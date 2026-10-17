@@ -335,6 +335,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             loading_device,
             loading_dtype,
             args.fp8_scaled,
+            anima38_connector=getattr(args, "anima38_connector", False),
         )
 
         # Store unsloth preference so that when the base NetworkTrainer calls
@@ -1034,6 +1035,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         # Latents already normalized by vae.encode with scale
         return latents
 
+    def get_extra_dit_kwargs(self, args, accelerator, text_encoder_conds, weight_dtype) -> dict:
+        """Extra keyword arguments for the DiT call in get_noise_pred_and_target (Anima-3.8B: Qwen3.5 features)."""
+        return {}
+
     def get_noise_pred_and_target(
         self,
         args,
@@ -1167,6 +1172,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         attn_mask = attn_mask.to(accelerator.device)
         t5_input_ids = t5_input_ids.to(accelerator.device, dtype=torch.long)
         t5_attn_mask = t5_attn_mask.to(accelerator.device)
+        extra_dit_kwargs = self.get_extra_dit_kwargs(args, accelerator, text_encoder_conds, weight_dtype)
 
         # Create padding mask
         bs = latents.shape[0]
@@ -1185,14 +1191,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 target_input_ids=t5_input_ids,
                 target_attention_mask=t5_attn_mask,
                 source_attention_mask=attn_mask,
+                **extra_dit_kwargs,
             )
-        model_pred = model_pred.squeeze(2)  # 5D to 4D, [B, C, 1, H, W] -> [B, C, H, W]
-
-        # Clear T-LoRA mask after the forward pass
-        self.clear_tlora_mask_if_needed()
-
-        # Upcast for grokking
-        latents = latents.to(torch.float64)
             if is_train and self.precision_reporter is not None:
                 self.precision_reporter.log_forward(
                     accelerator.device.type,
@@ -1201,10 +1201,20 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                     text_embeddings=prompt_embeds,
                     prediction=model_pred,
                 )
+        model_pred = model_pred.squeeze(2)  # 5D to 4D, [B, C, 1, H, W] -> [B, C, H, W]
+
+        # Clear T-LoRA mask after the forward pass
+        self.clear_tlora_mask_if_needed()
+
+        # Upcast for grokking
+        latents = latents.to(torch.float64)
         noise = noise.to(torch.float64)
 
         # Rectified flow target: noise - latents
         target = noise - latents
+
+        if is_train and self.precision_reporter is not None:
+            self.precision_reporter.log_tensors("flow target before loss processing", target=target)
 
         # Loss weighting
         weighting = anima_train_utils.compute_loss_weighting_for_anima(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
@@ -1213,9 +1223,6 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
     def process_batch(
         self, 
-        if is_train and self.precision_reporter is not None:
-            self.precision_reporter.log_tensors("flow target before loss processing", target=target)
-
         batch, 
         text_encoders, 
         unet, 
@@ -1410,6 +1417,9 @@ def setup_parser() -> argparse.ArgumentParser:
     parser = train_network.setup_parser()
     train_util.add_dit_training_arguments(parser)
     anima_train_utils.add_anima_training_arguments(parser)
+    from library.anima38.training import add_anima38_arguments
+
+    add_anima38_arguments(parser)  # Anima-3.8B v1.1: --anima38_connector, --qwen35_path, ...
     # parser.add_argument("--fp8_scaled", action="store_true", help="Use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う")
     parser.add_argument(
         "--unsloth_offload_checkpointing",
@@ -1467,5 +1477,10 @@ if __name__ == "__main__":
     # in train_network.py WITHOUT triggering the generic "Using Rectified Flow" log block.
     args._anima_model = True
 
-    trainer = AnimaNetworkTrainer()
+    if args.anima38_connector:
+        from library.anima38.trainer import make_anima38_trainer
+
+        trainer = make_anima38_trainer(AnimaNetworkTrainer)  # Qwen3.5-4B + Semantic Connector v2 conditioning
+    else:
+        trainer = AnimaNetworkTrainer()
     trainer.train(args)

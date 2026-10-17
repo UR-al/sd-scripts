@@ -1243,7 +1243,10 @@ class Anima(nn.Module):
     def prepare_block_swap_before_forward(self, free_cache: bool = True):
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:
             return
-        self.offloader.prepare_block_devices_before_forward(self.blocks, free_cache=free_cache)
+        try:
+            self.offloader.prepare_block_devices_before_forward(self.blocks, free_cache=free_cache)
+        except TypeError:  # local fix: this fork's ModelOffloader (custom_offloading_utils.py) has no free_cache parameter
+            self.offloader.prepare_block_devices_before_forward(self.blocks)
 
     def forward_mini_train_dit(
         self,
@@ -1334,7 +1337,20 @@ class Anima(nn.Module):
         source_attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        context = self._preprocess_text_embeds(context, target_input_ids, target_attention_mask, source_attention_mask)
+        anima38_conditioner = self.__dict__.get("anima38_conditioner")  # only set by --anima38_connector (library/anima38)
+        if anima38_conditioner is not None:
+            # Anima-3.8B v1.1: the frozen Semantic Connector v2 replaces the llm_adapter output, using this call's timesteps
+            context = anima38_conditioner(
+                context,
+                timesteps,
+                target_input_ids,
+                target_attention_mask,
+                source_attention_mask,
+                kwargs.pop("semantic_hidden_states", None),
+                kwargs.pop("semantic_attention_mask", None),
+            )
+        else:
+            context = self._preprocess_text_embeds(context, target_input_ids, target_attention_mask, source_attention_mask)
         return self.forward_mini_train_dit(x, timesteps, context, fps=fps, padding_mask=padding_mask, **kwargs)
 
     def _preprocess_text_embeds(

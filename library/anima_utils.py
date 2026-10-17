@@ -36,6 +36,15 @@ def _rename_hook(k: str) -> str:
         return k[len("net."):]
     return k
 
+# Anima-3.8B v1.1 bundles carry a Semantic Connector v2 next to the DiT (net.anima_v2_connector.*)
+ANIMA38_CONNECTOR_KEY_PREFIX = "anima_v2_connector."
+
+def _skip_anima38_connector_hook(k: str, tensor):
+    # WeightTransformHooks split hook: an empty key list drops the tensor (never loaded), (None, None) keeps it
+    if _rename_hook(k).startswith(ANIMA38_CONNECTOR_KEY_PREFIX):
+        return [], []
+    return None, None
+
 def count_blocks(state_dict_keys: list[str], prefix_string: str) -> int:
     count = 0
     while True:
@@ -60,6 +69,7 @@ def load_anima_model(
     fp8_scaled: bool = False,
     lora_weights_list: Optional[List[Dict[str, torch.Tensor]]] = None,
     lora_multipliers: Optional[list[float]] = None,
+    anima38_connector: bool = False,
 ) -> anima_models.Anima:
     """
     Load Anima model from the specified checkpoint.
@@ -75,6 +85,8 @@ def load_anima_model(
         fp8_scaled (bool): Whether to use fp8 scaling for the model weights.
         lora_weights_list (Optional[List[Dict[str, torch.Tensor]]]): LoRA weights to apply, if any.
         lora_multipliers (Optional[List[float]]): LoRA multipliers for the weights, if any.
+        anima38_connector (bool): Anima-3.8B v1.1 bundle: skip its Semantic Connector v2 tensors (library/anima38
+            builds the connector separately). A bundle without this flag raises an explanatory error.
     """
     # dit_weight_dtype is None for fp8_scaled
     assert (
@@ -93,6 +105,16 @@ def load_anima_model(
             key_prefix = "model.diffusion_model."
         elif any(k.startswith("net.") for k in state_dict_keys):
             key_prefix = "net."
+
+    anima38_connector_keys = [k for k in state_dict_keys if _rename_hook(k).startswith(ANIMA38_CONNECTOR_KEY_PREFIX)]
+    if anima38_connector_keys and not anima38_connector:
+        raise RuntimeError(
+            f"{dit_path} is an Anima-3.8B v1.1 bundle ({len(anima38_connector_keys)} Semantic Connector v2 tensors). Its"
+            " conditioning needs the connector and Qwen3.5-4B: train it with anima_train_network.py --anima38_connector"
+            " --qwen35_path ... (see config_anima38.toml)"
+        )
+    if anima38_connector and not anima38_connector_keys:
+        raise RuntimeError(f"anima38_connector is set, but {dit_path} is not an Anima-3.8B v1.1 bundle (no anima_v2_connector.* tensors)")
 
     dit_config = {
         "max_img_h": 512,
@@ -135,6 +157,9 @@ def load_anima_model(
     logger.info(f"Loading DiT model from {dit_path}, device={loading_device}")
 
     rename_hooks = WeightTransformHooks(rename_hook=_rename_hook)
+    if anima38_connector:
+        # the connector never enters the DiT state dict (nor fp8 optimization); library/anima38 builds it
+        rename_hooks.split_hook = _skip_anima38_connector_hook
     sd = load_safetensors_with_lora_and_fp8(
         model_files=dit_path,
         lora_weights_list=lora_weights_list,
