@@ -13,7 +13,7 @@ import torch
 from PIL import Image
 from safetensors.torch import load_file, save_file
 
-from library import train_util
+from library import timestep_presets, train_util
 from library.device_utils import clean_memory_on_device, synchronize_device
 from library.utils import setup_logging
 
@@ -41,7 +41,9 @@ def add_moss_training_arguments(parser) -> None:
     parser.add_argument("--timestep_sampling", type=str, default="moss", choices=TIMESTEP_CHOICES,
                         help="moss = the released Base's last pretraining distribution (logit-normal, see --moss_logit_*);"
                              " sigma/uniform/sigmoid/shift = the usual flow-matching options (fp32 timesteps)")
-    parser.add_argument("--sigmoid_scale", type=float, default=1.0, help="scale for sigmoid / shift timestep sampling")
+    parser.add_argument("--sigmoid_scale", type=timestep_presets.parse_sigmoid_scale, default=1.0,
+                        help=timestep_presets.SIGMOID_SCALE_HELP)
+    timestep_presets.add_timestep_preset_arguments(parser)
     parser.add_argument("--discrete_flow_shift", type=float, default=1.0,
                         help="shift for timestep_sampling=shift and the scheduler of sigma mode (MOSS training_shift = 1.0)")
     parser.add_argument("--moss_logit_mean", type=float, default=1.09, help="moss sampling: mean of logit(sigma)")
@@ -147,7 +149,7 @@ def moss_metadata(args) -> Dict[str, str]:
         "ss_moss_logit_std": str(args.moss_logit_std),
         "ss_moss_sigma_cutoff": str(args.moss_sigma_cutoff),
         "ss_moss_uniform_mix": str(args.moss_uniform_mix),
-        "ss_sigmoid_scale": str(args.sigmoid_scale),
+        **timestep_presets.metadata(args),
         "ss_discrete_flow_shift": str(args.discrete_flow_shift),
         "ss_weighting_scheme": str(args.weighting_scheme),
         "ss_logit_mean": str(args.logit_mean),

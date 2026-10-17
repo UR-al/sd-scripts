@@ -30,7 +30,7 @@ from accelerate import Accelerator
 from diffusers import DDPMScheduler
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from library import deepspeed_utils, model_util, sai_model_spec, strategy_base, strategy_sd, sai_model_spec
-from library import anchor_loss
+from library import anchor_loss, timestep_presets
 from library import adv_cache, dist_match
 from library import hf_token_loss
 from library.strategy_sdxl import SdxlTextEncodingStrategy
@@ -3607,6 +3607,7 @@ class NetworkTrainer:
 
         for epoch in range(epoch_to_start, num_train_epochs):
             current_epoch.value = epoch + 1
+            timestep_presets.set_epoch(args, current_epoch.value)  # scale_resume: low-noise stage after max_train_epochs
             accelerator.print(f"\nepoch {current_epoch.value}/{num_train_epochs}\n")
 
             metadata["ss_epoch"] = str(current_epoch.value)

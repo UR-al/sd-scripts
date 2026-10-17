@@ -14,7 +14,7 @@ from tqdm import tqdm
 from PIL import Image
 from safetensors.torch import save_file
 
-from library import flux_models, flux_utils, strategy_base, train_util, custom_train_functions
+from library import flux_models, flux_utils, strategy_base, train_util, custom_train_functions, timestep_presets
 from library.device_utils import init_ipex, clean_memory_on_device
 from library.image_utils import to_srgb
 from library.safetensors_utils import mem_eff_save_file
@@ -672,7 +672,23 @@ def get_noisy_model_input_and_timesteps(
         sigmas = timesteps / num_timesteps
     elif args.timestep_sampling == "uniform" or args.timestep_sampling == "sigmoid":
         # Simple random sigma-based noise sampling
-        if antithetic:
+        preset = timestep_presets.active_sigmoid_preset(args) if args.timestep_sampling == "sigmoid" else None
+        if preset is not None:
+            # Named sigmoid preset (balanced/content/style, or the scale_resume stage): quantiles of sigmoid(N(0,1))
+            # taken at base uniforms from the same variance-reduction source as the numeric path.
+            if antithetic:
+                u = custom_train_functions.compute_antithetic_sigmas(bsz, "uniform", device)
+            elif qmc is not None:
+                u = custom_train_functions.compute_density_for_timestep_sampling(
+                    weighting_scheme="uniform", batch_size=bsz, qmc=qmc, qmc_seed=qmc_seed, device=device, rank=qmc_rank
+                )
+            elif stratified:
+                edges = torch.arange(bsz, device=device, dtype=torch.float32)
+                u = (edges + torch.rand(bsz, device=device)) / bsz
+            else:
+                u = torch.rand((bsz,), device=device)
+            sigmas = timestep_presets.preset_sigmas(preset, u)
+        elif antithetic:
             # Antithetic pairing on the base variates; same marginal distribution
             sigmas = custom_train_functions.compute_antithetic_sigmas(
                 bsz, args.timestep_sampling, device, sigmoid_scale=args.sigmoid_scale

@@ -19,7 +19,7 @@ from library.device_utils import clean_memory_on_device, init_ipex
 init_ipex()
 
 import train_network
-from library import anima_train_utils, attention, sd3_train_utils, strategy_base, train_util
+from library import anima_train_utils, attention, sd3_train_utils, strategy_base, timestep_presets, train_util
 from library.custom_train_functions import apply_snr_weight_for_flow_matching, maybe_apply_antithetic_noise_pairing
 from library.moss import captions, flow, strategy
 from library.moss import train_utils as moss_train_utils
@@ -311,6 +311,7 @@ def prepare_moss_runtime(args) -> None:
     if args.attn_mode == "flash" and not attention.is_flash_attn_supported():
         raise ValueError("MOSS-Image: attn_mode = \"flash\" needs the flash-attn package and an Ampere or newer GPU;"
                          " install flash-attn or set attn_mode = \"torch\" (about 1.6x slower)")
+    timestep_presets.resolve(args)  # sigmoid_scale presets; scale_resume extends max_train_epochs
     register_moss_lycoris_presets()
     if not args.moss_stock_lycoris:
         install_fast_lokr_forward()  # before the network is created: apply_to binds LokrModule.forward

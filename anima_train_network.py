@@ -22,6 +22,7 @@ from library import (
     sd3_train_utils,
     strategy_anima,
     strategy_base,
+    timestep_presets,
     train_util,
 )
 from library.custom_train_functions import (
@@ -1346,7 +1347,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         metadata["ss_logit_std"] = args.logit_std
         metadata["ss_mode_scale"] = args.mode_scale
         metadata["ss_timestep_sampling"] = args.timestep_sampling
-        metadata["ss_sigmoid_scale"] = args.sigmoid_scale
+        metadata.update(timestep_presets.metadata(args))
         metadata["ss_discrete_flow_shift"] = args.discrete_flow_shift
         metadata["ss_ileco"] = args.ileco
         if args.ileco:
@@ -1425,6 +1426,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 def prepare_anima_runtime(args) -> None:
     """Speed-ups, bit-identical unless noted: the fast LyCORIS LoKr+DoRA forward (before the network is created: apply_to
     binds LokrModule.forward) and the compiled Block elementwise chains (~1 bf16 ulp)."""
+    timestep_presets.resolve(args)  # sigmoid_scale presets; scale_resume extends max_train_epochs
+    logger.info(f"Anima timestep_sampling={args.timestep_sampling}, {timestep_presets.describe(args)}")
     if not args.anima_stock_lycoris:
         install_fast_lokr_forward()
     anima_models.enable_elementwise_compile(not args.anima_no_compile)

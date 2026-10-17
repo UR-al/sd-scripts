@@ -11,7 +11,7 @@ from typing import Optional
 
 import torch
 
-from library import flux_train_utils
+from library import flux_train_utils, timestep_presets
 
 NUM_TRAIN_TIMESTEPS = 1000
 TIMESTEP_CHOICES = ["moss", "sigma", "uniform", "sigmoid", "shift"]
@@ -57,7 +57,7 @@ def get_noisy_model_input_and_timesteps(args, noise_scheduler, latents, noise, d
 
 def describe_moss_sampling(args) -> str:
     if args.timestep_sampling != "moss":
-        return f"timestep_sampling={args.timestep_sampling} (fp32 timesteps)"
+        return f"timestep_sampling={args.timestep_sampling}, {timestep_presets.describe(args)} (fp32 timesteps)"
     pmf = moss_sigma_pmf(args.moss_logit_mean, args.moss_logit_std, args.moss_sigma_cutoff, args.moss_uniform_mix)
     sigma = torch.arange(1, NUM_TRAIN_TIMESTEPS + 1, dtype=torch.float64) / NUM_TRAIN_TIMESTEPS
     cdf = pmf.cumsum(0)

@@ -15,7 +15,7 @@ from tqdm import tqdm
 from PIL import Image
 
 from library.device_utils import init_ipex, clean_memory_on_device, synchronize_device
-from library import anima_models, anima_utils, train_util, qwen_image_autoencoder_kl
+from library import anima_models, anima_utils, timestep_presets, train_util, qwen_image_autoencoder_kl
 from library.lycoris_fast import cached_lokr_weights
 
 init_ipex()
@@ -108,10 +108,11 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
     )
     parser.add_argument(
         "--sigmoid_scale",
-        type=float,
+        type=timestep_presets.parse_sigmoid_scale,
         default=1.0,
-        help="Scale factor for sigmoid (logit_normal) timestep sampling (default: 1.0)",
+        help=timestep_presets.SIGMOID_SCALE_HELP + " (default: 1.0)",
     )
+    timestep_presets.add_timestep_preset_arguments(parser)
     parser.add_argument(
         "--attn_mode",
         choices=["torch", "xformers", "flash", "sageattn", "sdpa"],  # "sdpa" is for backward compatibility
