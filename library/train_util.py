@@ -9231,6 +9231,15 @@ def prepare_optimizer(args, network, accelerator):
             trainable_params = results
             lr_descriptions = None
 
+    # DoRA magnitude parameters (dora_scale) get their own group: --learning_rate_DoRA, --weight_decay_DoRA (default 0)
+    from library import dora_lr
+
+    decay_keys = [k for k in dora_lr.DECAY_KEYS if k in optimizer_kwargs or k in optimizer_init_sig_parameters]
+    trainable_params, lr_descriptions = dora_lr.split_dora_param_groups(
+        network, trainable_params, lr_descriptions, dora_lr.dora_learning_rate(args), default_lr=args.learning_rate,
+        weight_decay=dora_lr.dora_weight_decay(args), decay_keys=decay_keys,
+    )
+
     optimizer_name, optimizer_args, optimizer = get_optimizer(args, trainable_params, optimizer_kwargs)
     optimizer_train_fn, optimizer_eval_fn = get_optimizer_train_eval_fn(optimizer, args)
 

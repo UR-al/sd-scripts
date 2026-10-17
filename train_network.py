@@ -30,7 +30,7 @@ from accelerate import Accelerator
 from diffusers import DDPMScheduler
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from library import deepspeed_utils, model_util, sai_model_spec, strategy_base, strategy_sd, sai_model_spec
-from library import anchor_loss, timestep_presets
+from library import anchor_loss, dora_lr, lycoris_args, timestep_presets
 from library import adv_cache, dist_match
 from library import hf_token_loss
 from library.strategy_sdxl import SdxlTextEncodingStrategy
@@ -2333,6 +2333,8 @@ class NetworkTrainer:
             for net_arg in args.network_args:
                 key, value = net_arg.split("=", 1)
                 net_kwargs[key] = value
+        # LyCORIS reads decompose_both / ggpo_conv / the use_tucker aliases without parsing "False"
+        net_kwargs = lycoris_args.fix_lycoris_bool_kwargs(args.network_module, net_kwargs)
 
         # if a new network is added in future, add if ~ then blocks for each network (;'∀')
         if args.dim_from_weights:
@@ -2949,6 +2951,7 @@ class NetworkTrainer:
             "ss_training_started_at": training_started_at,  # unix timestamp
             "ss_output_name": args.output_name,
             "ss_learning_rate": args.learning_rate,
+            **dora_lr.metadata(args),
             "ss_text_encoder_lr": text_encoder_lr,
             "ss_unet_lr": args.unet_lr,
             "ss_num_train_images": train_dataset_group.num_train_images,
@@ -4153,6 +4156,7 @@ def setup_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--unet_lr", type=float, default=None, help="learning rate for U-Net / U-Netの学習率")
+    dora_lr.add_dora_lr_arguments(parser)  # --learning_rate_DoRA
     parser.add_argument(
         "--text_encoder_lr",
         type=float,
