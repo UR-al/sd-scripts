@@ -76,6 +76,77 @@ def test_lora_moss_keys_and_default_excludes():
     assert lora_anima.LoRANetwork.ANIMA_TARGET_REPLACE_MODULE[0] == "Block"  # restored
 
 
+def _net_kwargs(network_args):
+    return dict(entry.split("=", 1) for entry in network_args)  # train_network's parsing
+
+
+def test_exclude_blocks_parsing():
+    from library.moss.train_utils import parse_moss_exclude_blocks
+
+    assert parse_moss_exclude_blocks("22") == [22] and parse_moss_exclude_blocks(" 22, 1 ") == [1, 22]
+    assert parse_moss_exclude_blocks(22) == [22] and parse_moss_exclude_blocks([23, 22, 22]) == [22, 23]
+    assert parse_moss_exclude_blocks("") == [] and parse_moss_exclude_blocks(None) == [] and parse_moss_exclude_blocks([]) == []
+    for bad in ("abc", "42", "-1", True, "1.5"):
+        try:
+            parse_moss_exclude_blocks(bad)
+        except ValueError:
+            continue
+        raise AssertionError(bad)
+
+
+def test_block_exclusion_merges_network_args_once():
+    from library.moss.train_utils import apply_moss_block_exclusion, moss_metadata
+
+    args = argparse.Namespace(moss_lora_exclude_blocks="22", network_args=["algo=lokr", "preset=moss"])
+    assert apply_moss_block_exclusion(args) == [22]
+    import ast
+
+    assert args.network_args[:2] == ["algo=lokr", "preset=moss"]
+    assert ast.literal_eval(_net_kwargs(args.network_args)["exclude_patterns"]) == [r"layers\.22(\..*)?"]
+    apply_moss_block_exclusion(args)  # idempotent
+    assert len(args.network_args) == 3
+    merged = argparse.Namespace(moss_lora_exclude_blocks="1,2", network_args=["exclude_patterns=['foo.*']"])
+    apply_moss_block_exclusion(merged)
+    assert ast.literal_eval(_net_kwargs(merged.network_args)["exclude_patterns"]) == [
+        "foo.*", r"layers\.1(\..*)?", r"layers\.2(\..*)?"]
+    other = argparse.Namespace(moss_lora_exclude_blocks="22", network_module="lycoris.kohya", network_args=["preset=full"])
+    try:
+        apply_moss_block_exclusion(other)
+        raise AssertionError("a non-MOSS LyCORIS preset must be refused")
+    except ValueError:
+        pass
+    ok = argparse.Namespace(moss_lora_exclude_blocks="22", network_module="lycoris.kohya", network_args=["preset=moss-text"])
+    assert apply_moss_block_exclusion(ok) == [22]
+    off = argparse.Namespace(moss_lora_exclude_blocks="", network_args=None)
+    assert apply_moss_block_exclusion(off) == [] and off.network_args is None
+    meta_args = argparse.Namespace(**{**vars(_args()), "moss_text_encoder": "te", "moss_max_token_length": 4096,
+                                     "discrete_flow_shift": 1.0, "weighting_scheme": "uniform", "logit_mean": 0.0,
+                                     "logit_std": 1.0, "sigmoid_scale": 1.0, "_moss_excluded_blocks": [22]})
+    assert moss_metadata(meta_args)["ss_moss_lora_exclude_blocks"] == "22"
+
+
+def test_excluded_blocks_get_no_adapters_in_both_network_modules():
+    from library.moss.train_utils import apply_moss_block_exclusion
+    from networks import lora_moss
+
+    register_moss_lycoris_presets()
+    from lycoris import kohya
+
+    args = argparse.Namespace(moss_lora_exclude_blocks="1", network_args=[])
+    apply_moss_block_exclusion(args)
+    kwargs = _net_kwargs(args.network_args)
+    want = sorted(f"lora_unet_layers_{i}_proj_{p}" for i in (0, 2)
+                  for p in ("q", "k", "v", "o", "ffn_up_gate", "ffn_down"))
+    lyco = kohya.create_network(1.0, 10000, 10000, None, [], _tiny_dit(), algo="lokr", preset="moss", factor=4,
+                                full_matrix=True, dora_wd=True, **kwargs)
+    assert sorted({lora.lora_name for lora in lyco.unet_loras}) == want
+    lora = lora_moss.create_network(1.0, 4, 1, None, [], _tiny_dit(), **kwargs)
+    assert sorted(m.lora_name for m in lora.unet_loras) == want
+    full = kohya.create_network(1.0, 10000, 10000, None, [], _tiny_dit(), algo="lokr", preset="moss", factor=4,
+                                full_matrix=True, dora_wd=True)
+    assert len(full.unet_loras) == 18  # nothing leaks into a later network without the flag
+
+
 def _tiny_te():
     cfg = replace(MossQwen35Config(), hidden_size=64, intermediate_size=96, num_hidden_layers=4)
     torch.manual_seed(0)

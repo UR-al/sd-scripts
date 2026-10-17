@@ -312,6 +312,7 @@ def prepare_moss_runtime(args) -> None:
         raise ValueError("MOSS-Image: attn_mode = \"flash\" needs the flash-attn package and an Ampere or newer GPU;"
                          " install flash-attn or set attn_mode = \"torch\" (about 1.6x slower)")
     timestep_presets.resolve(args)  # sigmoid_scale presets; scale_resume extends max_train_epochs
+    moss_train_utils.apply_moss_block_exclusion(args)  # --moss_lora_exclude_blocks -> network_args exclude_patterns
     register_moss_lycoris_presets()
     if not args.moss_stock_lycoris:
         install_fast_lokr_forward()  # before the network is created: apply_to binds LokrModule.forward

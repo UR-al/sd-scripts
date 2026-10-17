@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import hashlib
 import os
@@ -18,6 +19,7 @@ from library.device_utils import clean_memory_on_device, synchronize_device
 from library.utils import setup_logging
 
 from .flow import TIMESTEP_CHOICES, describe_moss_sampling
+from .models import MOSS_DIT_CONFIG
 from library.lycoris_fast import cached_lokr_weights
 from .vae import moss_vae_decode
 
@@ -60,6 +62,11 @@ def add_moss_training_arguments(parser) -> None:
                         help="use LyCORIS's stock LoKr forward and per-call sample merges (slower; same results)")
     parser.add_argument("--moss_no_sample_cache", action="store_true",
                         help="sample images without the merged LoKr weight cache (~9 GB less VRAM while sampling; slower)")
+    parser.add_argument("--moss_lora_exclude_blocks", type=str, default="",
+                        help="comma-separated joint block indices (0-41) left out of the LoRA/LyCORIS network, e.g. \"22\":"
+                             " the block the official sampler's negative branch skips, so CFG's skipped-block contrast stays"
+                             " the base model's (ai-toolkit's MOSS preset does this). Changes the network: a --resume state or"
+                             " --network_weights trained with those blocks will not match")
     parser.add_argument("--moss_sample_shift", type=float, default=DEFAULT_SAMPLE_SHIFT,
                         help="sample images: sigma shift (official 5.0); --fs in a prompt line overrides it")
     parser.add_argument("--moss_sample_uncond_skip_layers", type=str, default=DEFAULT_UNCOND_SKIP_LAYERS,
@@ -139,8 +146,65 @@ def validate_moss_args(args, train_dataset_group, val_dataset_group) -> None:
     logger.info("MOSS-Image: " + describe_moss_sampling(args))
 
 
+def parse_moss_exclude_blocks(value, num_layers: int = MOSS_DIT_CONFIG["num_layers"]) -> List[int]:
+    """--moss_lora_exclude_blocks: "22", "22, 23", 22 or [22, 23] (TOML values arrive unconverted) -> sorted indices."""
+    if value is None or value == "" or value == []:
+        return []
+    items = value if isinstance(value, (list, tuple)) else str(value).split(",")
+    blocks = set()
+    for item in items:
+        text = str(item).strip()
+        if not text:
+            continue
+        if isinstance(item, bool) or not text.lstrip("-").isdigit():
+            raise ValueError(f"MOSS-Image: moss_lora_exclude_blocks takes block indices, got {value!r}")
+        index = int(text)
+        if not 0 <= index < num_layers:
+            raise ValueError(f"MOSS-Image: moss_lora_exclude_blocks index {index} is outside 0..{num_layers - 1}")
+        blocks.add(index)
+    return sorted(blocks)
+
+
+def moss_block_exclude_patterns(blocks: Sequence[int]) -> List[str]:
+    """Regexes for network_args exclude_patterns. LyCORIS full-matches module paths ("layers.22" and its children),
+    networks.lora_moss full-matches "layers.22.proj.q" etc."""
+    return [rf"layers\.{index}(\..*)?" for index in blocks]
+
+
+def apply_moss_block_exclusion(args) -> List[int]:
+    """Merge the excluded blocks into network_args exclude_patterns (both network modules read it). Idempotent."""
+    if getattr(args, "_moss_excluded_blocks", None) is not None:
+        return args._moss_excluded_blocks
+    blocks = parse_moss_exclude_blocks(getattr(args, "moss_lora_exclude_blocks", ""))
+    args._moss_excluded_blocks = blocks
+    if not blocks:
+        return blocks
+    patterns = moss_block_exclude_patterns(blocks)
+    network_args = list(getattr(args, "network_args", None) or [])
+    if "lycoris" in str(getattr(args, "network_module", "")):
+        # LyCORIS ignores a preset's exclude_name once exclude_patterns is given; the MOSS presets have none.
+        preset = next((str(e).partition("=")[2].strip() for e in network_args if str(e).partition("=")[0].strip() == "preset"),
+                      "full")
+        if preset not in ("moss", "moss-text"):
+            raise ValueError(f"MOSS-Image: moss_lora_exclude_blocks needs LyCORIS preset=moss or moss-text, got {preset!r}")
+    for i, entry in enumerate(network_args):
+        key, _, value = str(entry).partition("=")
+        if key.strip() == "exclude_patterns":
+            existing = ast.literal_eval(value.strip())  # the network modules parse it the same way
+            existing = list(existing) if isinstance(existing, (list, tuple)) else [existing]
+            network_args[i] = f"exclude_patterns={existing + [p for p in patterns if p not in existing]!r}"
+            break
+    else:
+        network_args.append(f"exclude_patterns={patterns!r}")
+    args.network_args = network_args
+    logger.info(f"MOSS-Image: joint blocks {blocks} are left out of the network (exclude_patterns {patterns})")
+    return blocks
+
+
 def moss_metadata(args) -> Dict[str, str]:
+    excluded = getattr(args, "_moss_excluded_blocks", None) or []
     return {
+        "ss_moss_lora_exclude_blocks": ",".join(str(index) for index in excluded),
         "ss_base_model_version": "moss_image",
         "ss_moss_text_encoder": os.path.basename(str(args.moss_text_encoder)),
         "ss_moss_max_token_length": str(args.moss_max_token_length),
