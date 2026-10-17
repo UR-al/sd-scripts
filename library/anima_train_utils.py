@@ -1,6 +1,7 @@
 # Anima Training Utilities
 
 import argparse
+import contextlib
 import gc
 import math
 import os
@@ -15,6 +16,7 @@ from PIL import Image
 
 from library.device_utils import init_ipex, clean_memory_on_device, synchronize_device
 from library import anima_models, anima_utils, train_util, qwen_image_autoencoder_kl
+from library.lycoris_fast import cached_lokr_weights
 
 init_ipex()
 
@@ -381,6 +383,16 @@ def do_sample(
     return x
 
 
+def sample_merge_cache(accelerator: Accelerator, args: argparse.Namespace, dit):
+    """Context: merged LoKr weights built once per sampling round instead of on every call (bit-identical under
+    autocast; library/lycoris_fast.py). Not with block swap, without autocast, or when switched off."""
+    device_type = accelerator.device.type
+    if (getattr(args, "anima_stock_lycoris", False) or getattr(args, "anima_no_sample_cache", False)
+            or getattr(dit, "blocks_to_swap", None) or not torch.is_autocast_enabled(device_type)):
+        return contextlib.nullcontext()
+    return cached_lokr_weights(dit, torch.get_autocast_dtype(device_type), accelerator.device)
+
+
 def sample_images(
     accelerator: Accelerator,
     args: argparse.Namespace,
@@ -442,7 +454,7 @@ def sample_images(
     except Exception:
         pass
 
-    with torch.no_grad(), accelerator.autocast():
+    with torch.no_grad(), accelerator.autocast(), sample_merge_cache(accelerator, args, dit):
         for prompt_dict in prompts:
             dit.prepare_block_swap_before_forward()
             if on_prompt_start is not None:

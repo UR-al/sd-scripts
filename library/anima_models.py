@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from library import custom_offloading_utils, attention
+from library.elementwise_compile import ElementwiseChains
 
 
 def to_device(x, device):
@@ -177,6 +178,75 @@ def apply_rotary_pos_emb_qk(
     return q, k
 
 
+# ---- elementwise chains of Block / Attention, optionally fused with torch.compile (CUDA only) -------------------------
+# Same math and op order as the modules they replace (LayerNorm + AdaLN modulation, gated residual, q/k RMSNorm [+ RoPE]);
+# eager by default, compiled when the trainer calls enable_elementwise_compile (library/elementwise_compile.py).
+def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """RMSNorm.forward: fp32 normalisation, weight multiply in fp32, back to the input dtype."""
+    output = x.float()
+    output = output * torch.rsqrt(output.pow(2).mean(-1, keepdim=True) + eps)
+    return (output * weight).to(x.dtype)
+
+
+def _rope_rotate(t: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """One tensor's part of apply_rotary_pos_emb_qk, with cos/sin already sliced, transposed and cast."""
+    rot_dim = cos.shape[-1]
+    t_rot = t[..., :rot_dim]
+    emb = (t_rot * cos) + (_rotate_half(t_rot, False) * sin)
+    return emb if rot_dim == t.shape[-1] else torch.cat((emb, t[..., rot_dim:]), dim=-1)
+
+
+def _rope_tables(rope_cos_sin, q: torch.Tensor, k: torch.Tensor, tensor_format: str):
+    """The table preparation of apply_rotary_pos_emb_qk (kept eager)."""
+    cos_, sin_ = rope_cos_sin
+    max_seq_len = cos_.shape[0]
+    cur_seq_len = q.shape[1] if tensor_format == "bshd" else q.shape[0]
+    assert cur_seq_len <= max_seq_len, f"Rotary Embeddings only supported up to {max_seq_len} sequence length!"
+    cos_ = cos_[:cur_seq_len]
+    sin_ = sin_[:cur_seq_len]
+    if tensor_format == "bshd":
+        cos_ = cos_.transpose(0, 1)
+        sin_ = sin_.transpose(0, 1)
+    cos_q = cos_.to(q.dtype)
+    sin_q = sin_.to(q.dtype)
+    cos_k = cos_q if k.dtype == q.dtype else cos_.to(k.dtype)
+    sin_k = sin_q if k.dtype == q.dtype else sin_.to(k.dtype)
+    return cos_q, sin_q, cos_k, sin_k
+
+
+def adaln_modulate(x, scale, shift, eps: float):
+    """LayerNorm (no affine) then AdaLN: Block._adaln_fn with nn.LayerNorm(elementwise_affine=False)."""
+    return F.layer_norm(x, (x.shape[-1],), None, None, eps) * (1 + scale) + shift
+
+
+def gated_residual(x, gate, result):
+    return x + gate * result
+
+
+def qk_norm(q, k, q_weight, k_weight, q_eps: float, k_eps: float):
+    return _rms_norm(q, q_weight, q_eps), _rms_norm(k, k_weight, k_eps)
+
+
+def qk_norm_rope(q, k, q_weight, k_weight, q_eps: float, k_eps: float, cos_q, sin_q, cos_k, sin_k):
+    q = _rope_rotate(_rms_norm(q, q_weight, q_eps), cos_q, sin_q)
+    k = _rope_rotate(_rms_norm(k, k_weight, k_eps), cos_k, sin_k)
+    return q, k
+
+
+_CHAINS = ElementwiseChains("Anima Block", adaln_modulate=adaln_modulate, gated_residual=gated_residual, qk_norm=qk_norm,
+                            qk_norm_rope=qk_norm_rope)
+
+
+def enable_elementwise_compile(enabled: bool = True):
+    """Use torch.compile'd elementwise chains in Block / Attention for CUDA tensors (training and sampling)."""
+    _CHAINS.enable(enabled)
+
+
+def _plain_module(module: nn.Module) -> bool:
+    """No instance-level forward patch (e.g. a network wrapping it) and no hooks: safe to inline its math."""
+    return "forward" not in module.__dict__ and not module._forward_hooks and not module._forward_pre_hooks
+
+
 # Basic building blocks
 class RMSNorm(torch.nn.Module):
     """RMS Normalization for DiT blocks."""
@@ -298,6 +368,16 @@ class Attention(nn.Module):
         q = q.unflatten(-1, (self.n_heads, self.head_dim))
         k = k.unflatten(-1, (self.n_heads, self.head_dim))
         v = v.unflatten(-1, (self.n_heads, self.head_dim))
+
+        if _plain_module(self.q_norm) and _plain_module(self.k_norm):
+            fn = _CHAINS.get(q)
+            weights = (self.q_norm.weight, self.k_norm.weight, self.q_norm.eps, self.k_norm.eps)
+            if self.is_selfattn and rope_cos_sin is not None:
+                q, k = fn["qk_norm_rope"](q, k, *weights, *_rope_tables(rope_cos_sin, q, k, self.qkv_format))
+            else:
+                q, k = fn["qk_norm"](q, k, *weights)
+            v = self.v_norm(v)
+            return q, k, v
 
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -865,8 +945,11 @@ class Block(nn.Module):
         gate_mlp_B_T_1_1_D = gate_mlp_B_T_D[:, :, None, None, :]
 
         B, T, H, W, D = x_B_T_H_W_D.shape
+        fn = _CHAINS.get(x_B_T_H_W_D)
 
         def _adaln_fn(_x, _norm_layer, _scale, _shift):
+            if _plain_module(_norm_layer) and _norm_layer.weight is None and _norm_layer.bias is None:
+                return fn["adaln_modulate"](_x, _scale, _shift, _norm_layer.eps)
             return _norm_layer(_x) * (1 + _scale) + _shift
 
         # 1. Self-attention
@@ -878,7 +961,7 @@ class Block(nn.Module):
             x_flat,
             rope_cos_sin=rope_cos_sin,
         ).unflatten(1, (T, H, W))
-        x_B_T_H_W_D = x_B_T_H_W_D + gate_self_attn_B_T_1_1_D * result
+        x_B_T_H_W_D = fn["gated_residual"](x_B_T_H_W_D, gate_self_attn_B_T_1_1_D, result)
 
         # 2. Cross-attention
         normalized_x = _adaln_fn(x_B_T_H_W_D, self.layer_norm_cross_attn, scale_cross_attn_B_T_1_1_D, shift_cross_attn_B_T_1_1_D)
@@ -888,12 +971,12 @@ class Block(nn.Module):
             crossattn_emb,
             rope_cos_sin=rope_cos_sin,
         ).unflatten(1, (T, H, W))
-        x_B_T_H_W_D = result * gate_cross_attn_B_T_1_1_D + x_B_T_H_W_D
+        x_B_T_H_W_D = fn["gated_residual"](x_B_T_H_W_D, gate_cross_attn_B_T_1_1_D, result)  # was result * gate + x (same)
 
         # 3. MLP
         normalized_x = _adaln_fn(x_B_T_H_W_D, self.layer_norm_mlp, scale_mlp_B_T_1_1_D, shift_mlp_B_T_1_1_D)
         result = self.mlp(normalized_x)
-        x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp_B_T_1_1_D * result
+        x_B_T_H_W_D = fn["gated_residual"](x_B_T_H_W_D, gate_mlp_B_T_1_1_D, result)
 
         return x_B_T_H_W_D
 

@@ -138,7 +138,7 @@ def sample_images(
     except Exception:
         pass
 
-    with torch.no_grad(), accelerator.autocast():
+    with torch.no_grad(), accelerator.autocast(), anima_train_utils.sample_merge_cache(accelerator, args, dit):
         for prompt_dict in prompts:
             dit.prepare_block_swap_before_forward()
             sample_image_inference(

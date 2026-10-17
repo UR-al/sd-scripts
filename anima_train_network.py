@@ -30,6 +30,7 @@ from library.custom_train_functions import (
 )
 import train_network
 from library.utils import setup_logging
+from library.lycoris_fast import install_fast_lokr_forward
 from library.ramtorch_util import apply_ramtorch_to_module
 
 setup_logging()
@@ -317,7 +318,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
     def load_unet_lazily(self, args, weight_dtype, accelerator, text_encoders) -> tuple[nn.Module, list[nn.Module]]:
         loading_dtype = None if args.fp8_scaled else weight_dtype
-        loading_device = "cpu" if self.is_swapping_blocks else accelerator.device
+        # with RamTorch, load on the CPU so the streamed weights never pass through VRAM first
+        loading_device = "cpu" if (self.is_swapping_blocks or args.use_ramtorch) else accelerator.device
 
         attn_mode = "torch"
         if args.xformers:
@@ -344,8 +346,15 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         self._use_unsloth_offload_checkpointing = args.unsloth_offload_checkpointing
 
         if args.use_ramtorch:
-            logger.info("Applying RamTorch to Anima model dit.")
-            model = apply_ramtorch_to_module(model, "unet/dit", accelerator.device, model.dtype)
+            # Only the blocks' attention and MLP Linears (the LoRA targets, most of the DiT's weights) stay in pinned CPU
+            # RAM: LyCORIS streams them into its rebuild, so training is unchanged. The small layers (AdaLN modulation,
+            # embedders, final layer, llm_adapter) stay on the GPU: RamTorch's own backward would compute (and
+            # stochastically round, using the RNG) grads for their frozen weights.
+            for block in model.blocks:
+                for name in ("self_attn", "cross_attn", "mlp"):
+                    setattr(block, name, apply_ramtorch_to_module(getattr(block, name), f"Anima block {name}",
+                                                                  accelerator.device, model.dtype))
+            logger.info(f"RamTorch applied to the attention/MLP Linears of {len(model.blocks)} Anima blocks")
 
         # Block swap
         self.is_swapping_blocks = args.blocks_to_swap is not None and args.blocks_to_swap > 0
@@ -1413,6 +1422,14 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             accelerator.unwrap_model(unet).prepare_block_swap_before_forward()
 
 
+def prepare_anima_runtime(args) -> None:
+    """Speed-ups, bit-identical unless noted: the fast LyCORIS LoKr+DoRA forward (before the network is created: apply_to
+    binds LokrModule.forward) and the compiled Block elementwise chains (~1 bf16 ulp)."""
+    if not args.anima_stock_lycoris:
+        install_fast_lokr_forward()
+    anima_models.enable_elementwise_compile(not args.anima_no_compile)
+
+
 def setup_parser() -> argparse.ArgumentParser:
     parser = train_network.setup_parser()
     train_util.add_dit_training_arguments(parser)
@@ -1427,6 +1444,12 @@ def setup_parser() -> argparse.ArgumentParser:
         help="offload activations to CPU RAM using async non-blocking transfers (faster than --cpu_offload_checkpointing). "
         "Cannot be used with --cpu_offload_checkpointing or --blocks_to_swap.",
     )
+    parser.add_argument("--anima_no_compile", action="store_true",
+                        help="do not torch.compile the Block elementwise chains (LayerNorm+AdaLN, q/k RMSNorm+RoPE, residual)")
+    parser.add_argument("--anima_stock_lycoris", action="store_true",
+                        help="use LyCORIS's stock LoKr forward and per-call sample merges (slower; same results)")
+    parser.add_argument("--anima_no_sample_cache", action="store_true",
+                        help="sample images without the merged LoKr weight cache (slower; same results)")
     # Anima-specific default: lower cfm_lambda than the SDXL default of 0.05
     parser.set_defaults(cfm_lambda=0.02)
     parser.add_argument("--ileco", action="store_true", help="enable dataset-backed iLECO prompt-to-prompt training")
@@ -1476,6 +1499,8 @@ if __name__ == "__main__":
     # Anima is a Rectified Flow model. Use a private flag to bypass the CFM guard
     # in train_network.py WITHOUT triggering the generic "Using Rectified Flow" log block.
     args._anima_model = True
+
+    prepare_anima_runtime(args)
 
     if args.anima38_connector:
         from library.anima38.trainer import make_anima38_trainer
