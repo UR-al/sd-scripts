@@ -86,8 +86,11 @@ def encode_cache_array(value: Any, cache_dtype: str, key: str) -> Tuple[np.ndarr
     return raw_bits, target
 
 
-def save_npz(path: str, arrays: Mapping[str, Any], cache_dtype: str = "auto") -> None:
-    """Save a compressed NPZ cache, encoding floating arrays per policy."""
+def save_npz(path: str, arrays: Mapping[str, Any], cache_dtype: str = "auto", compress: bool = True) -> None:
+    """Save an NPZ cache (zlib-compressed unless ``compress=False``), encoding floating arrays per policy.
+
+    ``load_npz`` reads both forms; the stored values are identical either way.
+    """
     policy = normalize_cache_dtype(cache_dtype)
     encoded: Dict[str, np.ndarray] = {}
     dtype_metadata: Dict[str, str] = {}
@@ -101,7 +104,10 @@ def save_npz(path: str, arrays: Mapping[str, Any], cache_dtype: str = "auto") ->
 
     if dtype_metadata:
         encoded[CACHE_DTYPE_METADATA_KEY] = np.array(json.dumps(dtype_metadata, sort_keys=True))
-    np.savez_compressed(path, **encoded)
+    if compress:
+        np.savez_compressed(path, **encoded)
+    else:
+        np.savez(path, **encoded)
 
 
 def _decode_bf16(array: np.ndarray) -> np.ndarray:
