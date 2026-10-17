@@ -1193,6 +1193,14 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
         # Upcast for grokking
         latents = latents.to(torch.float64)
+            if is_train and self.precision_reporter is not None:
+                self.precision_reporter.log_forward(
+                    accelerator.device.type,
+                    noisy_latents=noisy_model_input,
+                    timesteps=timesteps,
+                    text_embeddings=prompt_embeds,
+                    prediction=model_pred,
+                )
         noise = noise.to(torch.float64)
 
         # Rectified flow target: noise - latents
@@ -1205,6 +1213,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
     def process_batch(
         self, 
+        if is_train and self.precision_reporter is not None:
+            self.precision_reporter.log_tensors("flow target before loss processing", target=target)
+
         batch, 
         text_encoders, 
         unet, 

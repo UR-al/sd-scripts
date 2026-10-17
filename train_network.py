@@ -39,6 +39,7 @@ import library.train_util as train_util
 from library.train_util import DreamBoothDataset
 from library.focal_frequency_loss import FocalFrequencyLoss
 from library.patch_topology_loss import PatchTopologyLoss, extract_spatial_mask
+from library.precision_logging import PrecisionReporter
 from library.dynamic_loss_weighting import DynamicLossWeighter, build_weighter_from_args
 import library.config_util as config_util
 from library.config_util import (
@@ -87,6 +88,7 @@ logger = logging.getLogger(__name__)
 
 class NetworkTrainer:
     def __init__(self):
+        self.precision_reporter = None
         self.vae_scale_factor = 0.18215
         self.is_sdxl = False
         self.latent_shift = 0.0
@@ -2910,6 +2912,12 @@ class NetworkTrainer:
         # resumeする
         train_util.resume_from_local_or_hf_if_specified(accelerator, args)
 
+        # Observe actual storage after dtype casts, Accelerate preparation and resume.
+        self.precision_reporter = PrecisionReporter(logger, enabled=accelerator.is_main_process)
+        self.precision_reporter.log_startup(
+            args, optimizer, network, unet, text_encoders, vae, save_dtype
+        )
+
         # epoch数を計算する
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
         num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
@@ -3724,6 +3732,7 @@ class NetworkTrainer:
                     if loss.ndim != 0:
                         loss = loss.mean()
 
+                    self.precision_reporter.log_tensors("loss passed to backward", loss=loss)
                     accelerator.backward(loss)
 
                     if self.should_sync_ramtorch(args, accelerator):
@@ -3768,6 +3777,9 @@ class NetworkTrainer:
                         #if hasattr(network, "update_norms"):
                         #    network.update_norms()
 
+                    if accelerator.sync_gradients:
+                        self.precision_reporter.log_gradients(optimizer)
+
                     if _use_step_func:
                         # Schedulefree-plus optimizers (e.g. AdamWScheduleFreePlus) use
                         # step_func(function_value) instead of step(). step_func reads p.grad
@@ -3791,6 +3803,11 @@ class NetworkTrainer:
                                 scaler.update()
                     else:
                         optimizer.step()
+                    self.precision_reporter.log_optimizer_state(
+                        optimizer,
+                        sync_gradients=accelerator.sync_gradients,
+                        step_was_skipped=getattr(optimizer, "step_was_skipped", False),
+                    )
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
 
