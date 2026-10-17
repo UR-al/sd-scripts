@@ -41,10 +41,18 @@ MOSS_VAE_SCALE = 16  # pixels per DiT token (8x VAE * 2x2 patch)
 
 def load_moss_vae(path: str, device: Optional[torch.device] = None, dtype: torch.dtype = torch.float32):
     """Load the diffusers-format FLUX.2 small-decoder VAE strictly. Keep it fp32 (official default)."""
+    import inspect
+
     from diffusers import AutoencoderKLFlux2
 
+    # Pass only the config keys this diffusers version accepts (0.41 dropped force_upcast); the weights are loaded strictly.
+    accepted = inspect.signature(AutoencoderKLFlux2.__init__).parameters
+    config = {key: value for key, value in MOSS_VAE_CONFIG.items() if key in accepted}
+    dropped = sorted(set(MOSS_VAE_CONFIG) - set(config))
+    if dropped:
+        logger.info(f"MOSS VAE: config keys not used by this diffusers version: {dropped}")
     with torch.device("meta"):
-        vae = AutoencoderKLFlux2(**MOSS_VAE_CONFIG)
+        vae = AutoencoderKLFlux2(**config)
     state = load_file(path, device="cpu")
     if any(key.startswith("vae.") for key in state):
         state = {key[4:]: value for key, value in state.items() if key.startswith("vae.")}
