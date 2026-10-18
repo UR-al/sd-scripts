@@ -4,8 +4,8 @@
 #    handles keep_tokens_separator, so with the user's "fixed ||| tags ||| sentence" captions 1 of every 8 cached
 #    variants fed all three encoders a literal "|||" that no Forge prompt contains. process_caption (variants 1..n,
 #    and the online path the 2.9B config uses) splits on the separator and joins with ", ". canonical_caption() is
-#    process_caption with every random choice fixed (no dropout, no shuffle, no tag dropout, first line, first
-#    wildcard option), and install_canonical_captions() puts it on each dataset instance (the class is untouched)
+#    process_caption with every random choice fixed (no dropout, no shuffle, no tag dropout; with enable_wildcard the
+#    first line and first wildcard option), and install_canonical_captions() puts it on each dataset instance (the class is untouched)
 #    for the duration of caching only: uninstall_canonical_captions() removes it again, because Windows DataLoader
 #    workers pickle the dataset and a bound method of a foreign function does not pickle.
 #
@@ -49,13 +49,14 @@ def _first_wildcard_options(caption: str) -> str:
 
 def canonical_caption(dataset: Any, subset: Any, caption: str) -> str:
     """BaseDataset.process_caption without randomness (same steps, same order, same joins)."""
+    if subset.enable_wildcard:  # one line per candidate: the first, chosen before prefix/suffix (process_caption picks one)
+        caption = caption.split("\n")[0]
     if subset.caption_prefix:
         caption = subset.caption_prefix + " " + caption
     if subset.caption_suffix:
         caption = caption + " " + subset.caption_suffix
 
-    caption = caption.split("\n")[0]
-    if subset.enable_wildcard:
+    if subset.enable_wildcard:  # without it process_caption uses a multi-line caption whole
         caption = _first_wildcard_options(caption)
 
     if subset.shuffle_caption or subset.token_warmup_step > 0 or subset.caption_tag_dropout_rate > 0:
@@ -112,13 +113,25 @@ def uninstall_canonical_captions(dataset_group: Any) -> int:
 
 
 def register_caption_digests(dataset_group: Any, caching_strategy: Any) -> int:
-    """Tell the caching strategy the digest of every image's current caption (keyed by its npz path)."""
+    """Tell the caching strategy the digests of every image's current caption (keyed by its npz path): the raw text
+    and the processed text the file is encoded from (the installed canonical function; the same value
+    BaseDataset.new_cache_text_encoder_outputs stores as ``info.cache_caption``)."""
     digests: Dict[str, str] = {}
+    processed: Dict[str, str] = {}
     for dataset in _datasets(dataset_group):
+        image_to_subset = getattr(dataset, "image_to_subset", {})
         for info in getattr(dataset, "image_data", {}).values():
             npz_path = caching_strategy.get_outputs_npz_path(info.absolute_path)
             digests[npz_key(npz_path)] = caption_digest(info.caption)
+            subset = image_to_subset.get(getattr(info, "image_key", None))
+            text = info.caption
+            if subset is not None and info.caption is not None and hasattr(dataset, "process_caption_canonical"):
+                text = dataset.process_caption_canonical(subset, info.caption)
+                info.cache_caption = text
+            processed[npz_key(npz_path)] = caption_digest(text)
     caching_strategy.caption_digests.update(digests)
+    if hasattr(caching_strategy, "cache_caption_digests"):
+        caching_strategy.cache_caption_digests.update(processed)
     return len(digests)
 
 

@@ -196,6 +196,6 @@ if __name__ == "__main__":
     parser = setup_parser()
 
     args = parser.parse_args()
-    args = train_util.read_config_from_file(args, parser)
+    args = train_util.read_config_from_file(args, parser, unknown_keys="ignore")  # reads training configs
 
     cache_to_disk(args)

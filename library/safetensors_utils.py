@@ -10,6 +10,12 @@ from typing import Dict, Any, Union, Optional
 from safetensors.torch import load_file
 
 from library.device_utils import synchronize_device
+from library.utils import setup_logging
+
+setup_logging()
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def mem_eff_save_file(tensors: Dict[str, torch.Tensor], filename: str, metadata: Dict[str, Any] = None):
@@ -309,9 +315,14 @@ def load_safetensors(
         return state_dict
     else:
         try:
-            state_dict = load_file(path, device=device)
-        except:
+            # safetensors only accepts a device string: a torch.device raised and silently fell back to the CPU
+            state_dict = load_file(path, device=str(device) if device is not None else "cpu")
+        except Exception as e:
+            logger.warning(f"load_file failed for device {device!r} ({e}); loading to the CPU and moving the tensors")
             state_dict = load_file(path)  # prevent device invalid Error
+            if device is not None:
+                for key in state_dict.keys():
+                    state_dict[key] = state_dict[key].to(device)
         if dtype is not None:
             for key in state_dict.keys():
                 state_dict[key] = state_dict[key].to(dtype=dtype)

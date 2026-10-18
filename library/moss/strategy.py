@@ -241,11 +241,9 @@ class MossTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
 
     def cache_batch_outputs(self, tokenize_strategy: TokenizeStrategy, models: List[Any],
                             text_encoding_strategy: TextEncodingStrategy, infos: List):
-        _, variant_groups = self._get_variant_caption_groups(infos)
-        # Variant 0 = the processed canonical caption (BaseDataset only builds variants for stochastic subsets; the
-        # others would otherwise be cached raw, see captions.prepare_canonical_captions).
-        canonical = [info.caption_variants[0] if getattr(info, "caption_variants", None)
-                     else getattr(info, "moss_canonical_caption", info.caption) for info in infos]
+        # Variant 0 = the processed canonical caption (caption_for_cache: variant 0, else info.cache_caption set by
+        # BaseDataset.new_cache_text_encoder_outputs / captions.prepare_canonical_captions, never the raw caption).
+        canonical, variant_groups = self._get_variant_caption_groups(infos)
 
         def encode(captions: List[str]) -> List[Dict[str, Any]]:
             tokens = tokenize_strategy.tokenize(captions)

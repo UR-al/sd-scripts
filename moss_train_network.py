@@ -282,8 +282,10 @@ class MossNetworkTrainer(train_network.NetworkTrainer):
 
     def get_sai_model_spec(self, args):
         spec = train_util.get_sai_model_spec_dataclass(None, args, False, True, False).to_metadata_dict()
-        spec["modelspec.architecture"] = "moss-image/lora"
+        spec["modelspec.architecture"] = "moss-image-base/lora"  # the string upstream sd-scripts writes
         spec["modelspec.implementation"] = "https://github.com/OpenMOSS/MOSS-Image"
+        if not getattr(args, "resolution", None):
+            spec["modelspec.resolution"] = "1024x1024"  # the dataset config sets the resolution; the 512 fallback is SD1
         return spec
 
     def update_metadata(self, metadata, args):
@@ -326,5 +328,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     train_util.verify_command_line_training_args(args)
     args = train_util.read_config_from_file(args, parser)
-    prepare_moss_runtime(args)
-    MossNetworkTrainer().train(args)
+    if args.show_timesteps:
+        moss_train_utils.show_timesteps(args)  # CPU only: no model, no GPU checks, then exit
+    else:
+        prepare_moss_runtime(args)
+        MossNetworkTrainer().train(args)

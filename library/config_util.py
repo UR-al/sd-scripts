@@ -153,9 +153,9 @@ class BaseSubsetParams:
     resolution_jitter_weights: Optional[List[float]] = None
     num_repeats: int = 1
     shuffle_caption: bool = False
-    caption_separator: str = (",",)
+    caption_separator: str = ","
     keep_tokens: int = 0
-    keep_tokens_separator: str = (None,)
+    keep_tokens_separator: str = ""
     secondary_separator: Optional[str] = None
     enable_wildcard: bool = False
     color_aug: bool = False

@@ -56,7 +56,7 @@ def cache_to_disk(args: argparse.Namespace) -> None:
         is_sdxl or is_flux
     ), "Cache text encoder outputs to disk is only supported for SDXL and FLUX models / テキストエンコーダ出力のディスクキャッシュはSDXLまたはFLUXでのみ有効です"
     assert (
-        is_sdxl or args.weighted_captions is None
+        is_sdxl or not args.weighted_captions  # store_true flag: never None
     ), "Weighted captions are only supported for SDXL models / 重み付きキャプションはSDXLモデルでのみ有効です"
 
     tokenize_strategy = set_tokenize_strategy(is_sd, is_sdxl, is_flux, args)
@@ -275,6 +275,6 @@ if __name__ == "__main__":
     parser = setup_parser()
 
     args = parser.parse_args()
-    args = train_util.read_config_from_file(args, parser)
+    args = train_util.read_config_from_file(args, parser, unknown_keys="ignore")  # reads training configs
 
     cache_to_disk(args)

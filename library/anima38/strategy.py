@@ -14,8 +14,9 @@
 # training sample always come from the same (shuffled / tag-dropped) caption. Qwen3.5 is loaded lazily on the first
 # caption that needs encoding and released by the trainer after caching.
 #
-# Each file also stores the SHA-1 of the raw caption it was built from; the trainer registers the current digests
-# (captions.register_caption_digests), so an edited caption rebuilds its cache. Qwen3.5 gets the caption escaped the
+# Each file also stores the SHA-1 of the raw caption it was built from and of the processed caption it encodes; the
+# trainer registers the current digests (captions.register_caption_digests), so an edited caption or a changed
+# prefix/suffix/separator rebuilds its cache. Qwen3.5 gets the caption escaped the
 # way it is typed into Forge (captions.forge_prompt_text); Qwen3 and T5 get it unchanged, as in Forge.
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ from library.strategy_anima import (
     AnimaTextEncodingStrategy,
     AnimaTokenizeStrategy,
 )
-from library.strategy_base import TextEncodingStrategy, TokenizeStrategy, variant_key
+from library.strategy_base import TextEncodingStrategy, TokenizeStrategy, caption_for_cache, variant_key
 
 from .captions import caption_digest, forge_prompt_text, npz_key
 from .qwen35 import LAYER_INDICES, clear_scan_graphs, load_qwen35_model, pad_token_batch
@@ -47,6 +48,7 @@ QWEN35_STATES_KEY = "qwen35_states"
 QWEN35_MASK_KEY = "qwen35_mask"
 SIGNATURE_KEY = "anima38_signature"
 CAPTION_DIGEST_KEY = "anima38_caption_sha1"
+CACHE_CAPTION_DIGEST_KEY = "anima38_cache_caption_sha1"  # digest of the PROCESSED caption the file was encoded from
 # v2: canonical variant without the keep-token separator, Qwen3.5 input escaped like a Forge prompt, caption digest
 CACHE_SCHEMA = "anima38-te-v2"
 
@@ -191,6 +193,8 @@ class Anima38TextEncoderOutputsCachingStrategy(AnimaTextEncoderOutputsCachingStr
         super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check, is_partial, cache_dtype=cache_dtype)
         self.qwen35_signature = qwen35_signature
         self.caption_digests: Dict[str, str] = {}  # npz_key(npz path) -> caption_digest(current raw caption)
+        # npz_key(npz path) -> caption_digest(processed caption: prefix/suffix, separators, replacements applied)
+        self.cache_caption_digests: Dict[str, str] = {}
 
     def get_outputs_npz_path(self, image_abs_path: str) -> str:
         return os.path.splitext(image_abs_path)[0] + self.ANIMA38_TEXT_ENCODER_OUTPUTS_NPZ_SUFFIX
@@ -215,6 +219,16 @@ class Anima38TextEncoderOutputsCachingStrategy(AnimaTextEncoderOutputsCachingStr
                 ):
                     logger.info(f"caption changed since caching, rebuilding: {npz_path}")
                     return False
+                if num_caption_variants is None or num_caption_variants <= 1:
+                    # Without caption variants the file holds the PROCESSED caption (prefix/suffix, secondary separator,
+                    # replacements; strategy_base.caption_for_cache). Files written before that fix carry no processed
+                    # digest: they are kept only when the processed caption equals the raw one, else rebuilt.
+                    expected_processed = self.cache_caption_digests.get(npz_key(npz_path))
+                    if expected_processed is not None:
+                        stored = str(npz[CACHE_CAPTION_DIGEST_KEY].tolist()) if CACHE_CAPTION_DIGEST_KEY in npz else expected_digest
+                        if stored != expected_processed:
+                            logger.info(f"processed caption changed since caching, rebuilding: {npz_path}")
+                            return False
                 if not self._check_cached_variant_keys(npz, set(self.OUTPUT_KEYS), num_caption_variants, caption_aug_hash):
                     return False
         except Exception as e:
@@ -291,6 +305,7 @@ class Anima38TextEncoderOutputsCachingStrategy(AnimaTextEncoderOutputsCachingStr
                 save_kwargs["caption_dropout_rate"] = caption_dropout_rate
                 save_kwargs[SIGNATURE_KEY] = np.array(self.qwen35_signature)
                 save_kwargs[CAPTION_DIGEST_KEY] = np.array(caption_digest(getattr(info, "caption", None)))
+                save_kwargs[CACHE_CAPTION_DIGEST_KEY] = np.array(caption_digest(caption_for_cache(info)))
                 for k, row in own_variants:
                     for key in self.OUTPUT_KEYS:
                         save_kwargs[variant_key(key, k)] = row[key]

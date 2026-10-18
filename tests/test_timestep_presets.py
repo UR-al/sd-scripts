@@ -169,7 +169,7 @@ def test_metadata():
     assert timestep_presets.metadata(numeric) == {"ss_sigmoid_scale": "1.5"}
 
 
-def test_toml_config_reaches_resolve_unconverted(monkeypatch):
+def test_toml_config_reaches_resolve(monkeypatch):
     import moss_train_network
 
     parser = moss_train_network.setup_parser()
@@ -179,7 +179,7 @@ def test_toml_config_reaches_resolve_unconverted(monkeypatch):
             f.write('timestep_sampling = "sigmoid"\nsigmoid_scale = "Content"\nscale_resume = 2\nmax_train_epochs = 4\n')
         monkeypatch.setattr(sys, "argv", ["moss_train_network.py", "--config_file", path])  # read_config re-parses argv
         args = train_util.read_config_from_file(parser.parse_args(), parser)
-    assert args.sigmoid_scale == "Content"  # TOML values bypass the argparse type
+    assert args.sigmoid_scale == "content"  # TOML strings go through the argparse type (library/config_validation.py)
     timestep_presets.resolve(args)
     assert args._sigmoid_preset == "content" and args.max_train_epochs == 6 and args._scale_resume_from == 4
 

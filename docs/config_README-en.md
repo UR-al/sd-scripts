@@ -379,7 +379,7 @@ As a temporary measure, we will list common errors and their solutions. If you e
 
 ### Multi-line captions
 
-By setting `enable_wildcard = true`, multiple-line captions are also enabled. If the caption file consists of multiple lines, one line is randomly selected as the caption. 
+By setting `enable_wildcard = true`, multiple-line captions are also enabled. If the caption file consists of multiple lines, one line is randomly selected as the caption. Without `enable_wildcard`, a multi-line caption file is used whole: its non-empty lines joined by newlines (this fork; upstream sd-scripts keeps only the first line). `caption_prefix` / `caption_suffix` are added after the line is chosen, so every line gets both.
 
 ```txt
 1girl, hatsune miku, vocaloid, upper body, looking at viewer, microphone, stage

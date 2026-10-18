@@ -32,7 +32,7 @@ from collections import deque
 from typing import Deque
 from library.laplace_mse_loss import mse_pyramid_loss_2d_non_reduced
 from library.focal_frequency_loss import FocalFrequencyLoss
-from library.image_utils import to_srgb
+from library.image_utils import flatten_alpha, to_srgb
 
 # from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -43,6 +43,7 @@ import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from library.device_utils import init_ipex, clean_memory_on_device
 from library.cache_utils import CACHE_DTYPE_CHOICES, load_npz, save_npz
+from library.strategy_base import caption_for_cache
 from library.strategy_base import (
     LatentsCachingStrategy,
     TokenizeStrategy,
@@ -1039,6 +1040,11 @@ class BaseDataset(torch.utils.data.Dataset):
         self.replacements[str_from] = str_to
 
     def process_caption(self, subset: BaseSubset, caption):
+        # with enable_wildcard every line of a multi-line caption is one candidate: pick the line BEFORE adding
+        # prefix/suffix so each candidate gets both (upstream PR #2454). Without it the caption is used whole.
+        if subset.enable_wildcard and "\n" in caption:
+            caption = random.choice(caption.split("\n"))
+
         # caption に prefix/suffix を付ける
         if subset.caption_prefix:
             caption = subset.caption_prefix + " " + caption
@@ -1062,12 +1068,8 @@ class BaseDataset(torch.utils.data.Dataset):
                 )
             caption = ""
         else:
-            # process wildcards
+            # process wildcards (the line was chosen above, before prefix/suffix)
             if subset.enable_wildcard:
-                # if caption is multiline, random choice one line
-                if "\n" in caption:
-                    caption = random.choice(caption.split("\n"))
-
                 # wildcard is like '{aaa|bbb|ccc...}'
                 # escape the curly braces like {{ or }}
                 replacer1 = "⦅"
@@ -1086,9 +1088,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
                 # unescape the curly braces
                 caption = caption.replace(replacer1, "{").replace(replacer2, "}")
-            else:
-                # if caption is multiline, use the first line
-                caption = caption.split("\n")[0]
+            # without enable_wildcard a multi-line caption is used whole (it used to be cut to its first line)
 
             if subset.shuffle_caption or subset.token_warmup_step > 0 or subset.caption_tag_dropout_rate > 0:
                 original_caption = caption
@@ -1206,27 +1206,31 @@ class BaseDataset(torch.utils.data.Dataset):
     def process_caption_canonical(self, subset: BaseSubset, caption: str) -> str:
         """Deterministic caption processing for the canonical variant (variant 0).
 
-        Applies prefix/suffix, secondary separator and replacements, takes the first line of
-        multiline captions and the first option of wildcards, and skips all stochastic
-        processing (dropout, shuffle, tag dropout, random wildcard/line selection).
+        Applies prefix/suffix, secondary separator and replacements; with enable_wildcard it takes
+        the first line of multiline captions (before prefix/suffix, like process_caption) and the
+        first option of wildcards (without it the caption is used whole, as process_caption does),
+        and skips all stochastic processing (dropout, shuffle, tag dropout, random wildcard/line
+        selection).
         """
+        if subset.enable_wildcard:
+            # multiline: first line (process_caption picks a random one), chosen before prefix/suffix
+            caption = caption.split("\n")[0]
+
         if subset.caption_prefix:
             caption = subset.caption_prefix + " " + caption
         if subset.caption_suffix:
             caption = caption + " " + subset.caption_suffix
 
-        # multiline: first line (matches the non-wildcard behavior of process_caption)
-        caption = caption.split("\n")[0]
-
-        # wildcards: deterministic first option, with the same escaping as process_caption
-        replacer1 = "⦅"
-        replacer2 = "⦆"
-        while replacer1 in caption or replacer2 in caption:
-            replacer1 += "⦅"
-            replacer2 += "⦆"
-        caption = caption.replace("{{", replacer1).replace("}}", replacer2)
-        caption = re.sub(r"\{([^}]+)\}", lambda m: m.group(1).split("|")[0], caption)
-        caption = caption.replace(replacer1, "{").replace(replacer2, "}")
+        if subset.enable_wildcard:
+            # wildcards: deterministic first option, with the same escaping as process_caption
+            replacer1 = "⦅"
+            replacer2 = "⦆"
+            while replacer1 in caption or replacer2 in caption:
+                replacer1 += "⦅"
+                replacer2 += "⦆"
+            caption = caption.replace("{{", replacer1).replace("}}", replacer2)
+            caption = re.sub(r"\{([^}]+)\}", lambda m: m.group(1).split("|")[0], caption)
+            caption = caption.replace(replacer1, "{").replace(replacer2, "}")
 
         # process secondary separator
         if subset.secondary_separator:
@@ -1928,6 +1932,12 @@ class BaseDataset(torch.utils.data.Dataset):
 
     def is_text_encoder_output_cacheable(self, cache_supports_dropout: bool = False):
         variants_enabled = self.caption_aug_variant_count > 1
+        if not variants_enabled and any(subset.enable_wildcard for subset in self.subsets):
+            logger.warning(
+                "enable_wildcard with cached Text Encoder outputs and no --cache_caption_variants: the first line and the"
+                " first {a|b} option of each caption are cached and used at every step"
+                " / enable_wildcardはText Encoder出力のキャッシュ時には--cache_caption_variantsがないと最初の行・最初の選択肢で固定されます"
+            )
         return all(
             [
                 not (
@@ -2262,6 +2272,14 @@ class BaseDataset(torch.utils.data.Dataset):
             self.build_caption_variants()
 
         image_infos = list(self.image_data.values())
+
+        # Every caching strategy encodes the deterministically processed caption (prefix/suffix, secondary separator,
+        # replacements, first line / first {a|b} option under enable_wildcard) instead of the raw caption file
+        # (upstream PR #2455). Infos with caption variants carry it as variant 0; the strategies read it through
+        # strategy_base.caption_for_cache.
+        for info in image_infos:
+            subset = self.image_to_subset[info.image_key]
+            info.cache_caption = None if info.caption is None else self.process_caption_canonical(subset, info.caption)
 
         # split by resolution
         batches = []
@@ -2749,7 +2767,7 @@ class BaseDataset(torch.utils.data.Dataset):
             flippeds.append(flipped)
 
             # captionとtext encoder outputを処理する
-            caption = image_info.caption  # default
+            caption = caption_for_cache(image_info)  # default: what cached TE outputs were encoded from (raw if none)
 
             tokenization_required = (
                 self.text_encoder_output_caching_strategy is None or self.text_encoder_output_caching_strategy.is_partial
@@ -3113,10 +3131,10 @@ class DreamBoothDataset(BaseDataset):
                             logger.error(f"illegal char in file (not UTF-8) / ファイルにUTF-8以外の文字があります: {cap_path}")
                             raise e
                         assert len(lines) > 0, f"caption file is empty / キャプションファイルが空です: {cap_path}"
-                        if enable_wildcard:
-                            caption = "\n".join([line.strip() for line in lines if line.strip() != ""])  # 空行を除く、改行で連結
-                        else:
-                            caption = lines[0].strip()
+                        # every non-empty line, joined by newlines (空行を除く、改行で連結). With enable_wildcard
+                        # process_caption picks one line per step; without it the whole file is the caption (it used to
+                        # keep only the first line, silently cutting multi-paragraph natural-language captions)
+                        caption = "\n".join([line.strip() for line in lines if line.strip() != ""])
                     break
             return caption
 
@@ -3256,6 +3274,14 @@ class DreamBoothDataset(BaseDataset):
                         else:
                             captions.append(cap_for_img)
 
+            if not subset.enable_wildcard:
+                multi_line = sum(1 for caption in captions if caption and "\n" in caption)
+                if multi_line:
+                    logger.info(
+                        f"{multi_line} captions in {subset.image_dir} have several lines; each is used whole"
+                        " (enable_wildcard = true would pick one line per step instead)"
+                    )
+
             self.set_tag_frequency(os.path.basename(subset.image_dir), captions)  # タグ頻度を記録
 
             if missing_captions:
@@ -3375,6 +3401,24 @@ class DreamBoothDataset(BaseDataset):
 
         self.num_reg_images = num_reg_images
         self.num_val_images = num_val_images
+
+
+def build_finetuning_caption(subset: BaseSubset, caption: str, tags: Optional[str]) -> str:
+    """Combine a metadata caption with its tags (FineTuningDataset).
+
+    With enable_wildcard the tags are appended to every non-empty caption line (one candidate per line); an entry
+    with tags but no caption lines uses the tags as they are (upstream build_finetuning_caption). Without it the
+    tags are appended once to the whole caption."""
+    if tags is None or len(tags) == 0:
+        return caption
+    if subset.enable_wildcard:
+        caption_lines = [line for line in caption.split("\n") if line.strip() != ""]
+        if caption_lines:
+            return "\n".join([f"{line}{subset.caption_separator}{tags}" for line in caption_lines])
+        return tags  # no caption lines (e.g. tags-only metadata): use the tags as they are
+    if len(caption) > 0:
+        caption = caption + subset.caption_separator
+    return caption + tags
 
 
 class FineTuningDataset(BaseDataset):
@@ -3540,27 +3584,11 @@ class FineTuningDataset(BaseDataset):
                 if caption is None:
                     caption = ""
 
-                if subset.enable_wildcard:
-                    # tags must be single line (split by caption separator)
-                    if tags is not None:
-                        tags = tags.replace("\n", subset.caption_separator)
-
-                    # add tags to each line of caption
-                    if tags is not None:
-                        caption = "\n".join(
-                            [f"{line}{subset.caption_separator}{tags}" for line in caption.split("\n") if line.strip() != ""]
-                        )
-                        tags_list.append(tags)
-                else:
-                    # use as is
-                    if tags is not None and len(tags) > 0:
-                        if len(caption) > 0:
-                            caption = caption + subset.caption_separator
-                        caption = caption + tags
-                        tags_list.append(tags)
-
-                if caption is None:
-                    caption = ""
+                if subset.enable_wildcard and tags is not None:
+                    tags = tags.replace("\n", subset.caption_separator)  # tags must be single line
+                caption = build_finetuning_caption(subset, caption, tags)
+                if tags is not None and len(tags) > 0:
+                    tags_list.append(tags)
 
                 image_info = ImageInfo(image_key, subset.num_repeats, caption, False, abs_path, subset.caption_dropout_rate)
                 image_info.resize_interpolation = (
@@ -4366,6 +4394,9 @@ def load_arbitrary_dataset(args, tokenizer=None) -> MinimalDataset:
     return train_dataset_group
 
 
+_FLATTENED_ALPHA_LOGGED = set()
+
+
 def load_image(image_path, alpha=False):
     try:
         with Image.open(image_path) as image:
@@ -4373,7 +4404,11 @@ def load_image(image_path, alpha=False):
                 if not image.mode == "RGBA":
                     image = image.convert("RGBA")
             else:
-                image = to_srgb(image)
+                flat = flatten_alpha(image)  # transparent areas -> white, not the colour stored under them
+                if flat is not image and image_path not in _FLATTENED_ALPHA_LOGGED:
+                    _FLATTENED_ALPHA_LOGGED.add(image_path)
+                    logger.info(f"transparent image composited onto white / 透過部分を白で合成しました: {image_path}")
+                image = to_srgb(flat)
             img = np.array(image, np.uint8)
             return img
     except (IOError, OSError) as e:
@@ -5876,6 +5911,11 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
     parser.add_argument(
         "--output_config", action="store_true", help="output command line args to given .toml file / 引数を.tomlファイルに出力する"
     )
+    parser.add_argument(
+        "--strict_config_keys",
+        action="store_true",
+        help="--config_file keys that name no option (typos) are an error instead of a warning / 設定ファイルの不明なキーをエラーにする",
+    )
     if support_dreambooth:
         # DreamBooth training
         parser.add_argument(
@@ -6469,7 +6509,9 @@ def add_sd_saving_arguments(parser: argparse.ArgumentParser):
     )
 
 
-def read_config_from_file(args: argparse.Namespace, parser: argparse.ArgumentParser):
+def read_config_from_file(args: argparse.Namespace, parser: argparse.ArgumentParser, unknown_keys: Optional[str] = None):
+    """unknown_keys: "warn" (default; "error" with --strict_config_keys) or "ignore" for tools that read a training config
+    with a smaller parser. See library/config_validation.py."""
     if not args.config_file:
         return args
 
@@ -6515,7 +6557,8 @@ def read_config_from_file(args: argparse.Namespace, parser: argparse.ArgumentPar
 
     logger.info(f"Loading settings from {config_path}...")
     with open(config_path, "r", encoding="utf-8") as f:
-        config_dict = toml.load(f)
+        config_text = f.read()
+    config_dict = toml.loads(config_text)
 
     # combine all sections into one
     ignore_nesting_dict = {}
@@ -6528,6 +6571,16 @@ def read_config_from_file(args: argparse.Namespace, parser: argparse.ArgumentPar
         # if value is dict, save all key and value into one dict
         for key, value in section_dict.items():
             ignore_nesting_dict[key] = value
+
+    # unknown keys (typos) and wrongly typed values: argparse takes a namespace as it is
+    from library import config_validation
+
+    if unknown_keys is None:
+        strict = bool(getattr(args, "strict_config_keys", False)) or ignore_nesting_dict.get("strict_config_keys") is True
+        unknown_keys = "error" if strict else "warn"
+    ignore_nesting_dict = config_validation.validate_config(
+        ignore_nesting_dict, parser, source=config_path, text=config_text, unknown=unknown_keys
+    )
 
     config_args = argparse.Namespace(**ignore_nesting_dict)
     args = parser.parse_args(namespace=config_args)
@@ -8597,6 +8650,7 @@ def get_my_scheduler(
     v_parameterization: bool,
 ):
     sched_init_args = {}
+    has_steps_offset = True
     if sample_sampler == "ddim":
         scheduler_cls = DDIMScheduler
     elif sample_sampler == "ddpm":  # ddpmはおかしくなるのでoptionから外してある
@@ -8612,8 +8666,12 @@ def get_my_scheduler(
     elif sample_sampler == "dpmsolver" or sample_sampler == "dpmsolver++":
         scheduler_cls = DPMSolverMultistepScheduler
         sched_init_args["algorithm_type"] = sample_sampler
+        if sample_sampler == "dpmsolver":
+            # diffusers rejects the default final_sigmas_type="zero" for the (non-++) dpmsolver algorithm
+            sched_init_args["final_sigmas_type"] = "sigma_min"
     elif sample_sampler == "dpmsingle":
         scheduler_cls = DPMSolverSinglestepScheduler
+        has_steps_offset = False  # DPMSolverSinglestepScheduler has no steps_offset argument
     elif sample_sampler == "heun":
         scheduler_cls = HeunDiscreteScheduler
     elif sample_sampler == "dpm_2" or sample_sampler == "k_dpm_2":
@@ -8625,13 +8683,14 @@ def get_my_scheduler(
 
     if v_parameterization:
         sched_init_args["prediction_type"] = "v_prediction"
+    if has_steps_offset:
+        sched_init_args["steps_offset"] = 1
 
     scheduler = scheduler_cls(
         num_train_timesteps=SCHEDULER_TIMESTEPS,
         beta_start=SCHEDULER_LINEAR_START,
         beta_end=SCHEDULER_LINEAR_END,
         beta_schedule=SCHEDLER_SCHEDULE,
-        steps_offset=1,
         **sched_init_args,
     )
 
@@ -8728,6 +8787,12 @@ def line_to_prompt_dict(line: str) -> dict:
         except ValueError as ex:
             logger.error(f"Exception in parsing / 解析エラー: {parg}")
             logger.error(ex)
+
+    # `\n` (backslash + n) in line-format prompts becomes a line break, for text encoders that read line breaks
+    # (MOSS-Image / Anima captions). .toml / .json (dict) prompts can hold real line breaks and are not converted.
+    for key in ("prompt", "negative_prompt"):
+        if prompt_dict.get(key) is not None:
+            prompt_dict[key] = prompt_dict[key].replace("\\n", "\n")
 
     return prompt_dict
 

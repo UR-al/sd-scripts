@@ -344,7 +344,7 @@ def run_dataset_backed_ileco(argv: list[str]) -> None:
     parser = setup_dataset_parser()
     args = parser.parse_args(dataset_argv)
     train_util.verify_command_line_training_args(args)
-    args = train_util.read_config_from_file(args, parser)
+    args = train_util.read_config_from_file(args, parser, unknown_keys="ignore")  # the config is written for the LECO parser
     args.ileco = True
 
     if args.attn_mode == "sdpa":

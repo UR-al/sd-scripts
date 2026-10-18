@@ -237,3 +237,27 @@ def to_srgb(im: Image.Image, assume: str = "sRGB") -> Image.Image:
     except Exception:
         _log_profile_failure(im, src)
         return im.convert("RGB")
+
+
+_ALPHA_MODES = ("RGBA", "LA", "PA", "RGBa", "La")
+
+
+def flatten_alpha(im: Image.Image, background=(255, 255, 255)) -> Image.Image:
+    """Composite an image with transparency onto a solid background (white by default).
+
+    ``to_srgb`` and ``convert("RGB")`` drop the alpha channel, so transparent areas would train as whatever colour the
+    file stores under them (often black). Covers alpha modes and palette/colour-key transparency (PNG tRNS). Images
+    without transparency, fully opaque RGBA included, are returned unchanged (the same object). The ICC profile is kept
+    for :func:`to_srgb`.
+    """
+    if im.mode not in _ALPHA_MODES and "transparency" not in im.info:
+        return im
+    rgba = im.convert("RGBA")
+    if rgba.getchannel("A").getextrema()[0] == 255:
+        return im
+    canvas = Image.new("RGBA", rgba.size, tuple(background) + (255,))
+    out = Image.alpha_composite(canvas, rgba).convert("RGB")
+    icc = im.info.get("icc_profile")
+    if icc:
+        out.info["icc_profile"] = icc
+    return out

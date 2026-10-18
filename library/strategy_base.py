@@ -450,6 +450,18 @@ class TextEncodingStrategy:
         raise NotImplementedError
 
 
+def caption_for_cache(info) -> str:
+    """The caption a Text Encoder caching strategy must encode for ``info``: variant 0 when caption variants were
+    built, else the deterministically processed caption (``info.cache_caption``, set by
+    ``BaseDataset.new_cache_text_encoder_outputs`` with prefix/suffix, secondary separator, replacements and the
+    enable_wildcard first line/option applied), else the raw caption. Never ``info.caption`` directly (PR #2455)."""
+    variants = getattr(info, "caption_variants", None)
+    if variants:
+        return variants[0]
+    processed = getattr(info, "cache_caption", None)
+    return info.caption if processed is None else processed
+
+
 class TextEncoderOutputsCachingStrategy:
     _strategy = None  # strategy instance: actual strategy class
 
@@ -519,7 +531,7 @@ class TextEncoderOutputsCachingStrategy:
             Tuple[List[str], List[List[Tuple[int, str]]]]: canonical captions (one per info),
                 and for each variant index k >= 1 a list of (info_index, caption).
         """
-        canonical_captions = [(info.caption_variants[0] if getattr(info, "caption_variants", None) else info.caption) for info in infos]
+        canonical_captions = [caption_for_cache(info) for info in infos]
         max_variant = 0
         for info in infos:
             if getattr(info, "caption_variants", None):

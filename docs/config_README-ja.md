@@ -386,7 +386,7 @@ skip_image_resolution = 1024
 
 ### 複数行キャプション
 
-`enable_wildcard = true` を設定することで、複数行キャプションも同時に有効になります。キャプションファイルが複数の行からなる場合、ランダムに一つの行が選ばれてキャプションとして利用されます。
+`enable_wildcard = true` を設定することで、複数行キャプションも同時に有効になります。キャプションファイルが複数の行からなる場合、ランダムに一つの行が選ばれてキャプションとして利用されます。`enable_wildcard` なしでは、複数行のキャプションファイルは空行を除いた全行を改行でつないでそのまま使います（このフォーク。本家 sd-scripts は最初の行のみ）。`caption_prefix` / `caption_suffix` は行を選んだ後に付加されるため、どの行にも両方が付きます。
 
 ```txt
 1girl, hatsune miku, vocaloid, upper body, looking at viewer, microphone, stage

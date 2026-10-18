@@ -3,8 +3,8 @@
 # 1. Canonical caption variant. BaseDataset.process_caption_canonical (variant 0 of --cache_caption_variants) ignores
 #    keep_tokens_separator, so "fixed ||| tags ||| sentence" captions would reach the text encoder with a literal "|||"
 #    in one of every N cached variants. canonical_caption() is BaseDataset.process_caption with every random choice
-#    fixed (no caption dropout, no shuffle, no tag dropout, first line, first wildcard option): the same joins as the
-#    shuffled variants. It is installed on each dataset INSTANCE only while caching (Windows DataLoader workers
+#    fixed (no caption dropout, no shuffle, no tag dropout; with enable_wildcard the first line and the first wildcard
+#    option): the same joins as the shuffled variants. It is installed on each dataset INSTANCE only while caching (Windows DataLoader workers
 #    pickle the dataset, and a bound foreign function does not pickle).
 # 2. Caption digest. A cached *_moss_te.npz holds the encoding of one caption; the fork's validity check never compares
 #    caption text, so the SHA-1 of every image's current caption is registered and an edited caption rebuilds its cache.
@@ -38,12 +38,13 @@ def _first_wildcard_options(caption: str) -> str:
 
 def canonical_caption(dataset: Any, subset: Any, caption: str) -> str:
     """train_util.BaseDataset.process_caption without randomness (same steps and joins, in the same order)."""
+    if subset.enable_wildcard:  # one line per candidate: the first one, chosen before prefix/suffix like process_caption
+        caption = caption.split("\n")[0]
     if subset.caption_prefix:
         caption = subset.caption_prefix + " " + caption
     if subset.caption_suffix:
         caption = caption + " " + subset.caption_suffix
-    caption = caption.split("\n")[0]
-    if subset.enable_wildcard:
+    if subset.enable_wildcard:  # without it process_caption uses a multi-line caption whole
         caption = _first_wildcard_options(caption)
 
     if subset.shuffle_caption or subset.token_warmup_step > 0 or subset.caption_tag_dropout_rate > 0:
@@ -99,11 +100,11 @@ def uninstall_canonical_captions(dataset_group: Any) -> int:
 
 
 def prepare_canonical_captions(dataset_group: Any) -> int:
-    """Store the deterministic processed caption on every image info (``info.moss_canonical_caption``).
+    """Store the deterministic processed caption on every image info (``info.cache_caption``).
 
-    Subsets without stochastic caption options get no caption variants, and the fork would otherwise cache the RAW
-    caption (no prefix/suffix, replacements, secondary separator or first-line handling) although training without a
-    cache feeds process_caption's output."""
+    BaseDataset.new_cache_text_encoder_outputs sets the same attribute for every model (with the installed canonical
+    function this gives the same text); it is computed here first so register_caption_digests can hash it before the
+    cache validity check runs."""
     count = 0
     for dataset in _datasets(dataset_group):
         image_to_subset = getattr(dataset, "image_to_subset", {})
@@ -111,7 +112,7 @@ def prepare_canonical_captions(dataset_group: Any) -> int:
             subset = image_to_subset.get(info.image_key)
             if subset is None or info.caption is None:
                 continue
-            info.moss_canonical_caption = canonical_caption(dataset, subset, info.caption)
+            info.cache_caption = canonical_caption(dataset, subset, info.caption)
             count += 1
     return count
 
@@ -122,7 +123,7 @@ def register_caption_digests(dataset_group: Any, caching_strategy: Any) -> int:
     digests: Dict[str, str] = {}
     for dataset in _datasets(dataset_group):
         for info in getattr(dataset, "image_data", {}).values():
-            text = (info.caption or "") + "\x00" + str(getattr(info, "moss_canonical_caption", info.caption) or "")
+            text = (info.caption or "") + "\x00" + str(getattr(info, "cache_caption", info.caption) or "")
             digests[npz_key(caching_strategy.get_outputs_npz_path(info.absolute_path))] = caption_digest(text)
     caching_strategy.caption_digests.update(digests)
     return len(digests)
@@ -130,4 +131,4 @@ def register_caption_digests(dataset_group: Any, caching_strategy: Any) -> int:
 
 def info_caption_digest(info: Any) -> str:
     """The digest register_caption_digests computes for this info (stored in the cache file)."""
-    return caption_digest((info.caption or "") + "\x00" + str(getattr(info, "moss_canonical_caption", info.caption) or ""))
+    return caption_digest((info.caption or "") + "\x00" + str(getattr(info, "cache_caption", info.caption) or ""))

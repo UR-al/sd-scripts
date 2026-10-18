@@ -7,6 +7,7 @@ from transformers import AutoTokenizer, Qwen2TokenizerFast
 from library import hunyuan_image_text_encoder, hunyuan_image_vae, train_util
 from library.cache_utils import load_npz, save_npz
 from library.strategy_base import LatentsCachingStrategy, TextEncodingStrategy, TokenizeStrategy, TextEncoderOutputsCachingStrategy
+from library.strategy_base import caption_for_cache
 
 from library.utils import setup_logging
 
@@ -133,7 +134,7 @@ class HunyuanImageTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStr
         self, tokenize_strategy: TokenizeStrategy, models: List[Any], text_encoding_strategy: TextEncodingStrategy, infos: List
     ):
         huyuan_image_text_encoding_strategy: HunyuanImageTextEncodingStrategy = text_encoding_strategy
-        captions = [info.caption for info in infos]
+        captions = [caption_for_cache(info) for info in infos]
 
         tokens_and_masks = tokenize_strategy.tokenize(captions)
         with torch.no_grad():

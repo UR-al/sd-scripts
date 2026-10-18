@@ -6,6 +6,7 @@ import torch
 from transformers import AutoTokenizer, AutoModel, Gemma2Model, GemmaTokenizerFast
 from library import train_util
 from library.offline_utils import safe_from_pretrained
+from library.strategy_base import caption_for_cache
 from library.strategy_base import (
     LatentsCachingStrategy,
     TokenizeStrategy,
@@ -236,7 +237,7 @@ class LuminaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy)
         assert isinstance(text_encoding_strategy, LuminaTextEncodingStrategy)
         assert isinstance(tokenize_strategy, LuminaTokenizeStrategy)
 
-        captions = [info.caption for info in batch]
+        captions = [caption_for_cache(info) for info in batch]
 
         if self.is_weighted:
             tokens, attention_masks, weights_list = (

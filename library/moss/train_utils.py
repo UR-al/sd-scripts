@@ -74,6 +74,12 @@ def add_moss_training_arguments(parser) -> None:
     # Accepted and ignored so Anima command lines / train.ps1 do not fail argparse.
     parser.add_argument("--vae_chunk_size", type=int, default=None, help="ignored for MOSS-Image")
     parser.add_argument("--vae_disable_cache", action="store_true", help="ignored for MOSS-Image")
+    parser.add_argument("--show_timesteps", type=str, default=None, choices=["console", "image"],
+                        help="print (console) or plot (image, matplotlib) the timestep distribution and loss weighting the"
+                             " current settings sample, then exit without training (CPU only, no model loaded)")
+    parser.add_argument("--show_timesteps_epoch", type=int, default=None,
+                        help="--show_timesteps: preview the distribution of this 1-based epoch (scale_resume switches to the"
+                             " low-noise 'style' preset after max_train_epochs)")
 
 
 def _datasets(groups: Sequence) -> List:
@@ -144,6 +150,51 @@ def validate_moss_args(args, train_dataset_group, val_dataset_group) -> None:
     if val_dataset_group is not None:
         val_dataset_group.verify_bucket_reso_steps(16)
     logger.info("MOSS-Image: " + describe_moss_sampling(args))
+
+
+def show_timesteps(args, n_try: int = 100000) -> None:
+    """--show_timesteps: sample the configured timestep distribution on the CPU and print / plot it (no model).
+
+    Goes through the trainer's own sampling path (flow.get_noisy_model_input_and_timesteps with the moss pmf sampler,
+    the sigmoid presets and scale_resume) and loss weighting, so the histogram is what training samples.
+    library/timestep_visualization.py is upstream sd-scripts' renderer."""
+    from library import sd3_train_utils, timestep_visualization
+    from library.anima_train_utils import compute_loss_weighting_for_anima
+
+    from .flow import NUM_TRAIN_TIMESTEPS, MossSigmaSampler, get_noisy_model_input_and_timesteps
+
+    timestep_presets.resolve(args)
+    epoch = getattr(args, "show_timesteps_epoch", None)
+    if epoch is not None:
+        timestep_presets.set_epoch(args, int(epoch))
+    scheduler = sd3_train_utils.FlowMatchEulerDiscreteScheduler(num_train_timesteps=NUM_TRAIN_TIMESTEPS,
+                                                                shift=args.discrete_flow_shift)
+    sampler = MossSigmaSampler(args) if args.timestep_sampling == "moss" else None
+    device, dtype = torch.device("cpu"), torch.float32
+
+    def sample_timesteps(batch_size: int) -> torch.Tensor:
+        latents = torch.zeros(batch_size, MOSS_DIT_CONFIG["latent_channels"], 4, 4, dtype=dtype, device=device)
+        _, timesteps, _ = get_noisy_model_input_and_timesteps(args, scheduler, latents, torch.ones_like(latents), device,
+                                                              dtype, sampler)
+        return timesteps
+
+    def compute_weighting(timesteps: torch.Tensor) -> torch.Tensor:
+        sigmas = timesteps / NUM_TRAIN_TIMESTEPS
+        weighting = compute_loss_weighting_for_anima(args.weighting_scheme, sigmas)
+        if getattr(args, "min_snr_gamma", None):  # the trainer applies it on top (post_process_loss)
+            from library.custom_train_functions import apply_snr_weight_for_flow_matching
+
+            weighting = apply_snr_weight_for_flow_matching(weighting, sigmas, args.min_snr_gamma,
+                                                           soft=bool(getattr(args, "min_snr_gamma_soft", False)))
+        return weighting
+
+    header = "MOSS-Image timestep distribution: " + describe_moss_sampling(args)
+    if epoch is not None and args.timestep_sampling == "sigmoid":
+        header += f" (epoch {int(epoch)}: preset {timestep_presets.active_sigmoid_preset(args) or 'numeric scale'})"
+    elif epoch is not None:
+        header += f" (epoch {int(epoch)})"
+    timestep_visualization.show_timestep_distribution(args.show_timesteps, sample_timesteps, compute_weighting,
+                                                      num_train_timesteps=NUM_TRAIN_TIMESTEPS, n_try=n_try, header=header)
 
 
 def parse_moss_exclude_blocks(value, num_layers: int = MOSS_DIT_CONFIG["num_layers"]) -> List[int]:
