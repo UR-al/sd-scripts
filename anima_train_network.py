@@ -31,7 +31,7 @@ from library.custom_train_functions import (
 )
 import train_network
 from library.utils import setup_logging
-from library.lycoris_fast import install_fast_lokr_forward
+from library.lycoris_fast import enable_compiled_rebuild, install_fast_lokr_forward
 from library.ramtorch_util import apply_ramtorch_to_module
 
 setup_logging()
@@ -1431,6 +1431,8 @@ def prepare_anima_runtime(args) -> None:
     if not args.anima_stock_lycoris:
         install_fast_lokr_forward()
     anima_models.enable_elementwise_compile(not args.anima_no_compile)
+    # The fast forward's LoKr+DoRA weight rebuild, fused by torch.compile (~1 bf16 ulp; 1536 b1: 2.66 -> 2.38 s/step)
+    enable_compiled_rebuild(not (args.anima_stock_lycoris or args.anima_no_compile or args.anima_no_lokr_compile))
 
 
 def setup_parser() -> argparse.ArgumentParser:
@@ -1451,6 +1453,9 @@ def setup_parser() -> argparse.ArgumentParser:
                         help="do not torch.compile the Block elementwise chains (LayerNorm+AdaLN, q/k RMSNorm+RoPE, residual)")
     parser.add_argument("--anima_stock_lycoris", action="store_true",
                         help="use LyCORIS's stock LoKr forward and per-call sample merges (slower; same results)")
+    parser.add_argument("--anima_no_lokr_compile", action="store_true",
+                        help="do not torch.compile the LyCORIS LoKr+DoRA weight rebuild of the fast forward (a fixed ~0.27 s"
+                             " per step at Anima-3.8B shapes; compiled results differ by ~1 bf16 ulp)")
     parser.add_argument("--anima_no_sample_cache", action="store_true",
                         help="sample images without the merged LoKr weight cache (slower; same results)")
     # Anima-specific default: lower cfm_lambda than the SDXL default of 0.05

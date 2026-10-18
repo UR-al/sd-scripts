@@ -467,6 +467,35 @@ def test_fast_lokr_forward_is_bit_identical_to_lycoris():
         assert all(same), ((out_dim, in_dim), same)
 
 
+def test_compiled_rebuild_switch_keeps_cpu_path_identical():
+    """enable_compiled_rebuild only compiles for CUDA tensors: on the CPU the fast forward stays bit-identical to
+    LyCORIS with the switch on, and the trainers' flags turn it on and off."""
+    from library import lycoris_fast as lokr_fast
+
+    w0 = (torch.randn(192, 128, generator=torch.Generator().manual_seed(0)) * 0.05).to(torch.bfloat16)
+    x = torch.randn(2, 9, 128, generator=torch.Generator().manual_seed(1)).to(torch.bfloat16)
+    outs = []
+    for fast, compiled in ((False, False), (True, True)):
+        lokr_fast.enable_compiled_rebuild(compiled)
+        org, _ = _lokr_linear(w0, fast)
+        with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+            outs.append(org(x))
+    lokr_fast.enable_compiled_rebuild(False)
+    assert torch.equal(outs[0], outs[1])
+
+    import moss_train_network
+
+    parser = moss_train_network.setup_parser()
+    for extra, want in (([], True), (["--moss_no_lokr_compile"], False), (["--moss_no_compile"], False),
+                        (["--moss_stock_lycoris"], False)):
+        args = parser.parse_args(["--network_module", "lycoris.kohya"] + extra)
+        moss_train_network.prepare_moss_runtime(args)
+        assert lokr_fast._REBUILD.enabled is want, extra
+    lokr_fast.enable_compiled_rebuild(False)
+    from library.moss import models
+    models.enable_elementwise_compile(False)
+
+
 def test_cached_lokr_weights_match_and_restore():
     from library.lycoris_fast import cached_lokr_weights
 

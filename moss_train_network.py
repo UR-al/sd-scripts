@@ -23,7 +23,7 @@ from library import anima_train_utils, attention, sd3_train_utils, strategy_base
 from library.custom_train_functions import apply_snr_weight_for_flow_matching, maybe_apply_antithetic_noise_pairing
 from library.moss import captions, flow, strategy
 from library.moss import train_utils as moss_train_utils
-from library.lycoris_fast import install_fast_lokr_forward
+from library.lycoris_fast import enable_compiled_rebuild, install_fast_lokr_forward
 from library.moss.lycoris_presets import register_moss_lycoris_presets
 from library.moss.models import MOSS_DIT_CONFIG, MossTransformer, enable_elementwise_compile
 from library.moss.vae import load_moss_vae, moss_vae_encode
@@ -319,6 +319,8 @@ def prepare_moss_runtime(args) -> None:
     if not args.moss_stock_lycoris:
         install_fast_lokr_forward()  # before the network is created: apply_to binds LokrModule.forward
     enable_elementwise_compile(not args.moss_no_compile)
+    # The fast forward's LoKr+DoRA weight rebuild, fused by torch.compile (~1 bf16 ulp)
+    enable_compiled_rebuild(not (args.moss_stock_lycoris or args.moss_no_compile or args.moss_no_lokr_compile))
     # Rectified-flow target (noise - latents) for contrastive flow matching in train_network (historical flag name).
     args._anima_model = True
 

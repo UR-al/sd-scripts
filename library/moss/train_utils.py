@@ -58,6 +58,9 @@ def add_moss_training_arguments(parser) -> None:
     parser.add_argument("--split_attn", action="store_true", help="per-sample attention (slower, lowest memory)")
     parser.add_argument("--moss_no_compile", action="store_true",
                         help="do not torch.compile the MossBlock elementwise chains (RMSNorm/RoPE/SiTU/residual) on CUDA")
+    parser.add_argument("--moss_no_lokr_compile", action="store_true",
+                        help="do not torch.compile the LyCORIS LoKr+DoRA weight rebuild of the fast forward (compiled results"
+                             " differ by ~1 bf16 ulp)")
     parser.add_argument("--moss_stock_lycoris", action="store_true",
                         help="use LyCORIS's stock LoKr forward and per-call sample merges (slower; same results)")
     parser.add_argument("--moss_no_sample_cache", action="store_true",

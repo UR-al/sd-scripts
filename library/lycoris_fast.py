@@ -7,6 +7,9 @@
 #    buffer without use_scalar). Same float ops in the same order otherwise: output, input grad and the lokr_w1 / lokr_w2 /
 #    dora_scale grads are bit-identical (checked on CPU and on the GPU at MOSS and Anima shapes, bf16 and fp32 inputs).
 #    Other configurations, and calls outside bf16/fp16 autocast, fall back to the stock forward.
+# 1b) Compiled weight rebuild (enable_compiled_rebuild): the per-call kron + add + DoRA norm + scale + bf16 cast over the
+#    full weight is a string of memory-bound kernels (~0.4-0.5 s of every Anima-3.8B step regardless of batch size);
+#    torch.compile fuses it (forward and backward). Same float ops; the norm's reduction order may differ (~1 ulp).
 # 2) Sampling (cached_lokr_weights): the sampler runs many no-grad forwards with fixed weights; build each merged
 #    LoKr+DoRA weight once per sampling round instead of on every call. Bit-identical to the per-call rebuild under
 #    autocast. While cached, each base weight waits in CPU RAM (or stays there with RamTorch), so the cache takes the
@@ -23,6 +26,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from library.elementwise_compile import ElementwiseChains
 from library.utils import setup_logging
 
 setup_logging()
@@ -75,6 +79,26 @@ def _static_eligible(module) -> bool:
 _FLOAT_INPUTS = (torch.float32, torch.bfloat16, torch.float16)
 
 
+def _rebuild_weight(weight, w1, w2, lokr_scale, dora_scale, multiplier, eps, norm_dims, out_dtype):
+    """The merged LoKr+DoRA weight of the fast forward, cast to the autocast dtype (what F.linear casts it to)."""
+    from lycoris.functional.lokr import make_kron
+
+    diff = make_kron(w1, w2, lokr_scale)  # == get_weight(shape) here (fp32)
+    merged = weight + diff.to(dora_scale.dtype)  # bf16 + fp32 -> fp32: the same exact upcast as .to(fp32)
+    norm = torch.linalg.vector_norm(merged, dim=norm_dims, keepdim=True) + eps
+    scale = dora_scale / norm
+    scale = multiplier * (scale - 1) + 1
+    return (merged * scale).to(out_dtype)
+
+
+_REBUILD = ElementwiseChains("LyCORIS LoKr+DoRA weight rebuild", rebuild=_rebuild_weight)
+
+
+def enable_compiled_rebuild(enabled: bool = True) -> None:
+    """torch.compile the merged-weight rebuild of the fast forward (CUDA only; eager fallback on a compile failure)."""
+    _REBUILD.enable(enabled)
+
+
 def _fast_forward(self, x, *args, **kwargs):
     # Under autocast F.linear casts its float input to the autocast dtype, and the stock x.to(fp32) before it is exact for
     # these dtypes, so any float input takes the same path (Anima feeds fp32 LayerNorm outputs, MOSS bf16).
@@ -89,18 +113,17 @@ def _fast_forward(self, x, *args, **kwargs):
         and torch.promote_types(org.weight.dtype, self._cached_dtype) == self._cached_dtype  # bf16/fp16 base, fp32 net
     ):
         return _STOCK_FORWARD(self, x, *args, **kwargs)
-    from lycoris.functional.lokr import make_kron
-
     weight = self.get_org_weight_for_compute(x.device).detach()  # stock uses .data (no grad into the base)
-    diff = make_kron(self.lokr_w1, self.lokr_w2, self.scale)  # == get_weight(shape) here (fp32)
-    merged = weight + diff.to(self._cached_dtype)  # bf16 + fp32 -> fp32: the same exact upcast as .to(fp32)
-    norm = torch.linalg.vector_norm(merged, dim=self._dora_norm_dims, keepdim=True) + self._dora_eps
-    scale = self.dora_scale / norm
-    scale = self.multiplier_buf * (scale - 1) + 1
+    lokr_scale = self.__dict__.get("_fast_lokr_scale")
+    if lokr_scale is None:  # alpha / factor: a numpy scalar in LyCORIS; a plain float keeps torch.compile's guards simple
+        lokr_scale = self.__dict__["_fast_lokr_scale"] = float(self.scale)
+    rebuild = _REBUILD.get(x)["rebuild"]
+    merged = rebuild(weight, self.lokr_w1, self.lokr_w2, lokr_scale, self.dora_scale, self.multiplier_buf, self._dora_eps,
+                     self._dora_norm_dims, torch.get_autocast_dtype(device_type))
     bias = self.get_org_bias_for_compute(x.device)  # moves a RamTorch CPU bias like the stock forward
     if bias is not None:
         bias = bias.to(x.dtype)
-    return F.linear(x, merged * scale, bias)  # autocast casts the fp32 weight to bf16, as before
+    return F.linear(x, merged, bias)  # the weight is already in the autocast dtype (the cast F.linear used to do)
 
 
 def install_fast_lokr_forward() -> bool:
