@@ -1,0 +1,67 @@
+name: Fork tests (moss-image, CPU)
+
+# tests.yml runs the whole suite on main / dev / sd3 only; many upstream tests need a CUDA device, so on a CPU runner
+# this branch runs just the fork's own test files (all CPU, no model files: tests that need them skip).
+on:
+  push:
+    branches:
+      - moss-image
+  pull_request:
+    branches:
+      - moss-image
+
+# CKV2_GHA_1: "Ensure top-level permissions are not set to write-all"
+permissions: read-all
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      CUDA_VISIBLE_DEVICES: "-1"  # as the fork's tests are run locally (test_anima38_integration asserts no GPU)
+      PYTHONIOENCODING: utf-8
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # https://woodruffw.github.io/zizmor/audits/#artipacked
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"  # the training venv's Python (backend/installer.py creates it with 3.11)
+          cache: 'pip'
+
+      - name: Install CPU torch
+        run: |
+          python -m pip install --upgrade pip
+          # The venv's torch 2.7.1 / torchvision 0.22.1 as CPU builds (installer.py installs the cu128 ones);
+          # numpy as installer.py pins it next to torch.
+          pip install torch==2.7.1+cpu torchvision==0.22.1+cpu "numpy~=2.2.6" --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install requirements
+        run: |
+          # requirements.txt unfiltered: on Linux the triton-windows line is skipped by its marker, triton and
+          # bitsandbytes install from manylinux wheels (unused with CPU torch), flash-attn appears only in comments,
+          # and xformers / torchao / flash-attn are installed by installer.py, which this job does not run
+          # (no fork test imports them).
+          # The constraint keeps the CPU torch: anything asking for another torch fails here instead of pulling the
+          # CUDA wheels and nvidia-* packages from PyPI.
+          printf 'torch==2.7.1+cpu\ntorchvision==0.22.1+cpu\n' > "$RUNNER_TEMP/cpu-torch.txt"
+          pip install -r requirements.txt -c "$RUNNER_TEMP/cpu-torch.txt" pytest==9.1.1
+
+      - name: Test with pytest
+        run: >
+          python -m pytest
+          tests/test_anima38_integration.py
+          tests/test_anima_te_caption_cache.py
+          tests/test_anima_speedups.py
+          tests/test_caption_lines_and_alpha.py
+          tests/test_caption_processing_order.py
+          tests/test_config_validation.py
+          tests/test_dora_lr.py
+          tests/test_moss_models.py
+          tests/test_moss_pipeline.py
+          tests/test_precision_logging.py
+          tests/test_requirements_pins.py
+          tests/test_timestep_presets.py
+          tests/test_unsloth_checkpoint_rng.py
