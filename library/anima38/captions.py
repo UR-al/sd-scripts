@@ -1,11 +1,13 @@
 # Caption handling for cached Anima-3.8B training (--anima38_connector).
 #
-# 1. Canonical caption variant. BaseDataset.process_caption_canonical (variant 0 of --cache_caption_variants) never
-#    handles keep_tokens_separator, so with the user's "fixed ||| tags ||| sentence" captions 1 of every 8 cached
+# 1. Canonical caption variant. BaseDataset.process_caption_canonical (variant 0 of --cache_caption_variants) used to
+#    ignore keep_tokens_separator, so with the user's "fixed ||| tags ||| sentence" captions 1 of every N cached
 #    variants fed all three encoders a literal "|||" that no Forge prompt contains. process_caption (variants 1..n,
-#    and the online path the 2.9B config uses) splits on the separator and joins with ", ". canonical_caption() is
+#    and the uncached online path) splits on the separator and joins with ", ". canonical_caption() is
 #    process_caption with every random choice fixed (no dropout, no shuffle, no tag dropout; with enable_wildcard the
-#    first line and first wildcard option), and install_canonical_captions() puts it on each dataset instance (the class is untouched)
+#    first line and first wildcard option). BaseDataset.process_caption_canonical now does the same and returns the
+#    same text (tests/test_anima_te_caption_cache.py), so this patch no longer changes anything; it stays as the 3.8B
+#    cache's own definition. install_canonical_captions() puts it on each dataset instance (the class is untouched)
 #    for the duration of caching only: uninstall_canonical_captions() removes it again, because Windows DataLoader
 #    workers pickle the dataset and a bound method of a foreign function does not pickle.
 #

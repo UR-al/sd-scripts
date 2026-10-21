@@ -1,15 +1,17 @@
 # Anima Strategy Classes
 
+import hashlib
+import json
 import os
 import random
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 
 from library import anima_utils, train_util
-from library.cache_utils import load_npz, save_npz
-from library.strategy_base import LatentsCachingStrategy, TextEncodingStrategy, TokenizeStrategy, TextEncoderOutputsCachingStrategy, variant_key
+from library.cache_utils import CACHE_DTYPE_METADATA_KEY, save_npz
+from library.strategy_base import LatentsCachingStrategy, TextEncodingStrategy, TokenizeStrategy, TextEncoderOutputsCachingStrategy, caption_for_cache, variant_key
 from library import qwen_image_autoencoder_kl
 
 from library.utils import setup_logging
@@ -149,6 +151,41 @@ class AnimaTextEncodingStrategy(TextEncodingStrategy):
         return [prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask]
 
 
+# SHA-1 of the raw caption and the processed caption a *_anima_te.npz encodes (cache_caption_digest). The upstream
+# validity check compares only the caption augmentation settings, never the caption text, so without it an edited
+# caption file silently kept its old encoding. Files written before the digest existed have no such key and are
+# rebuilt once (Qwen3-0.6B is fast).
+CAPTION_DIGEST_KEY = "anima_caption_sha1"
+
+TE_OUTPUT_KEYS = ("prompt_embeds", "attn_mask", "t5_input_ids", "t5_attn_mask")
+
+
+def cache_caption_digest(info) -> str:
+    """Digest of the raw caption + the processed caption the cache encodes as variant 0 (caption_for_cache), so editing
+    the caption file or a deterministic caption setting (prefix/suffix, separators, shuffle on/off, replacements)
+    changes it. Variants 1..n follow from the raw caption and the settings in caption_aug_hash. Without variants the
+    file also stores the caption dropout rate the trainer applies (cache_batch_outputs; with variants it is 0 and
+    caption_aug_hash covers it), so that rate is part of the digest too."""
+    variants = getattr(info, "caption_variants", None)
+    rate = 0.0 if variants and len(variants) > 1 else float(getattr(info, "caption_dropout_rate", 0.0) or 0.0)
+    text = (info.caption or "") + "\x00" + (caption_for_cache(info) or "") + "\x00" + repr(rate)
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def _npz_key(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _read_cached(npz, key: str, stored_dtype: Optional[str], bf16_as_tensor: bool = False):
+    """One npz entry as load_npz returns it (BF16 bits widened to fp32 numpy); with bf16_as_tensor the stored BF16 bits
+    are viewed straight as a torch.bfloat16 tensor instead (same values, no fp32 round trip)."""
+    array = npz[key]
+    if stored_dtype != "bf16":
+        return array
+    bf16 = torch.from_numpy(np.ascontiguousarray(array.astype(np.uint16, copy=False))).view(torch.bfloat16)
+    return bf16 if bf16_as_tensor else bf16.float().numpy()
+
+
 class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
     """Caching strategy for Anima text encoder outputs.
 
@@ -166,9 +203,20 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         cache_dtype: str = "auto",
     ) -> None:
         super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check, is_partial, cache_dtype=cache_dtype)
+        # npz_key(npz path) -> cache_caption_digest of the image's current caption (register_cache_captions)
+        self.caption_text_digests: Dict[str, str] = {}
+        self._logged_missing_caption_digest = False
 
     def get_outputs_npz_path(self, image_abs_path: str) -> str:
         return os.path.splitext(image_abs_path)[0] + self.ANIMA_TEXT_ENCODER_OUTPUTS_NPZ_SUFFIX
+
+    def register_cache_captions(self, infos: List) -> None:
+        """Called by BaseDataset.new_cache_text_encoder_outputs once info.cache_caption (and the caption variants) are
+        set: the digest each image's cache file must carry. The Anima-3.8B subclass checks its own digests."""
+        if not self.cache_to_disk:
+            return
+        for info in infos:
+            self.caption_text_digests[_npz_key(self.get_outputs_npz_path(info.absolute_path))] = cache_caption_digest(info)
 
     def is_disk_cached_outputs_expected(self, npz_path: str, num_caption_variants: int = 0, caption_aug_hash: Optional[str] = None) -> bool:
         if not self.cache_to_disk:
@@ -179,41 +227,42 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
             return True
 
         try:
-            npz = load_npz(npz_path)
-            if "prompt_embeds" not in npz:
-                return False
-            if "attn_mask" not in npz:
-                return False
-            if "t5_input_ids" not in npz:
-                return False
-            if "t5_attn_mask" not in npz:
-                return False
-            if "caption_dropout_rate" not in npz:
-                return False
-            required_keys = {"prompt_embeds", "attn_mask", "t5_input_ids", "t5_attn_mask"}
-            if not self._check_cached_variant_keys(npz, required_keys, num_caption_variants, caption_aug_hash):
-                return False
+            with np.load(npz_path, allow_pickle=False) as npz:  # lazy: only the entries read below are decompressed
+                for key in TE_OUTPUT_KEYS + ("caption_dropout_rate",):
+                    if key not in npz:
+                        return False
+                expected_digest = self.caption_text_digests.get(_npz_key(npz_path))
+                if expected_digest is not None:
+                    stored_digest = str(npz[CAPTION_DIGEST_KEY].tolist()) if CAPTION_DIGEST_KEY in npz else None
+                    if stored_digest != expected_digest:
+                        if stored_digest is not None:
+                            logger.info(f"caption changed since caching, rebuilding: {npz_path}")
+                        elif not self._logged_missing_caption_digest:
+                            self._logged_missing_caption_digest = True
+                            logger.info(f"Anima TE caches written before caption digests are rebuilt once (first: {npz_path})")
+                        return False
+                if not self._check_cached_variant_keys(npz, set(TE_OUTPUT_KEYS), num_caption_variants, caption_aug_hash):
+                    return False
         except Exception as e:
             logger.error(f"Error loading file: {npz_path}")
             raise e
 
         return True
 
-    def load_outputs_npz(self, npz_path: str, variant: int = 0) -> List[np.ndarray]:
-        data, dtypes = load_npz(npz_path, return_dtypes=True)
-        prompt_embeds = self._npz_get(data, "prompt_embeds", variant)
-        attn_mask = self._npz_get(data, "attn_mask", variant)
-        t5_input_ids = self._npz_get(data, "t5_input_ids", variant)
-        t5_attn_mask = self._npz_get(data, "t5_attn_mask", variant)
-        caption_dropout_rate = data["caption_dropout_rate"]
-        # BF16 entries are stored as their uint16 bit layout on disk and decoded
-        # to widened fp32 by load_npz (numpy has no native BF16). Reconstruct the
-        # compact bf16 tensor here so the batch stays bf16 in RAM/queue until the
-        # weight_dtype cast at the model boundary. Legacy fp32/fp16 caches (no
-        # bf16 metadata) keep the historical numpy behavior.
-        if dtypes.get("prompt_embeds") == "bf16":
-            prompt_embeds = torch.from_numpy(np.ascontiguousarray(prompt_embeds)).to(dtype=torch.bfloat16)
-        return [prompt_embeds, attn_mask, t5_input_ids, t5_attn_mask, caption_dropout_rate]
+    def load_outputs_npz(self, npz_path: str, variant: int = 0) -> List[Any]:
+        """Reads only the chosen variant's entries and caption_dropout_rate (load_npz would decompress every variant in
+        the file and widen each BF16 one to fp32). BF16 prompt_embeds come back as a compact torch.bfloat16 tensor
+        straight from the stored bits, so the batch stays bf16 in RAM/queue until the weight_dtype cast at the model
+        boundary; everything else, and legacy fp32/fp16 caches, exactly as load_npz returns it."""
+        with np.load(npz_path, allow_pickle=False) as npz:
+            files = set(npz.files)
+            dtypes = json.loads(str(npz[CACHE_DTYPE_METADATA_KEY].tolist())) if CACHE_DTYPE_METADATA_KEY in files else {}
+            outputs = []
+            for base_key in TE_OUTPUT_KEYS:
+                key = variant_key(base_key, variant) if variant > 0 and variant_key(base_key, variant) in files else base_key
+                outputs.append(_read_cached(npz, key, dtypes.get(key), bf16_as_tensor=base_key == "prompt_embeds"))
+            caption_dropout_rate = _read_cached(npz, "caption_dropout_rate", dtypes.get("caption_dropout_rate"))
+        return outputs + [caption_dropout_rate]
 
     def cache_batch_outputs(
         self,
@@ -267,6 +316,7 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
             if self.cache_to_disk:
                 save_kwargs = {key: batched[key][i] for key in base_keys}
                 save_kwargs["caption_dropout_rate"] = caption_dropout_rate
+                save_kwargs[CAPTION_DIGEST_KEY] = np.array(cache_caption_digest(info))
                 for k, (group, vb) in enumerate(variant_batched, start=1):
                     idxs = [idx for idx, _ in group]
                     if i not in idxs:

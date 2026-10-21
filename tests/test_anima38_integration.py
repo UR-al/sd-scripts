@@ -899,14 +899,13 @@ def test_canonical_caption_is_process_caption_without_randomness(monkeypatch, su
     for caption in USER_CAPTIONS + ["a ;;; b, c ||| d"]:
         expected = train_util.BaseDataset.process_caption(dataset, subset, caption)
         assert a38_captions.canonical_caption(dataset, subset, caption) == expected, caption
+        assert train_util.BaseDataset.process_caption_canonical(dataset, subset, caption) == expected, caption
         if subset.shuffle_caption:
             assert "|||" not in expected
-    # the fork's own canonical variant keeps the separator (what F1 was about)
-    original = train_util.BaseDataset.process_caption_canonical(dataset, _caption_subset(), USER_CAPTIONS[0])
-    assert "|||" in original
-    assert a38_captions.canonical_caption(dataset, _caption_subset(), USER_CAPTIONS[0]) == (
-        "@ennjomon, 1boy, male focus, muscular male, short hair, A large man stands on a beach."
-    )
+    # the fork's own canonical variant used to keep the separator (what F1 was about); it now gives the same text
+    joined = "@ennjomon, 1boy, male focus, muscular male, short hair, A large man stands on a beach."
+    assert train_util.BaseDataset.process_caption_canonical(dataset, _caption_subset(), USER_CAPTIONS[0]) == joined
+    assert a38_captions.canonical_caption(dataset, _caption_subset(), USER_CAPTIONS[0]) == joined
 
 
 def test_install_canonical_captions_patches_instances_and_build_caption_variants_uses_it():
@@ -931,7 +930,7 @@ def test_install_canonical_captions_patches_instances_and_build_caption_variants
     assert a38_captions.uninstall_canonical_captions(group) == 2
     assert a38_captions.uninstall_canonical_captions(group) == 0
     pickle.loads(pickle.dumps(dataset))
-    # the class itself is untouched: other datasets / the plain Anima trainer keep the fork's behaviour
+    # the class itself is untouched (its own canonical function gives the same text since the F5 fix)
     assert "process_caption_canonical" not in vars(_bare_dataset())
     assert train_util.BaseDataset.process_caption_canonical is not a38_captions.canonical_caption
 

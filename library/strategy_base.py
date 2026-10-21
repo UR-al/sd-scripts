@@ -453,8 +453,9 @@ class TextEncodingStrategy:
 def caption_for_cache(info) -> str:
     """The caption a Text Encoder caching strategy must encode for ``info``: variant 0 when caption variants were
     built, else the deterministically processed caption (``info.cache_caption``, set by
-    ``BaseDataset.new_cache_text_encoder_outputs`` with prefix/suffix, secondary separator, replacements and the
-    enable_wildcard first line/option applied), else the raw caption. Never ``info.caption`` directly (PR #2455)."""
+    ``BaseDataset.new_cache_text_encoder_outputs`` with prefix/suffix, secondary separator, replacements, the
+    enable_wildcard first line/option and, under shuffle / tag dropout / token warmup, the keep_tokens /
+    keep_tokens_separator split joined with ", " applied), else the raw caption. Never ``info.caption`` directly (PR #2455)."""
     variants = getattr(info, "caption_variants", None)
     if variants:
         return variants[0]

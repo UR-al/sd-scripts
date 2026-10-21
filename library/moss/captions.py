@@ -1,8 +1,10 @@
 # Caption handling for cached MOSS-Image training.
 #
-# 1. Canonical caption variant. BaseDataset.process_caption_canonical (variant 0 of --cache_caption_variants) ignores
-#    keep_tokens_separator, so "fixed ||| tags ||| sentence" captions would reach the text encoder with a literal "|||"
-#    in one of every N cached variants. canonical_caption() is BaseDataset.process_caption with every random choice
+# 1. Canonical caption variant. BaseDataset.process_caption_canonical (variant 0 of --cache_caption_variants) used to
+#    ignore keep_tokens_separator, so "fixed ||| tags ||| sentence" captions reached the text encoder with a literal
+#    "|||" in one of every N cached variants. It now returns the same text as canonical_caption() below
+#    (tests/test_anima_te_caption_cache.py); this stays as MOSS's own definition. canonical_caption() is
+#    BaseDataset.process_caption with every random choice
 #    fixed (no caption dropout, no shuffle, no tag dropout; with enable_wildcard the first line and the first wildcard
 #    option): the same joins as the shuffled variants. It is installed on each dataset INSTANCE only while caching (Windows DataLoader workers
 #    pickle the dataset, and a bound foreign function does not pickle).

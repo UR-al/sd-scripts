@@ -1206,11 +1206,13 @@ class BaseDataset(torch.utils.data.Dataset):
     def process_caption_canonical(self, subset: BaseSubset, caption: str) -> str:
         """Deterministic caption processing for the canonical variant (variant 0).
 
-        Applies prefix/suffix, secondary separator and replacements; with enable_wildcard it takes
-        the first line of multiline captions (before prefix/suffix, like process_caption) and the
-        first option of wildcards (without it the caption is used whole, as process_caption does),
-        and skips all stochastic processing (dropout, shuffle, tag dropout, random wildcard/line
-        selection).
+        process_caption with every random choice fixed, in the same order: prefix/suffix, with
+        enable_wildcard the first line of multiline captions (chosen before prefix/suffix) and the
+        first option of wildcards (without it the caption is used whole), the keep_tokens /
+        keep_tokens_separator split joined with ", " (when shuffle, token warmup or tag dropout is
+        on, as in process_caption: a "fixed ||| tags ||| sentence" caption never reaches the text
+        encoder with a literal separator), secondary separator and replacements. No caption dropout,
+        shuffle, tag dropout or token warmup truncation.
         """
         if subset.enable_wildcard:
             # multiline: first line (process_caption picks a random one), chosen before prefix/suffix
@@ -1231,6 +1233,27 @@ class BaseDataset(torch.utils.data.Dataset):
             caption = caption.replace("{{", replacer1).replace("}}", replacer2)
             caption = re.sub(r"\{([^}]+)\}", lambda m: m.group(1).split("|")[0], caption)
             caption = caption.replace(replacer1, "{").replace(replacer2, "}")
+
+        # the fixed|flex|suffix split and ", " join of process_caption, in the original tag order
+        if subset.shuffle_caption or subset.token_warmup_step > 0 or subset.caption_tag_dropout_rate > 0:
+            separator = getattr(subset, "keep_tokens_separator", None)
+            fixed_tokens = []
+            flex_tokens = []
+            fixed_suffix_tokens = []
+            if separator and separator in caption:
+                fixed_part, flex_part = caption.split(separator, 1)
+                if separator in flex_part:
+                    flex_part, fixed_suffix_part = flex_part.split(separator, 1)
+                    fixed_suffix_tokens = [t.strip() for t in fixed_suffix_part.split(subset.caption_separator) if t.strip()]
+                fixed_tokens = [t.strip() for t in fixed_part.split(subset.caption_separator) if t.strip()]
+                flex_tokens = [t.strip() for t in flex_part.split(subset.caption_separator) if t.strip()]
+            else:
+                tokens = [t.strip() for t in caption.strip().split(subset.caption_separator)]
+                flex_tokens = tokens[:]
+                if subset.keep_tokens > 0:
+                    fixed_tokens = flex_tokens[: subset.keep_tokens]
+                    flex_tokens = tokens[subset.keep_tokens :]
+            caption = ", ".join(fixed_tokens + flex_tokens + fixed_suffix_tokens)
 
         # process secondary separator
         if subset.secondary_separator:
@@ -2274,12 +2297,18 @@ class BaseDataset(torch.utils.data.Dataset):
         image_infos = list(self.image_data.values())
 
         # Every caching strategy encodes the deterministically processed caption (prefix/suffix, secondary separator,
-        # replacements, first line / first {a|b} option under enable_wildcard) instead of the raw caption file
-        # (upstream PR #2455). Infos with caption variants carry it as variant 0; the strategies read it through
-        # strategy_base.caption_for_cache.
+        # replacements, first line / first {a|b} option under enable_wildcard, the keep_tokens_separator split and ", "
+        # join under shuffle / tag dropout) instead of the raw caption file (upstream PR #2455). Infos with caption
+        # variants carry it as variant 0; the strategies read it through strategy_base.caption_for_cache.
         for info in image_infos:
             subset = self.image_to_subset[info.image_key]
             info.cache_caption = None if info.caption is None else self.process_caption_canonical(subset, info.caption)
+
+        # A strategy that checks which caption a cache file was encoded from (the plain Anima one) learns every image's
+        # caption now that the processed text is known: an edited caption file or caption setting rebuilds the file.
+        register_cache_captions = getattr(caching_strategy, "register_cache_captions", None)
+        if register_cache_captions is not None:
+            register_cache_captions(image_infos)
 
         # split by resolution
         batches = []
