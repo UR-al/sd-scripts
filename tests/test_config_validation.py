@@ -2,6 +2,7 @@
 
 Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe -m pytest tests/test_config_validation.py
 """
+import ast
 import os
 import sys
 
@@ -61,9 +62,9 @@ def test_booleans_must_be_toml_booleans(parser):
 
 def test_numbers_and_strings_convert_like_the_command_line(parser):
     out = validate_config({"learning_rate": "1e-4", "max_train_epochs": 10.0, "network_dim": "16",
-                           "moss_lora_exclude_blocks": 22, "network_alpha": 4}, parser)
-    assert out == {"learning_rate": 1e-4, "max_train_epochs": 10, "network_dim": 16, "moss_lora_exclude_blocks": "22",
-                   "network_alpha": 4.0}
+                           "moss_sample_uncond_skip_layers": 22, "network_alpha": 4}, parser)
+    assert out == {"learning_rate": 1e-4, "max_train_epochs": 10, "network_dim": 16,
+                   "moss_sample_uncond_skip_layers": "22", "network_alpha": 4.0}
     assert type(out["max_train_epochs"]) is int and type(out["network_alpha"]) is float
     message = _problems({"max_train_epochs": 2.5, "learning_rate": True, "seed": "abc", "output_name": [1]}, parser)
     for key in ("max_train_epochs = 2.5", "learning_rate = True", "seed = 'abc'", "output_name = [1]"):
@@ -82,6 +83,34 @@ def test_custom_types_convert_strings_only(parser):
     out = validate_config({"sigmoid_scale": "Style", "lr_warmup_steps": "10%", "lr_decay_steps": 50}, parser)
     assert out == {"sigmoid_scale": "style", "lr_warmup_steps": 0.1, "lr_decay_steps": 50}
     assert "sigmoid_scale" in _problems({"sigmoid_scale": "sharp"}, parser)
+
+
+def test_moss_exclude_blocks_take_an_array_and_check_strings(parser, tmp_path, monkeypatch):
+    # A custom type (type=str refused an array): strings are checked, an array or integer reaches the parser as written
+    from library.moss.train_utils import apply_moss_block_exclusion
+
+    for value in ([22, 23], 22, " 22, 1 "):
+        assert validate_config({"moss_lora_exclude_blocks": value}, parser) == {"moss_lora_exclude_blocks": value}
+    assert "needs a string" in _problems({"moss_sample_uncond_skip_layers": [22]}, parser)  # str options still do
+    assert parser.parse_args([]).moss_lora_exclude_blocks == ""
+    assert parser.parse_args(["--moss_lora_exclude_blocks", "22,23"]).moss_lora_exclude_blocks == "22,23"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--moss_lora_exclude_blocks", "22,x"])
+
+    path = tmp_path / "config.toml"
+    path.write_text('[network_arguments]\nnetwork_args = ["algo=lokr", "preset=moss"]\n'
+                    "moss_lora_exclude_blocks = [22, 23]\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["moss_train_network.py", "--config_file", str(path)])
+    args = train_util.read_config_from_file(parser.parse_args(), parser)
+    assert args.moss_lora_exclude_blocks == [22, 23] and apply_moss_block_exclusion(args) == [22, 23]
+    key, _, patterns = args.network_args[-1].partition("=")
+    assert args.network_args[:2] == ["algo=lokr", "preset=moss"] and key == "exclude_patterns"
+    assert ast.literal_eval(patterns) == [r"layers\.22(\..*)?", r"layers\.23(\..*)?"]
+
+    for text, error in (('"22,x"', "takes block indices"), ('"42"', "index 42 is outside 0..41")):
+        path.write_text(f"moss_lora_exclude_blocks = {text}\n", encoding="utf-8")
+        with pytest.raises(ConfigValidationError, match=r"config\.toml:1: moss_lora_exclude_blocks = .*" + error):
+            train_util.read_config_from_file(parser.parse_args(), parser)
 
 
 def test_read_config_from_file(parser, tmp_path, monkeypatch):

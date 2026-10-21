@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import ast
 import contextlib
 import hashlib
@@ -65,7 +66,7 @@ def add_moss_training_arguments(parser) -> None:
                         help="use LyCORIS's stock LoKr forward and per-call sample merges (slower; same results)")
     parser.add_argument("--moss_no_sample_cache", action="store_true",
                         help="sample images without the merged LoKr weight cache (~9 GB less VRAM while sampling; slower)")
-    parser.add_argument("--moss_lora_exclude_blocks", type=str, default="",
+    parser.add_argument("--moss_lora_exclude_blocks", type=moss_exclude_blocks_arg, default="",
                         help="comma-separated joint block indices (0-41) left out of the LoRA/LyCORIS network, e.g. \"22\":"
                              " the block the official sampler's negative branch skips, so CFG's skipped-block contrast stays"
                              " the base model's (ai-toolkit's MOSS preset does this). Changes the network: a --resume state or"
@@ -217,6 +218,17 @@ def parse_moss_exclude_blocks(value, num_layers: int = MOSS_DIT_CONFIG["num_laye
             raise ValueError(f"MOSS-Image: moss_lora_exclude_blocks index {index} is outside 0..{num_layers - 1}")
         blocks.add(index)
     return sorted(blocks)
+
+
+def moss_exclude_blocks_arg(value):
+    """argparse type of --moss_lora_exclude_blocks: checks the indices and keeps the value as given. config_validation
+    converts a TOML string with a custom type (a bad "22,x" fails when the config is read, with the file and line) and
+    passes an array or integer through unconverted to parse_moss_exclude_blocks; type=str refused [22, 23]."""
+    try:
+        parse_moss_exclude_blocks(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+    return value
 
 
 def moss_block_exclude_patterns(blocks: Sequence[int]) -> List[str]:
