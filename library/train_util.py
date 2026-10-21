@@ -7053,6 +7053,80 @@ def is_wrapper_optimizer(args: argparse.Namespace) -> bool:
         
     return False
 
+
+# get_optimizer's built-in names (lower case) -> (module, class). get_optimizer itself is left as upstream wrote it (each
+# branch also adjusts kwargs, args and logging); tests/test_dora_lr.py checks every entry against the class it builds.
+_OPTIMIZER_TYPE_CLASSES = {
+    "lion": ("lion_pytorch", "Lion"),
+    "adamw8bit": ("bitsandbytes.optim", "AdamW8bit"),
+    "sgdnesterov8bit": ("bitsandbytes.optim", "SGD8bit"),
+    "lion8bit": ("bitsandbytes.optim", "Lion8bit"),
+    "pagedadamw8bit": ("bitsandbytes.optim", "PagedAdamW8bit"),
+    "pagedlion8bit": ("bitsandbytes.optim", "PagedLion8bit"),
+    "pagedadamw": ("bitsandbytes.optim", "PagedAdamW"),
+    "pagedadamw32bit": ("bitsandbytes.optim", "PagedAdamW32bit"),
+    "sgdnesterov": ("torch.optim", "SGD"),
+    "dadaptation": ("dadaptation.experimental", "DAdaptAdamPreprint"),
+    "dadaptadampreprint": ("dadaptation.experimental", "DAdaptAdamPreprint"),
+    "dadaptadagrad": ("dadaptation", "DAdaptAdaGrad"),
+    "dadaptadam": ("dadaptation", "DAdaptAdam"),
+    "dadaptadan": ("dadaptation", "DAdaptAdan"),
+    "dadaptadanip": ("dadaptation.experimental", "DAdaptAdanIP"),
+    "dadaptlion": ("dadaptation", "DAdaptLion"),
+    "dadaptsgd": ("dadaptation", "DAdaptSGD"),
+    "prodigy": ("prodigyopt", "Prodigy"),
+    "adafactor": ("transformers.optimization", "Adafactor"),
+    "adamw": ("torch.optim", "AdamW"),
+    "radamschedulefree": ("schedulefree", "RAdamScheduleFree"),
+    "adamwschedulefree": ("schedulefree", "AdamWScheduleFree"),
+    "sgdschedulefree": ("schedulefree", "SGDScheduleFree"),
+}
+
+
+def resolve_optimizer_class(args: argparse.Namespace) -> type:
+    """The class get_optimizer builds for these args, imported but not instantiated: --use_8bit_adam / --use_lion_optimizer,
+    the built-in names in any case (AdamW8bit, PagedAdamW*, Lion, SGDNesterov, DAdapt*, Prodigy, Adafactor, *ScheduleFree,
+    "adamw"), else a torch.optim class or a dotted path (a wrapper optimizer is the wrapper class). Raises where get_optimizer
+    would: a missing package, an unknown name."""
+    optimizer_type = args.optimizer_type
+    if getattr(args, "use_8bit_adam", False):
+        optimizer_type = "AdamW8bit"
+    elif getattr(args, "use_lion_optimizer", False):
+        optimizer_type = "Lion"
+    if not optimizer_type:
+        optimizer_type = "AdamW"
+    name = optimizer_type.lower()
+
+    # get_optimizer imports bitsandbytes / schedulefree for every *8bit / *schedulefree name, also the ones it then looks up
+    # as a torch.optim class or a dotted path, and knows only its own DAdapt* names
+    if name.endswith("8bit"):
+        importlib.import_module("bitsandbytes")
+    elif name.startswith("dadapt") and name not in _OPTIMIZER_TYPE_CLASSES:
+        raise ValueError(f"Unknown optimizer type: {name}")
+    elif name.endswith("schedulefree"):
+        importlib.import_module("schedulefree")
+    if name in _OPTIMIZER_TYPE_CLASSES:
+        module_name, class_name = _OPTIMIZER_TYPE_CLASSES[name]
+        return getattr(importlib.import_module(module_name), class_name)
+
+    case_sensitive_optimizer_type = args.optimizer_type  # not lower
+    if "." not in case_sensitive_optimizer_type:  # from torch.optim
+        return getattr(torch.optim, case_sensitive_optimizer_type)
+    values = case_sensitive_optimizer_type.split(".")
+    return getattr(importlib.import_module(".".join(values[:-1])), values[-1])
+
+
+def optimizer_init_parameters(args: argparse.Namespace, optimizer_kwargs: Dict) -> typing.Mapping[str, inspect.Parameter]:
+    """__init__ parameters of the optimizer that receives optimizer_kwargs: the resolve_optimizer_class class, or for a wrapper
+    optimizer its base_optimizer_type, to which the wrappers pass the keyword arguments on."""
+    optimizer_class = resolve_optimizer_class(args)
+    if args.optimizer_type and is_wrapper_optimizer(args):
+        base_optimizer_values = optimizer_kwargs.get("base_optimizer_type", None).split(".")
+        base_optimizer_module = importlib.import_module(".".join(base_optimizer_values[:-1]))
+        optimizer_class = getattr(base_optimizer_module, base_optimizer_values[-1])
+    return inspect.signature(optimizer_class.__init__).parameters
+
+
 def get_dummy_scheduler(optimizer: Optimizer) -> Any:
     # dummy scheduler for schedulefree optimizer. supports only empty step(), get_last_lr() and optimizers.
     # this scheduler is used for logging only.
@@ -9222,32 +9296,13 @@ def prepare_optimizer(args, network, accelerator):
             optimizer_kwargs[key] = value
 
     try:
-        # Check optimizer defaults
-        case_sensitive_optimizer_type = args.optimizer_type  # not lower
-
-        if "." not in case_sensitive_optimizer_type:  # from torch.optim
-            optimizer_module = torch.optim
-        else:  # from other library
-            values = case_sensitive_optimizer_type.split(".")
-            optimizer_module = importlib.import_module(".".join(values[:-1]))
-            case_sensitive_optimizer_type = values[-1]
-
-        # Need to handle base optimizer
-        if case_sensitive_optimizer_type.lower() == "schedulefreewrapper" or args.optimizer_type.lower().endswith("snoo_asgd".lower()):
-            case_sensitive_full_base_optimizer_name = optimizer_kwargs.get("base_optimizer_type", None)
-            base_optimizer_values = case_sensitive_full_base_optimizer_name.split(".")
-            base_optimizer_module = importlib.import_module(".".join(base_optimizer_values[:-1]))
-            case_sensitive_base_optimizer_type = base_optimizer_values[-1]
-            optimizer_class = getattr(base_optimizer_module, case_sensitive_base_optimizer_type)
-        else:
-            optimizer_class = getattr(optimizer_module, case_sensitive_optimizer_type)
-        
-        sig = inspect.signature(optimizer_class.__init__)
-
-        optimizer_init_sig_parameters = sig.parameters
+        # Check optimizer defaults: the class get_optimizer builds (AdamW8bit, lower case adamw, ... resolved the same way)
+        optimizer_init_sig_parameters = optimizer_init_parameters(args, optimizer_kwargs)
+        optimizer_signature_known = True
     except Exception as e:
         logger.warning(f"Encountered an error while trying to determine default orthograd from optimizer init signature. {e}")
         optimizer_init_sig_parameters = {}
+        optimizer_signature_known = False
 
     apply_orthograd = any(optimizer_kwargs.get(key, getattr(optimizer_init_sig_parameters.get(key, types.SimpleNamespace()), "default", False)) == True for key in ['use_orthograd', 'orthograd'])
 
@@ -9329,10 +9384,18 @@ def prepare_optimizer(args, network, accelerator):
     from library import dora_lr
 
     decay_keys = [k for k in dora_lr.DECAY_KEYS if k in optimizer_kwargs or k in optimizer_init_sig_parameters]
-    trainable_params, lr_descriptions = dora_lr.split_dora_param_groups(
+    decay_known = bool(decay_keys) or optimizer_signature_known
+    split_params, split_descriptions = dora_lr.split_dora_param_groups(
         network, trainable_params, lr_descriptions, dora_lr.dora_learning_rate(args), default_lr=args.learning_rate,
-        weight_decay=dora_lr.dora_weight_decay(args), decay_keys=decay_keys,
+        weight_decay=dora_lr.dora_weight_decay(args),
+        decay_keys=decay_keys if decay_known else None,  # None: unknown, dora_lr warns
     )
+    if split_params is not trainable_params and dora_lr.resume_predates_split(args, trainable_params, split_params):
+        dora_lr.drop_dora_group(args)  # --resume state saved without the DoRA group: resume it with its own layout (warned)
+    else:
+        trainable_params, lr_descriptions = split_params, split_descriptions
+        if not decay_known:
+            dora_lr.mark_weight_decay_unknown(args)  # metadata must not claim weight_decay_DoRA
 
     optimizer_name, optimizer_args, optimizer = get_optimizer(args, trainable_params, optimizer_kwargs)
     optimizer_train_fn, optimizer_eval_fn = get_optimizer_train_eval_fn(optimizer, args)
