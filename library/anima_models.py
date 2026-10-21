@@ -69,11 +69,25 @@ except ImportError:
             )
 
 
+def _cuda_rng_devices(*args) -> list:
+    """Indices of the CUDA devices holding the tensors in args (looks one level into tuples, e.g. rope_cos_sin)."""
+    devices = set()
+    for arg in args:
+        for t in arg if isinstance(arg, (tuple, list)) else (arg,):
+            if isinstance(t, torch.Tensor) and t.is_cuda:
+                devices.add(t.get_device())
+    return sorted(devices)
+
+
 class UnslothOffloadedGradientCheckpointer(torch.autograd.Function):
     """Saves VRAM by offloading activations to CPU RAM using non-blocking transfers.
 
     Compared to standard cpu_offload_checkpointing which uses blocking transfers,
     this uses non_blocking=True to hide CPU<->GPU transfer latency behind compute.
+
+    Like torch.utils.checkpoint (preserve_rng_state=True), the recomputation in backward replays the RNG states of the
+    forward pass, so dropout masks (nn.Dropout, LyCORIS dropout / rank_dropout / module_dropout) match the ones the
+    loss saw, and leaves the caller's RNG streams where they were.
     """
 
     @staticmethod
@@ -81,6 +95,10 @@ class UnslothOffloadedGradientCheckpointer(torch.autograd.Function):
     def forward(ctx, forward_function, hidden_states, *args):
         # Remember the original device for backward pass (multi-GPU support)
         ctx.input_device = hidden_states.device
+        # RNG states the block starts from: CPU always, CUDA only for the devices the inputs are on (none on CPU inputs)
+        ctx.cpu_rng_state = torch.get_rng_state()
+        ctx.cuda_rng_devices = _cuda_rng_devices(hidden_states, *args)
+        ctx.cuda_rng_states = [torch.cuda.get_rng_state(d) for d in ctx.cuda_rng_devices]
         saved_hidden_states = hidden_states.to("cpu", non_blocking=True)
         with torch.no_grad():
             output = forward_function(hidden_states, *args)
@@ -100,8 +118,13 @@ class UnslothOffloadedGradientCheckpointer(torch.autograd.Function):
         hidden_states.requires_grad_(True)
         args = detach_variable(ctx.args)
         inputs = (hidden_states,) + args
-        with torch.enable_grad():
-            outputs = ctx.forward_function(*inputs)
+        # Replay the forward's RNG states; fork_rng gives the caller its own back, so backward draws no random numbers
+        with torch.random.fork_rng(devices=ctx.cuda_rng_devices):
+            torch.set_rng_state(ctx.cpu_rng_state)
+            for device, state in zip(ctx.cuda_rng_devices, ctx.cuda_rng_states):
+                torch.cuda.set_rng_state(state, device)
+            with torch.enable_grad():
+                outputs = ctx.forward_function(*inputs)
 
         output_tensors = []
         grad_tensors = []
