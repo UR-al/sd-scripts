@@ -57,6 +57,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         self.ileco_text_encoder_conds = None
         self.ileco_prompt_pairs = None
         self.addift_pair_settings = None
+        self._tsm_grouped_supported = True  # TSM-LoKr tsm_grouped_accumulation: see get_noise_pred_and_target
         # Cache of zero padding masks keyed by (batch, height, width, dtype, device).
         # The Anima DiT consumes padding_mask read-only (resize/expand/concat, never
         # mutated in place), so a single reusable buffer per key avoids a fresh CUDA
@@ -1033,6 +1034,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             self.sample_prompts_te_outputs,
         )
 
+    def _lycoris_fix_sampler_timestep_scale(self):
+        # LyCORIS fixed paths: the sampler calls dit(x, sigma, ...) with sigma in [0, 1]; training masks use sigma*1000
+        return 1000.0
+
     def get_noise_scheduler(self, args: argparse.Namespace, device: torch.device) -> Any:
         noise_scheduler = sd3_train_utils.FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, shift=args.discrete_flow_shift)
         return noise_scheduler
@@ -1134,16 +1139,24 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             self._adaptive_last_noise = noise.detach()
 
         # Get noisy model input and timesteps
-        noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
-            args,
-            noise_scheduler,
-            latents,
-            noise,
-            accelerator.device,
-            weight_dtype,
-            fixed_timesteps=adaptive_fixed_timesteps,
-            is_train=is_train,
-        )
+        def draw_noisy_model_input():
+            return flux_train_utils.get_noisy_model_input_and_timesteps(
+                args,
+                noise_scheduler,
+                latents,
+                noise,
+                accelerator.device,
+                weight_dtype,
+                fixed_timesteps=adaptive_fixed_timesteps,
+                is_train=is_train,
+            )
+
+        tsm_plan = getattr(self, "_tsm_offload", None)
+        if is_train and adaptive_fixed_timesteps is None and tsm_plan is not None and tsm_plan.grouped:
+            # TSM-LoKr tsm_grouped_accumulation: every sample of this optimizer step in one core interval (redraws)
+            noisy_model_input, timesteps, sigmas = tsm_plan.grouped_draw(draw_noisy_model_input)
+        else:
+            noisy_model_input, timesteps, sigmas = draw_noisy_model_input()
         # Store noisy latents for LWD wavelet masking (used in process_batch via base class)
         # Must be stored BEFORE unsqueeze to 5D (wavelet DWT expects 4D)
         if is_train and getattr(self, "wavelet_masking_enabled", False):

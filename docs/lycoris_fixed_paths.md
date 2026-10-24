@@ -1,0 +1,48 @@
+# LyCORIS fixed paths (default) and `--lycoris_stock`
+
+For `network_module = "lycoris.kohya"` every trainer of this fork built on `train_network.py`'s `NetworkTrainer`
+(Anima incl. `anima_train_addift.py`, MOSS, SDXL, FLUX, SD3, Lumina, HunyuanImage) runs LyCORIS through
+`library/lycoris_algo_fixes.py`: in-memory fixes for algorithms that are broken on these trainers, faster forwards that
+compute the same function, and saves that Forge reads correctly. LyCORIS in site-packages is not modified.
+
+Scripts that build or merge LyCORIS networks themselves keep stock LyCORIS: the LECO trainers (`anima_train_leco.py`,
+`sdxl_train_leco.py`, `train_leco.py`), `gen_img*.py` and the merge tools, and `train_network.py`'s own
+`--base_weights` merge (it runs before the patches are applied).
+
+| setting | effect |
+|---|---|
+| nothing (default) | fixed paths on for LyCORIS networks |
+| `lycoris_stock = true` / `--lycoris_stock` | LyCORIS exactly as installed; `library/lycoris_algo_fixes.py` is not imported; `algo=tsm-lokr` is refused |
+| `lycoris_algo_fixes = true` / `--lycoris_algo_fixes` | the old opt-in switch: accepted for old configs, changes nothing (one log line) |
+| both | `--lycoris_stock` wins (warning) |
+
+Other network modules (`networks.lora`, ...) are never touched. `--lycoris_stock` is not `--anima_stock_lycoris`
+(that one only turns off the fast LoKr+DoRA forward of `library/lycoris_fast.py`).
+
+Saved files of the fixed paths carry three extra metadata keys: `ss_lycoris_algo_fixes = "1"`, `ss_saved_format`
+(`lora`, `loha`, `lokr`, `oft`, `boft`, `glora`, `diff`, `tsm-native`, `tsm-lokr-native`, `ia3-native`) and
+`ss_lycoris_algo`.
+
+## What changes per algo
+
+The module header of `library/lycoris_algo_fixes.py` lists, per algo, what stock LyCORIS does wrong on these trainers
+(with the LyCORIS source lines) and what the fixed path does; every patched function is listed in
+`apply_module_patches()` and logged at start-up. In short:
+
+- `lokr` (the production setting): training at multiplier 1 is bit-identical to stock (the fast LoKr+DoRA forward of
+  `library/lycoris_fast.py` still does every multiplier-1 call); only DoRA at multiplier != 1 (the teacher / target
+  passes of differential output preservation, iLECO and ADDifT) now interpolates `W0 + m (W1 - W0)` like Forge instead
+  of keeping the whole update. Sample images during training always use multiplier 1.
+- `lora`, `locon`, `ortholora`, `dylora`, `gora`, `ralora`, `lora2`, `tlora`, `loha`, `abba`, `diag-oft`, `boft`,
+  `tsm`, `glora`: faster forwards (no dense delta / merged weight per call where that is cheaper), same math.
+- `ralora`, `gora`, `lora2`, `tlora`, `abba`, `dylora`, `ortholora`, PiSSA, `full`, `glora`, `ia3`, `tsm`: training,
+  resume and save fixes (see the module header).
+- `dora_wd=True` on an algo whose LyCORIS module ignores it (diag-oft, boft, tlora, tsm, dylora, glora, ia3, full)
+  stops with an error instead of training without DoRA.
+- `full`: the trained weights are fp32 master weights (stock kept them in bf16 and lost small AdamW steps): with AdamW
+  that is 16 bytes per adapted base parameter on the GPU, twice the stock footprint (the size is logged at start-up).
+- `algo=tsm-lokr`: see `docs/tsm_lokr.md`.
+
+Known limitation: GoRA / RaLoRA / LoRA² with DoRA on the factored path (`_LowRankDoRA`, RaLoRA blocks): a `dora_scale`
+entry that is exactly 0 on a nonzero base row (LyCORIS never initialises one, it starts at `||W0_i||`; only a file
+trained on another base can bring one) gets that entry's gradient without its base term; everything else stays exact.

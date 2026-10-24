@@ -76,6 +76,10 @@ try:
 except ImportError:
     LORA2_AVAILABLE = False
 
+# LyCORIS fixed paths (default; --lycoris_stock turns them off): where the GoRA/RaLoRA allocation is kept for --resume (state dir) and --network_weights (metadata)
+LYCORIS_ALLOC_STATE_FILE = "gora_alloc.json"
+LYCORIS_ALLOC_METADATA_KEY = "ss_lycoris_alloc"
+
 setup_logging()
 import logging
 import warnings
@@ -103,6 +107,18 @@ class NetworkTrainer:
         self.tlora_mask_alpha = 1.0
         self.tlora_max_timestep = 1000
         self.tlora_use_network_method = False  # True → use network.set_timestep_mask()
+
+        # LyCORIS fixed/optimised code paths (library/lycoris_algo_fixes.py): on by default for network_module=lycoris.kohya,
+        # off with --lycoris_stock; everything below stays unused while they are off
+        self._lycoris_fix_on = False
+        self._lycoris_fixes = None  # the module, imported only when the fixed paths are on
+        self._lycoris_fix_algo = ""
+        self._lycoris_fix_alloc = None  # GoRA/RaLoRA per-module allocation, saved as gora_alloc.json and in metadata
+        self._lycoris_fix_defer_clear = False  # True between a training forward and its accelerator.backward
+        self._lycoris_fix_tsm_checked = False
+        self._lycoris_fix_sampling_logged = False
+        self._tsm_offload = None  # TSM-LoKr core-expert offload manager (library/tsm_offload.py), algo=tsm-lokr only
+        self._tsm_grouped_supported = False  # trainers that implement tsm_grouped_accumulation set this
 
         # LoRA² adaptive rank regularization config
         self.lora2_enabled = False
@@ -1227,6 +1243,8 @@ class NetworkTrainer:
         which uses a shared GPU buffer aliased across all modules) or the
         module-level functions from lycoris.modules.tlora (full TLoraModule).
         """
+        if getattr(self, "_lycoris_fix_on", False):
+            self._lycoris_fix_set_timestep(timesteps)  # T-LoRA / TSM per-step timestep, [0, max_timestep]
         if not self.tlora_enabled:
             return
 
@@ -1255,12 +1273,194 @@ class NetworkTrainer:
 
     def clear_tlora_mask_if_needed(self):
         """Clear the T-LoRA mask after the forward pass."""
+        if getattr(self, "_lycoris_fix_defer_clear", False):
+            # LyCORIS fixed paths: gradient checkpointing re-runs the forward inside backward, so the mask (and the TSM
+            # timestep) must survive until accelerator.backward; _lycoris_fix_after_backward clears it.
+            return
+        if getattr(self, "_lycoris_fix_on", False):
+            self._lycoris_fix_clear_timestep()
         if not self.tlora_enabled:
             return
         if self.tlora_use_network_method:
             self.network.clear_timestep_mask()
         else:
             clear_timestep_mask()
+
+    # region LyCORIS fixed paths (library/lycoris_algo_fixes.py): the default for LyCORIS, off with --lycoris_stock.
+    # The methods below run only while they are on.
+
+    def _lycoris_fix_setup(self, args) -> bool:
+        """LyCORIS networks (network_module=lycoris.kohya) get the fixed/optimised code paths by default: import the fixes
+        module and monkeypatch LyCORIS before the network is created. --lycoris_stock keeps LyCORIS exactly as installed
+        (the module is not even imported). --lycoris_algo_fixes is still accepted (old configs) and changes nothing.
+        False: --lycoris_stock or not LyCORIS."""
+        stock = bool(getattr(args, "lycoris_stock", False))
+        legacy = bool(getattr(args, "lycoris_algo_fixes", False))
+        if not (args.network_module or "").startswith("lycoris"):
+            if stock or legacy:
+                flag = "--lycoris_stock" if stock else "--lycoris_algo_fixes"
+                logger.warning(
+                    f"{flag} only applies to LyCORIS (network_module=lycoris.kohya); ignored for {args.network_module}"
+                    f" / {flag} 는 LyCORIS 에만 적용됩니다. {args.network_module} 에서는 무시합니다"
+                )
+            return False
+        if stock:
+            if legacy:
+                logger.warning(
+                    "--lycoris_stock and --lycoris_algo_fixes both given: --lycoris_stock wins (LyCORIS as installed)"
+                    " / --lycoris_stock 과 --lycoris_algo_fixes 가 함께 지정됨: --lycoris_stock 을 따릅니다(원본 LyCORIS)"
+                )
+            logger.info("--lycoris_stock: LyCORIS runs as installed, nothing patched / 원본 LyCORIS 그대로 실행합니다")
+            return False
+        if legacy:
+            logger.info(
+                "--lycoris_algo_fixes is the default now and changes nothing; --lycoris_stock gives the original LyCORIS"
+                " / --lycoris_algo_fixes 는 이제 기본값이라 아무 효과가 없습니다. 원본은 --lycoris_stock"
+            )
+        from library import lycoris_algo_fixes
+
+        self._lycoris_fixes = lycoris_algo_fixes
+        lycoris_algo_fixes.apply_module_patches()
+        logger.info(
+            f"LyCORIS fixed paths on (default; --lycoris_stock for the original): patched algos"
+            f" {sorted(lycoris_algo_fixes.FIX_ALGOS)}"
+        )
+        return True
+
+    def _lycoris_fix_prepare_kwargs(self, net_kwargs: dict) -> dict:
+        """Typed/validated kwargs for create_network. net_kwargs itself stays strings (trainer parsing, ss_network_args)."""
+        self._lycoris_fix_algo = (net_kwargs.get("algo", "lora") or "lora").lower()
+        return self._lycoris_fixes.prepare_network_kwargs(self._lycoris_fix_algo, dict(net_kwargs), logger)
+
+    def _lycoris_fix_restore_allocation(self, args, network) -> None:
+        """GoRA/RaLoRA: restore the measured per-module allocation instead of re-running the pre-pass.
+
+        --resume: <resume dir>/gora_alloc.json (written by save_model_hook). --network_weights: the file's
+        ss_lycoris_alloc metadata. Either way the pre-pass is skipped when --network_weights is given."""
+        if not (getattr(network, "_gora_needs_init", False) or getattr(network, "_ralora_needs_init", False)):
+            return
+        state, source = None, None
+        if args.resume and not args.resume_from_huggingface:
+            alloc_file = os.path.join(args.resume, LYCORIS_ALLOC_STATE_FILE)
+            if os.path.isfile(alloc_file):
+                with open(alloc_file, "r", encoding="utf-8") as f:
+                    state, source = json.load(f), alloc_file
+        if state is None and args.network_weights is not None and args.network_weights.endswith(".safetensors"):
+            from safetensors import safe_open
+
+            with safe_open(args.network_weights, framework="pt") as f:
+                raw = (f.metadata() or {}).get(LYCORIS_ALLOC_METADATA_KEY)
+            if raw:
+                state, source = json.loads(raw), f"{args.network_weights} metadata"
+
+        if state is not None:
+            self._lycoris_fixes.restore_gora_ralora_allocation(network, state)
+            self._lycoris_fix_alloc = state
+            logger.info(f"GoRA/RaLoRA: allocation restored from {source}; skipping the gradient pre-pass")
+        elif args.network_weights is not None:
+            logger.warning(
+                "GoRA/RaLoRA: --network_weights given, so the gradient pre-pass is skipped, but the file has no"
+                f" {LYCORIS_ALLOC_METADATA_KEY} metadata; dense layers take the file's ranks when it loads, RaLoRA block"
+                " layers (n_split > 1) do not"
+            )
+        else:
+            if args.resume:
+                logger.warning(
+                    f"GoRA/RaLoRA: --resume {args.resume} has no {LYCORIS_ALLOC_STATE_FILE}; re-measuring the allocation"
+                    " (the state only loads if the new ranks match)"
+                )
+            return
+        network._gora_needs_init = False
+        network._ralora_needs_init = False
+
+    def _lycoris_fix_current_alloc(self, network):
+        """GoRA/RaLoRA allocation as the network has it now (pre-pass, --resume or a --network_weights file that resized
+        the modules), else the one restored/measured earlier; None for other algos."""
+        alloc = self._lycoris_fixes.gora_ralora_allocation_state(network)
+        if alloc is not None:
+            self._lycoris_fix_alloc = alloc
+        return self._lycoris_fix_alloc
+
+    def _lycoris_fix_reapply_tsm_stage(self, network) -> None:
+        """TSM stage 2: prepare_optimizer_params / prepare_grad_etc call requires_grad_(True) on the whole network,
+        which unfreezes the stage-1 experts again. Re-apply each module's stage after every such call."""
+        reapplied = 0
+        for lora in getattr(network, "loras", None) or []:
+            stage = getattr(lora, "tsm_stage", None)
+            if stage is not None and hasattr(lora, "set_stage"):
+                lora.set_stage(stage)
+                reapplied += 1
+        if reapplied:
+            logger.info(f"TSM: re-applied the stage on {reapplied} modules after requires_grad_(True)")
+
+    def _lycoris_fix_set_timestep(self, timesteps) -> None:
+        self._lycoris_fixes.set_timestep(self.network, timesteps)
+
+    def _lycoris_fix_clear_timestep(self) -> None:
+        self._lycoris_fixes.clear_timestep(self.network)
+
+    def _lycoris_fix_after_backward(self, network) -> None:
+        """Clear the T-LoRA mask / TSM timestep only now: the checkpointed forward has been recomputed in backward."""
+        self._lycoris_fix_defer_clear = False
+        self.clear_tlora_mask_if_needed()
+        if self._lycoris_fix_tsm_checked:
+            return
+        self._lycoris_fix_tsm_checked = True
+        routers = [
+            lora.router_fc.weight
+            for lora in getattr(network, "loras", None) or []
+            if getattr(lora, "tsm_stage", None) == 2 and hasattr(lora, "router_fc")
+        ]
+        if routers:
+            dead = sum(1 for w in routers if w.grad is None or not bool(torch.any(w.grad != 0)))
+            if dead:
+                logger.warning(f"TSM stage 2: router_fc.weight got no gradient in {dead}/{len(routers)} modules on the first step")
+            else:
+                logger.info(f"TSM stage 2: router_fc.weight gets gradients in all {len(routers)} modules")
+
+    def _lycoris_fix_sampler_timestep_scale(self) -> Optional[float]:
+        """Factor from the sampler's DiT timestep argument to [0, max_timestep]; None: no per-step hook for this model."""
+        return None
+
+    def _lycoris_fix_wrap_sampling(self, sample_images_fn):
+        """Sampling with T-LoRA / TSM: feed the sampler's per-step timestep where the model supports it (forward pre-hook
+        on the DiT), otherwise sample with the full T-LoRA mask and TSM's no-timestep expert, and say so once."""
+
+        def sample_images_with_timestep(*a, **kw):
+            self._lycoris_fix_defer_clear = False
+            self.clear_tlora_mask_if_needed()
+            timestep_algo = self._lycoris_fix_algo in ("tlora", "tsm", "tsm-lokr") or self.tlora_enabled
+            accelerator = kw.get("accelerator", a[0] if a else None)
+            unet = kw.get("unet", a[8] if len(a) > 8 else None)
+            scale = self._lycoris_fix_sampler_timestep_scale()
+            handle = None
+            if timestep_algo and scale is not None and unet is not None and accelerator is not None:
+
+                def set_sampler_timestep(_module, h_args, h_kwargs):
+                    t = h_args[1] if len(h_args) > 1 else h_kwargs.get("timesteps")
+                    if isinstance(t, torch.Tensor):
+                        ts = t.detach().float() * scale
+                        if self.tlora_enabled and not self.tlora_use_network_method:
+                            self.apply_tlora_mask(ts)  # also sets the TSM timestep
+                        else:
+                            self._lycoris_fix_set_timestep(ts)  # LoCon use_timestep_mask: all ranks at inference
+
+                handle = accelerator.unwrap_model(unet).register_forward_pre_hook(set_sampler_timestep, with_kwargs=True)
+                if not self._lycoris_fix_sampling_logged:
+                    logger.info(f"LyCORIS fixed paths: sample images use the sampler's timestep (x{scale:g}) for T-LoRA / TSM")
+            elif timestep_algo and not self._lycoris_fix_sampling_logged:
+                logger.info("LyCORIS fixed paths: sample images use the full T-LoRA mask / TSM no-timestep expert")
+            self._lycoris_fix_sampling_logged = True
+            try:
+                return sample_images_fn(*a, **kw)
+            finally:
+                if handle is not None:
+                    handle.remove()
+                self.clear_tlora_mask_if_needed()
+
+        return sample_images_with_timestep
+
+    # endregion
 
     def setup_lora2_regularization(self, net_kwargs):
         """
@@ -2336,13 +2536,32 @@ class NetworkTrainer:
         # LyCORIS reads decompose_both / ggpo_conv / the use_tucker aliases without parsing "False"
         net_kwargs = lycoris_args.fix_lycoris_bool_kwargs(args.network_module, net_kwargs)
 
+        # LyCORIS fixed paths (default; off with --lycoris_stock): patch LyCORIS before the network is built and hand it
+        # typed, validated kwargs. With --lycoris_stock (or a non-LyCORIS network) create_kwargs is net_kwargs itself.
+        create_kwargs = net_kwargs
+        self._lycoris_fix_on = self._lycoris_fix_setup(args)
+        if (
+            not self._lycoris_fix_on
+            and getattr(args, "lycoris_stock", False)
+            and str(net_kwargs.get("algo", "") or "").lower() == "tsm-lokr"
+        ):
+            raise ValueError(
+                "algo=tsm-lokr exists only in the fixed LyCORIS paths (library/tsm_lokr.py); remove --lycoris_stock"
+                " / algo=tsm-lokr 는 고친 경로에만 있습니다. --lycoris_stock 을 빼세요"
+            )
+        if self._lycoris_fix_on:
+            create_kwargs = self._lycoris_fix_prepare_kwargs(net_kwargs)
+            if self._lycoris_fix_algo == "tsm-lokr":
+                self._lycoris_fixes.check_tsm_lokr_args(args)
+
         # if a new network is added in future, add if ~ then blocks for each network (;'∀')
         if args.dim_from_weights:
-            network, _ = network_module.create_network_from_weights(1, args.network_weights, vae, text_encoder, unet, **net_kwargs)
+            network, _ = network_module.create_network_from_weights(1, args.network_weights, vae, text_encoder, unet, **create_kwargs)
         else:
             if "dropout" not in net_kwargs:
                 # workaround for LyCORIS (;^ω^)
                 net_kwargs["dropout"] = args.network_dropout
+            create_kwargs.setdefault("dropout", net_kwargs["dropout"])
 
             network = network_module.create_network(
                 1.0,
@@ -2352,7 +2571,7 @@ class NetworkTrainer:
                 text_encoder,
                 unet,
                 neuron_dropout=args.network_dropout,
-                **net_kwargs,
+                **create_kwargs,
             )
         if network is None:
             return
@@ -2407,6 +2626,15 @@ class NetworkTrainer:
         train_text_encoder = self.is_train_text_encoder(args)
         network.apply_to(text_encoder, unet, train_text_encoder, train_unet)
 
+        if self._lycoris_fix_on:
+            # Forge-loadable save_weights (and its metadata), a load_weights that reads those files back (ABBA saved as
+            # LoHa keys, per-layer GoRA/RaLoRA ranks), so it must be installed before --network_weights loads below;
+            # per-step timestep hook for sample images
+            self._lycoris_fixes.after_network_created(network, args, logger)
+            self.sample_images = self._lycoris_fix_wrap_sampling(self.sample_images)
+            # GoRA/RaLoRA: per-module ranks/splits from the resume state or the weights' metadata, before anything loads
+            self._lycoris_fix_restore_allocation(args, network)
+
         if args.network_weights is not None:
             # FIXME consider alpha of weights: this assumes that the alpha is not changed
             info = network.load_weights(args.network_weights)
@@ -2445,6 +2673,8 @@ class NetworkTrainer:
             lr_descriptions, 
             text_encoder_lr
          ) = train_util.prepare_optimizer(args, network, accelerator)
+        if self._lycoris_fix_on:
+            self._lycoris_fix_reapply_tsm_stage(network)  # prepare_optimizer_params unfroze the TSM experts
 
         # prepare dataloader
         # strategies are set here because they cannot be referenced in another process. Copy them with the dataset
@@ -2695,6 +2925,17 @@ class NetworkTrainer:
             world_size = accelerator.num_processes if hasattr(accelerator, 'num_processes') else 1
             global_rank = accelerator.process_index if hasattr(accelerator, 'process_index') else 0
 
+            if self._lycoris_fix_on:
+                # ralora_precompute_gradients calls forward_fn(model, batch) inside precompute_and_init's
+                # @torch.no_grad(): accept both call forms and build the loss with grad enabled.
+                _ralora_forward_batch = ralora_forward_fn
+
+                def ralora_forward_fn(*forward_args):
+                    with torch.enable_grad():
+                        result = _ralora_forward_batch(forward_args[-1])
+                    loss = result[0] if isinstance(result, (tuple, list)) else result
+                    return loss.mean() if loss.ndim != 0 else loss
+
             RaLoRAModule.precompute_and_init(
                 model=network,
                 dataloader=train_dataloader,
@@ -2711,6 +2952,34 @@ class NetworkTrainer:
                 save_dir=args.output_dir if hasattr(args, 'output_dir') else None,
             )
             accelerator.print("RaLoRA: Pre-computation complete.")
+
+        if self._lycoris_fix_on and network_needs_init:
+            # LyCORIS fixed paths: the pre-pass replaced lora_up/lora_down (per-module ranks, RaLoRA blocks) after the
+            # optimizer and lr scheduler above were built from the old tensors. Rebuild both (and the train/eval fns).
+            self._lycoris_fix_alloc = self._lycoris_fixes.gora_ralora_allocation_state(network)
+            network._gora_needs_init = False  # RaLoRAModule.precompute_and_init never resets its flag
+            network._ralora_needs_init = False
+            self._lycoris_fix_clear_timestep()
+            # the pre-pass hooks leave .grad (GoRA) and requires_grad (RaLoRA) on the targeted base weights
+            for base_model in [unet] + [t_enc for t_enc in text_encoders if isinstance(t_enc, torch.nn.Module)]:
+                for p in base_model.parameters():
+                    if p.requires_grad or p.grad is not None:
+                        p.requires_grad_(False)
+                        p.grad = None
+            if args.full_fp16 or args.full_bf16:
+                network.to(weight_dtype)  # tensors created by the pre-pass
+            (
+                optimizer_name,
+                optimizer_args,
+                optimizer,
+                optimizer_train_fn,
+                optimizer_eval_fn,
+                lr_descriptions,
+                text_encoder_lr,
+            ) = train_util.prepare_optimizer(args, network, accelerator)
+            self._lycoris_fix_reapply_tsm_stage(network)
+            lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
+            accelerator.print("GoRA/RaLoRA: optimizer and lr scheduler rebuilt over the allocated tensors")
 
         if network_needs_init:
             # Restore initial dataloader seed
@@ -2790,6 +3059,17 @@ class NetworkTrainer:
         del t_enc
 
         accelerator.unwrap_model(network).prepare_grad_etc(text_encoder, unet)
+        if self._lycoris_fix_on:
+            self._lycoris_fix_reapply_tsm_stage(accelerator.unwrap_model(network))  # prepare_grad_etc unfroze them again
+            if self._lycoris_fix_algo == "tsm-lokr":
+                # TSM-LoKr core-expert offload (tsm_offload_states / tsm_resident_cores / tsm_grouped_accumulation): its
+                # optimizer hooks must exist before the accelerate state hooks and --resume below
+                batch = max([int(args.train_batch_size or 1)] + [int(getattr(d, "batch_size", 1) or 1)
+                                                                 for d in getattr(train_dataset_group, "datasets", [])])
+                self._tsm_offload = self._lycoris_fixes.attach_tsm_offload(
+                    accelerator.unwrap_model(network), getattr(optimizer, "optimizer", optimizer), args,
+                    accelerator.device, batch_size=batch, grouped_supported=self._tsm_grouped_supported, logger=logger,
+                )
 
         if not cache_latents:  # キャッシュしない場合はVAEを使うのでVAEを準備する
             vae.requires_grad_(False)
@@ -2820,6 +3100,14 @@ class NetworkTrainer:
             logger.info(f"save train state to {train_state_file} at epoch {current_epoch.value} step {current_step.value+1}")
             with open(train_state_file, "w", encoding="utf-8") as f:
                 json.dump({"current_epoch": current_epoch.value, "current_step": current_step.value + 1}, f)
+
+            # LyCORIS fixed paths: GoRA/RaLoRA allocation, so --resume rebuilds the same shapes before loading
+            alloc = self._lycoris_fix_current_alloc(accelerator.unwrap_model(network)) if self._lycoris_fix_on else None
+            if alloc is not None:
+                alloc_file = os.path.join(output_dir, LYCORIS_ALLOC_STATE_FILE)
+                logger.info(f"save GoRA/RaLoRA allocation to {alloc_file}")
+                with open(alloc_file, "w", encoding="utf-8") as f:
+                    json.dump(alloc, f)
 
             # save adaptive timestep sampler state if enabled
             if self.adaptive_manager is not None:
@@ -3214,6 +3502,10 @@ class NetworkTrainer:
         # add extra args
         if args.network_args:
             metadata["ss_network_args"] = json.dumps(net_kwargs)
+        if self._lycoris_fix_on:
+            alloc = self._lycoris_fix_current_alloc(accelerator.unwrap_model(network))
+            if alloc is not None:
+                metadata[LYCORIS_ALLOC_METADATA_KEY] = json.dumps(alloc)  # read back by --network_weights
 
         # model name and hash
         if args.pretrained_model_name_or_path is not None:
@@ -3689,6 +3981,8 @@ class NetworkTrainer:
                     # Update patch topology current step for warmup/start_step logic
                     self._patch_topology_current_step = global_step
 
+                    if self._lycoris_fix_on:
+                        self._lycoris_fix_defer_clear = True  # keep the T-LoRA mask / TSM timestep until backward
                     loss, pre_scaling_loss, loss_scaled = self.process_batch(
                         batch,
                         text_encoders,
@@ -3738,6 +4032,8 @@ class NetworkTrainer:
 
                     self.precision_reporter.log_tensors("loss passed to backward", loss=loss)
                     accelerator.backward(loss)
+                    if self._lycoris_fix_on:
+                        self._lycoris_fix_after_backward(accelerator.unwrap_model(network))
 
                     if self.should_sync_ramtorch(args, accelerator):
                         torch.cuda.synchronize()
@@ -4220,6 +4516,26 @@ def setup_parser() -> argparse.ArgumentParser:
         "--dim_from_weights",
         action="store_true",
         help="automatically determine dim (rank) from network_weights / dim (rank)をnetwork_weightsで指定した重みから自動で決定する",
+    )
+    parser.add_argument(
+        "--lycoris_stock",
+        action="store_true",
+        default=False,
+        help="LyCORIS (network_module=lycoris.kohya) only: run LyCORIS exactly as installed, without the fixed/optimised"
+        " code paths of library/lycoris_algo_fixes.py that are on by default (fixes and faster forwards for lora/locon,"
+        " loha, lokr, abba, gora, ralora, lora2, diag-oft, boft, tlora, tsm, ortholora, dylora, glora, ia3, full;"
+        " Forge-loadable saves; algo=tsm-lokr). Not the same as --anima_stock_lycoris (the fast LoKr+DoRA forward)"
+        " / LyCORIS 전용: 기본으로 켜지는 고친·빠른 경로(library/lycoris_algo_fixes.py)를 끄고 설치된 LyCORIS 그대로"
+        " 학습한다(algo=tsm-lokr 는 쓸 수 없음). --anima_stock_lycoris(빠른 LoKr+DoRA forward)와는 별개",
+    )
+    parser.add_argument(
+        "--lycoris_algo_fixes",
+        action="store_true",
+        default=False,
+        help="Deprecated, no effect: the fixed LyCORIS code paths are the default now (use --lycoris_stock for the original"
+        " LyCORIS; --lycoris_stock wins when both are given). Kept so old configs still load"
+        " / 더 이상 효과 없음: 고친 LyCORIS 경로가 이제 기본값이다(원본은 --lycoris_stock, 둘 다 주면 --lycoris_stock)."
+        " 옛 설정 파일 호환용",
     )
     parser.add_argument(
         "--scale_weight_norms",
