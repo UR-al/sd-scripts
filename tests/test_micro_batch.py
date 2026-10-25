@@ -362,9 +362,32 @@ def test_dataset_rows_per_epoch_counts_the_bucket_batch_rows():
     assert micro_batch.dataset_rows_per_epoch(ds) == 41
     group = types.SimpleNamespace(datasets=[ds, _fake_dataset([5], delegate=True)], num_train_images=46)
     assert micro_batch.dataset_rows_per_epoch(group) == 46
-    # a dataset without the bucket structure counts its num_train_images
+    # a dataset without the bucket structure counts its num_train_images: no attributes at all, or the empty lists every
+    # train_util.BaseDataset starts with (a --dataset_class MinimalDataset never makes buckets: before the fix it counted 0
+    # rows, so max_train_steps became 0 and the trainer divided by zero)
     plain = types.SimpleNamespace(datasets=[types.SimpleNamespace(num_train_images=7)])
     assert micro_batch.dataset_rows_per_epoch(plain) == 7
+    empty = types.SimpleNamespace(datasets=[types.SimpleNamespace(all_buckets_indices=[], buckets_indices=[],
+                                                                  batch_buckets=[], num_train_images=12)])
+    assert micro_batch.dataset_rows_per_epoch(empty) == 12
+    from library import train_util
+
+    class _Arbitrary(train_util.MinimalDataset):  # the --dataset_class shape (train_util.load_arbitrary_dataset)
+        def __init__(self):
+            super().__init__((512, 512), 1.0)
+            self.num_train_images = 40
+
+        def __len__(self):
+            return 10
+
+        def __getitem__(self, idx):
+            return {"latents": torch.zeros(4, 1)}
+
+    arbitrary = _Arbitrary()
+    assert arbitrary.datasets == [arbitrary] and arbitrary.all_buckets_indices == [] and arbitrary.batch_buckets == []
+    assert micro_batch.dataset_rows_per_epoch(arbitrary) == 40 and micro_batch.steps_per_epoch(40, 8) == 5
+    with pytest.raises(ValueError, match="0 rows per epoch"):
+        micro_batch.dataset_rows_per_epoch(types.SimpleNamespace(datasets=[types.SimpleNamespace(num_train_images=0)]))
     with pytest.raises(ValueError, match="resolution jitter"):
         micro_batch.dataset_rows_per_epoch(types.SimpleNamespace(datasets=[_fake_dataset([4], jitter=True)]))
     assert micro_batch.steps_per_epoch(725, 8) == 91 and micro_batch.steps_per_epoch(728, 8) == 91
@@ -555,10 +578,152 @@ def test_trainer_wires_step_rows():
         "for sb in micro_batch.sub_batches(batch):",
         "micro_batch.sub_batches(batch)[0],",
         "skipped_dataloader = train_dataloader.skip_first_packs(initial_step - 1)",
+        "train_dataset_group.attach_epoch_value(current_epoch)",  # the epoch's shuffle before its first fetch
     ):
         assert needle in src, needle
+    assert src.index("train_dataset_group.attach_epoch_value(current_epoch)") \
+        < src.index("train_dataloader = torch.utils.data.DataLoader(")
     assert src.index("self.assert_extra_args(args, train_dataset_group, val_dataset_group)") \
         < src.index("micro_batch.step_rows_messages(args)") < src.index("train_util.prepare_accelerator(args)")
     assert src.index("training_model = network") < src.index("micro_batch.RowPacker(train_dataloader") \
         < src.index("for step, batch in enumerate(skipped_dataloader or train_dataloader)")
     assert '"--step_rows"' in inspect.getsource(train_util)
+
+
+def test_step_rows_messages_warn_for_a_large_batch_and_dataset_class():
+    """--step_rows N with train_batch_size > N (a bucket batch cut over several steps stays on the device through them)
+    and with --dataset_class (rows per epoch from num_train_images) are warned about, not refused."""
+    base = dict(step_rows=8, gradient_accumulation_steps=1, batch_loss_norm_rows=0, train_batch_size=8)
+    assert micro_batch.step_rows_messages(argparse.Namespace(**base)) == []
+    msgs = micro_batch.step_rows_messages(argparse.Namespace(**dict(base, train_batch_size=13)))
+    assert len(msgs) == 1 and "train_batch_size 13" in msgs[0] and "<= step_rows" in msgs[0]
+    msgs = micro_batch.step_rows_messages(argparse.Namespace(**dict(base, dataset_class="my.module.Dataset")))
+    assert len(msgs) == 1 and "dataset_class" in msgs[0] and "num_train_images" in msgs[0]
+    assert micro_batch.step_rows_messages(argparse.Namespace(**dict(base, step_rows=0, train_batch_size=13))) == []
+
+
+def test_row_packer_releases_a_cut_batch_before_yielding():
+    """A batch cut at a step boundary: its pieces are copies made before the pack is yielded and the packer drops the
+    batch, so while the consumer holds the pack the parent is gone (only the loader could still hold it); a batch larger
+    than the step fills whole packs on its own. Same packs as before (the boundary test above covers the layout)."""
+    import gc
+    import weakref
+
+    refs = []
+
+    def make(n):
+        b = _collated(n)
+        refs.append(weakref.ref(b["latents"]))
+        return b
+
+    def loader(sizes):  # yields without keeping the batch in its own frame (a loader that does, like accelerate's
+        for n in sizes:  # DataLoaderShard, holds the parent until the next pull - the packer cannot change that)
+            yield make(n)
+
+    packer = micro_batch.RowPacker(loader([3, 13, 16, 4]), 8, 36)
+    assert len(packer) == 5
+    it = iter(packer)
+    pack0 = next(it)  # [3 | 5 of the 13]
+    gc.collect()
+    assert [micro_batch.batch_rows(sb) for sb in pack0] == [3, 5] and pack0.sub_batches[0]["latents"] is not None
+    assert refs[0]() is not None  # the whole 3-row batch is the pack's own sub-batch ...
+    assert refs[1]() is None  # ... the cut 13-row batch is released: the pack holds its copies only
+    pack1 = next(it)  # [8 of the 13]
+    gc.collect()
+    assert [micro_batch.batch_rows(sb) for sb in pack1] == [8] and refs[1]() is None
+    assert pack1.sub_batches[0]["captions"] == [f"cap {i}" for i in range(5, 13)]
+    pack2, pack3 = next(it), next(it)  # the 16-row batch: two whole packs, released
+    gc.collect()
+    assert [p.rows for p in (pack2, pack3)] == [8, 8] and refs[2]() is None
+    assert pack3.sub_batches[0]["captions"] == [f"cap {i}" for i in range(8, 16)]
+    pack4 = next(it)
+    assert [micro_batch.batch_rows(sb) for sb in pack4] == [4] and pack4.sub_batches[0]["captions"] == ["cap 0", "cap 1", "cap 2", "cap 3"]
+    with pytest.raises(StopIteration):
+        next(it)
+
+
+class _RowCountDataset:
+    """A train_util.BaseDataset with the bucket structure make_buckets leaves (real set_current_epoch / shuffle_buckets /
+    sync_epoch) and a stub payload with the rows BaseDataset.__getitem__ would give (bucket[image_index : + batch size])."""
+
+    def __new__(cls, bucket_sizes, batch_size, seed):
+        import math
+
+        from library import train_util
+
+        class RowCountDataset(train_util.BaseDataset):
+            def __init__(self):
+                super().__init__((512, 512), 1.0, False, False)
+                self.image_data = {}
+                self.num_train_images = sum(bucket_sizes)
+                self.num_reg_images = self.num_val_images = 0
+                self.batch_buckets = [[f"b{b}_{i}" for i in range(n)] for b, n in enumerate(bucket_sizes)]
+                self.batch_bucket_jitter_resos = [None] * len(self.batch_buckets)
+                self.batch_bucket_weights = [None] * len(self.batch_buckets)
+                self.buckets_indices = [train_util.BucketBatchIndex(b, batch_size, k)
+                                        for b, bucket in enumerate(self.batch_buckets)
+                                        for k in range(math.ceil(len(bucket) / batch_size))]
+                self.all_buckets_indices = list(self.buckets_indices)  # as make_buckets
+                self.set_seed(seed)
+                self.shuffle_buckets()
+                self._length = len(self.buckets_indices)
+                self.epoch_at_fetch = []  # (epoch the trainer is in, the dataset's epoch when the item was read)
+
+            def __getitem__(self, index):
+                self.sync_epoch()  # the first statement of the real __getitem__ (asserted below)
+                self.epoch_at_fetch.append(self.current_epoch)
+                bbi = self.buckets_indices[index]
+                bucket = self.batch_buckets[bbi.bucket_index]
+                keys = bucket[bbi.batch_index * bbi.bucket_batch_size:(bbi.batch_index + 1) * bbi.bucket_batch_size]
+                return {"latents": torch.zeros(len(keys), 1), "captions": list(keys),
+                        "bbi": [(bbi.bucket_index, bbi.batch_index)] * len(keys)}
+
+        return RowCountDataset()
+
+
+@pytest.mark.parametrize("attached", [True, False])
+def test_epoch_shuffle_precedes_the_first_fetch(attached):
+    """train_util.collator_class sets the dataset's epoch after the item was fetched (torch collates after dataset[idx]),
+    so without the shared epoch attached the first bucket batch of an epoch is read under the previous epoch's bucket
+    permutation (one batch duplicated, another missed: the rows per epoch, and with --step_rows the packs, vary). With
+    attach_epoch_value (train_network.py, before the DataLoader is built) __getitem__ shuffles first: every bucket batch
+    exactly once per epoch, the pack count equals the formula in every epoch."""
+    import inspect
+    from collections import Counter
+    from multiprocessing import Value
+
+    from library import train_util
+
+    for cls in (train_util.BaseDataset, train_util.ControlNetDataset):  # the real __getitem__s start with the sync
+        body = inspect.getsource(cls.__getitem__).split("\n", 1)[1].lstrip()
+        assert body.startswith("self.sync_epoch()"), cls
+    sizes = [3, 8, 1, 2, 6, 4, 5, 9, 2, 7, 1, 1, 8, 3, 6, 5, 2, 4, 7, 1]  # 85 rows, 26 ragged bucket batches
+    ds = _RowCountDataset(sizes, batch_size=4, seed=7)
+    group = train_util.DatasetGroup([ds])
+    rows_formula = micro_batch.dataset_rows_per_epoch(group)
+    assert rows_formula == 85
+    current_epoch, current_step = Value("i", 0), Value("i", 0)
+    if attached:
+        group.attach_epoch_value(current_epoch)
+    collator = train_util.collator_class(current_epoch, current_step, group)
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(1234)
+    loader = torch.utils.data.DataLoader(group, batch_size=1, shuffle=True, collate_fn=collator, num_workers=0, generator=gen)
+    packer = micro_batch.RowPacker(loader, 8, rows_formula)
+    expected = {(bi.bucket_index, bi.batch_index): min(4, len(ds.batch_buckets[bi.bucket_index]) - bi.batch_index * 4)
+                for bi in ds.all_buckets_indices}
+    stale_first_fetch, mismatched_epochs = 0, 0
+    for epoch in range(1, 7):
+        current_epoch.value = epoch  # as the trainer does before iterating the loader
+        ds.epoch_at_fetch.clear()
+        packs = list(packer)
+        got = Counter(b for p in packs for sb in p for b in sb["bbi"])
+        if ds.epoch_at_fetch[0] != epoch:
+            stale_first_fetch += 1
+        if got != Counter(expected) or sum(p.rows for p in packs) != rows_formula or len(packs) != len(packer):
+            mismatched_epochs += 1
+        assert all(e == epoch for e in ds.epoch_at_fetch[1:]), (epoch, ds.epoch_at_fetch[:3])
+    if attached:
+        assert stale_first_fetch == 0 and mismatched_epochs == 0
+    else:
+        assert stale_first_fetch == 6 and mismatched_epochs >= 1  # every epoch's first batch: the previous permutation
