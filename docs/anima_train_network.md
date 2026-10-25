@@ -215,6 +215,14 @@ For LoRA training, use `network_reg_lrs` in `--network_args` instead. See [Secti
   - Cannot be used with `--cpu_offload_checkpointing` or `--unsloth_offload_checkpointing`.
 * `--unsloth_offload_checkpointing`
   - Offload activations to CPU RAM using async non-blocking transfers (faster than `--cpu_offload_checkpointing`). Cannot be combined with `--cpu_offload_checkpointing` or `--blocks_to_swap`.
+* `--anima_no_checkpoint_max_tokens=<integer>` (fork)
+  - With `--gradient_checkpointing`: micro-steps whose samples have at most this many DiT tokens (latent H/2 x W/2; a 512^2 image = 1024 tokens) run without checkpointing (no recompute, activations stay in VRAM); larger ones keep the configured checkpointing. The mode is switched per micro-step. Ignored with `--blocks_to_swap`. 0 (default) = off (every micro-step keeps its checkpointing). Measured on Anima 2.9B, 4-tier buckets batch 1: 1100 (the 512 tier) -3.8% step time for +0.5 GiB.
+* `--anima_half_checkpoint_max_tokens=<integer>` (fork)
+  - Micro-steps with more tokens than `--anima_no_checkpoint_max_tokens` but at most this many checkpoint only every other Block (half the recompute, about half the activation VRAM of no checkpointing). Must be >= `--anima_no_checkpoint_max_tokens`. 0 (default) = off. The 1024 tier (4096 tokens) did not fit in 32 GB at dim 32.
+* `--anima_adaln_hoist` (fork)
+  - Compute each checkpointed Block's adaLN modulations once per micro-step outside its checkpoint instead of inside it (the six modulation Linears per Block skip the recompute). Bit-identical results; off by default because it measured +-0 s/step on Anima 2.9B 4-tier batch 1.
+* `--cuda_memory_fraction=<float>` (fork; or the `CUDA_MEMORY_FRACTION` environment variable)
+  - `torch.cuda.set_per_process_memory_fraction` for the training process: caps what the caching allocator may reserve (the desktop keeps its share of the card). With it, `PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.92` lets the allocator free cached blocks before hitting the cap. `--cuda_empty_cache_every_n_steps N` / `--cuda_empty_cache_above_gib G` call `empty_cache` at an optimizer step every N steps / when reserved memory exceeds G GiB. `CUDA_MEMLOG=N` logs allocated / reserved / window peaks / fragmentation / allocator retries every N optimizer steps and after sampling, `save_state` and each epoch; `CUDA_MEMLOG_FILE=<path>` writes those entries as JSON lines instead (N defaults to 50; `CUDA_MEMLOG=0` switches the log off).
 * `--cache_text_encoder_outputs`
   - Cache Qwen3 text encoder outputs to reduce VRAM usage. Recommended when not training text encoder LoRA.
 * `--cache_text_encoder_outputs_to_disk`
@@ -273,6 +281,10 @@ LoRA学習の場合は、`--network_args`の`network_reg_lrs`を使用してく�
 
 * `--blocks_to_swap` - TransformerブロックをCPUとGPUでスワップしてVRAMを節約。`--cpu_offload_checkpointing`および`--unsloth_offload_checkpointing`とは併用できません。
 * `--unsloth_offload_checkpointing` - 非同期転送でアクティベーションをCPU RAMにオフロード。`--cpu_offload_checkpointing`および`--blocks_to_swap`とは併用できません。
+* `--anima_no_checkpoint_max_tokens`（フォーク） - `--gradient_checkpointing`時、DiTトークン数（latent H/2 x W/2、512^2画像 = 1024）がこの値以下のマイクロステップはチェックポイントなしで実行（再計算なし）。それより大きいものは設定どおり。`--blocks_to_swap`時は無視。0（デフォルト）= 無効（すべてのマイクロステップが設定どおりチェックポイント）。
+* `--anima_half_checkpoint_max_tokens`（フォーク） - 上の値より大きくこの値以下のマイクロステップは1つおきのBlockのみチェックポイント。`--anima_no_checkpoint_max_tokens`以上が必要。0（デフォルト）= 無効。
+* `--anima_adaln_hoist`（フォーク） - チェックポイントされた各BlockのadaLN変調をチェックポイントの外で1回だけ計算（結果はビット同一）。デフォルトは無効（速度差が測定できなかったため）。
+* `--cuda_memory_fraction`（フォーク、環境変数`CUDA_MEMORY_FRACTION`でも可） - `torch.cuda.set_per_process_memory_fraction`でキャッシングアロケータの予約上限を設定。`--cuda_empty_cache_every_n_steps N` / `--cuda_empty_cache_above_gib G`はオプティマイザステップでNステップごと / 予約量がG GiBを超えたときに`empty_cache`。`CUDA_MEMLOG=N`はNステップごと（およびサンプリング・`save_state`・エポック終了後）にメモリ統計をログ、`CUDA_MEMLOG_FILE=<path>`があればJSON行で書き出す（Nのデフォルト50、`CUDA_MEMLOG=0`で無効）。
 * `--cache_text_encoder_outputs` - Qwen3の出力をキャッシュしてメモリ使用量を削減。
 * `--cache_latents`, `--cache_latents_to_disk` - Qwen-Image VAEの出力をキャッシュ。
 * `--vae_chunk_size` - Qwen-Image VAEのチャンク処理サイズ。メモリ使用量を削減しますが速度が低下します。デフォルトはチャンク処理なし。
