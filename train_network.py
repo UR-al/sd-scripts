@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 from torch.types import Number
 from library.device_utils import init_ipex, clean_memory_on_device
+from library import cuda_memory
 from library.edm2_loss_utils import prepare_edm2_loss_weighting, plot_edm2_loss_weighting_check, plot_edm2_loss_weighting
 from library.ramtorch_util import apply_ramtorch_to_module
 
@@ -2420,6 +2421,8 @@ class NetworkTrainer:
         accelerator = train_util.prepare_accelerator(args)
         logger.info(f"prepared accelerator on {accelerator.device}")
         is_main_process = accelerator.is_main_process
+        cuda_memory.apply_memory_fraction(args, accelerator.device)  # before the models reach the GPU
+        memlog = cuda_memory.MemLog(accelerator.device)
 
         # mixed precisionに対応した型を用意しておき適宜castする
         weight_dtype, save_dtype = train_util.prepare_dtype(args)
@@ -3830,6 +3833,8 @@ class NetworkTrainer:
 
                 optimizer_eval_fn()
                 self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
+                if train_util.sample_images_check(args, 0, global_step):
+                    memlog.mark("after sampling", global_step)
                 if train_util.calculate_val_loss_check(args, global_step, 0, val_dataloader, train_dataloader):
                     current_val_loss, average_val_loss, val_logs = self.calculate_val_loss(
                         global_step, 0, train_dataloader, val_loss_recorder, val_dataloader, 
@@ -4172,8 +4177,10 @@ class NetworkTrainer:
                     rate_tracker.tick()
                     progress_bar.update(1)
                     global_step += 1
+                    cuda_memory.maybe_empty_cache(args, accelerator.device, global_step)  # after zero_grad: activations freed
+                    memlog.step(global_step)
 
-                    if (train_util.sample_images_check(args, None, global_step) or 
+                    if (train_util.sample_images_check(args, None, global_step) or
                         train_util.calculate_val_loss_check(args, global_step, step, val_dataloader, train_dataloader) or 
                         args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0):
                         with torch.no_grad():
@@ -4187,6 +4194,8 @@ class NetworkTrainer:
                             self.sample_images(
                                 accelerator, args, None, global_step, accelerator.device, vae, tokenizers, text_encoder, unet
                             )
+                            if train_util.sample_images_check(args, None, global_step):
+                                memlog.mark("after sampling", global_step)
 
                             if train_util.calculate_val_loss_check(args, global_step, step, val_dataloader, train_dataloader):
                                 current_val_loss, average_val_loss, val_logs = self.calculate_val_loss(global_step, step, 
@@ -4225,6 +4234,7 @@ class NetworkTrainer:
 
                                     if args.save_state:
                                         train_util.save_and_remove_state_stepwise(args, accelerator, global_step)
+                                        memlog.mark("after save_state", global_step)
 
                                     remove_step_no = train_util.get_remove_step_no(args, global_step)
                                     if remove_step_no is not None:
@@ -4375,8 +4385,11 @@ class NetworkTrainer:
 
                             if args.save_state:
                                 train_util.save_and_remove_state_on_epoch_end(args, accelerator, current_epoch.value)
+                                memlog.mark("after save_state", global_step)
 
                     self.sample_images(accelerator, args, current_epoch.value, global_step, accelerator.device, vae, tokenizers, text_encoder, unet)
+                    if train_util.sample_images_check(args, current_epoch.value, global_step):
+                        memlog.mark("after sampling", global_step)
                     progress_bar.unpause()
                     optimizer_train_fn()
                     accelerator.unwrap_model(network).train()
@@ -4391,6 +4404,7 @@ class NetworkTrainer:
             # this epoch (distinct bucket-shape pools from random-crop
             # training, validation, and sample-image generation).
             clean_memory_on_device(accelerator.device)
+            memlog.mark("epoch end (cache released)", global_step)
 
         # metadata["ss_epoch"] = str(num_train_epochs)
         metadata["ss_training_finished_at"] = str(time.time())

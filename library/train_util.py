@@ -5884,6 +5884,29 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         help="disable low VRAM optimization. e.g. do not clear CUDA cache after each latent caching (for machines which have bigger VRAM) "
         + "/ VRAMが少ない環境向け最適化を無効にする。たとえば各latentのキャッシュ後のCUDAキャッシュクリアを行わない等（VRAMが多い環境向け）",
     )
+    parser.add_argument(
+        "--cuda_memory_fraction",
+        type=float,
+        default=None,
+        help="cap the CUDA caching allocator at this fraction of total VRAM (set_per_process_memory_fraction): it frees its"
+        " unused cache before reserving past the cap (OOM instead of shared-memory fallback); also enables"
+        " PYTORCH_CUDA_ALLOC_CONF garbage_collection_threshold. Env CUDA_MEMORY_FRACTION if unset (library/cuda_memory.py;"
+        " applied by the network trainers, train_network.py and *_train_network.py)",
+    )
+    parser.add_argument(
+        "--cuda_empty_cache_every_n_steps",
+        type=int,
+        default=None,
+        help="torch.cuda.empty_cache() every N optimizer steps (releases the reserved-but-unused cache; applied by the"
+        " network trainers, train_network.py and *_train_network.py)",
+    )
+    parser.add_argument(
+        "--cuda_empty_cache_above_gib",
+        type=float,
+        default=None,
+        help="torch.cuda.empty_cache() at an optimizer step when reserved CUDA memory exceeds this many GiB (applied by"
+        " the network trainers, train_network.py and *_train_network.py)",
+    )
 
     parser.add_argument(
         "--sample_every_n_steps",

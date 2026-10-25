@@ -160,7 +160,13 @@ def _cache_targets(model: nn.Module):
 
 def _free_bytes(device: torch.device) -> int:
     free, _ = torch.cuda.mem_get_info(device)
-    return free + torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+    reserved = torch.cuda.memory_reserved(device)
+    from library.cuda_memory import cap_bytes  # --cuda_memory_fraction: the allocator stops at the cap, not at free VRAM
+
+    cap = cap_bytes(device)
+    if cap is not None:
+        free = min(free, max(0, cap - reserved))
+    return free + reserved - torch.cuda.memory_allocated(device)
 
 
 def _restore(patched, parked):
