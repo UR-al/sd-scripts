@@ -15,7 +15,9 @@ graph as inductor, without codegen) on a 2-Block toy Anima and networks built th
 * a resolution sweep inside the union band runs on the first graphs (soft marks under attn_mode torch);
 * pause() / eval run the eager Blocks; restore_blocks puts the class methods back;
 * rebind_forwards keeps lycoris_fast's merged-weight cache targets; library/attention.py's split path traces without a
-  graph break; the trainer glue: validate_block_compile_args, after_network_loaded, prepare_anima_runtime, the parser.
+  graph break; the trainer glue: validate_block_compile_args, after_network_loaded, prepare_anima_runtime, the parser;
+* a cold network (the trainer's first forward is the first traced call) traces whole once prime_module_caches has filled
+  the lazy per-module caches - without it LoKr+DoRA breaks on a .item() and keeps the fragments.
 
 Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe -B -m pytest tests/test_anima_block_compile.py
 """
@@ -62,8 +64,12 @@ TOY_BANDS = bc.plan_bands(TOY_TOKENS, "union")  # [(16, 64)]
 
 @pytest.fixture(autouse=True)
 def _env():
-    laf.apply_module_patches()
+    # production order (anima_train_network.prepare_anima_runtime, then train()): the fast LoKr+DoRA forward first, the
+    # fixed paths on top of it. Reversed in a fresh process, install_fast_lokr_forward would record the fixed-path LoKr
+    # forward as "stock" and later test files (test_lycoris_algo_fixes, test_moss_pipeline) would find the fast forward
+    # gone.
     lycoris_fast.install_fast_lokr_forward()
+    laf.apply_module_patches()
     torch._dynamo.reset()
     bc._warned_oob.clear()
     yield
@@ -175,9 +181,37 @@ def counting_backend(inner: str = "aot_eager"):
     return backend, calls
 
 
-def compile_toy(unet, backend="aot_eager", bands=TOY_BANDS, skip_call=None, **kw):
+def compile_toy(unet, net=None, backend="aot_eager", bands=TOY_BANDS, skip_call=None, **kw):
+    """compile_blocks as the trainer calls it: the network's lazy per-module caches primed first (prime_module_caches)."""
+    if net is not None:
+        laf.prime_module_caches(net)
     return bc.compile_blocks(unet, bands=bands, backend=backend, dynamic="union" if bands else "static",
                              recompile_limit=64, skip_call=skip_call, isolate_cache=False, **kw)
+
+
+def capture_block_args(unet, net, x, t, ctx, pad):
+    """The (args, kwargs) Block 0 receives in a training forward, captured WITHOUT running any Block (a hook raises), so
+    the network's lazy caches stay cold."""
+
+    class Stop(Exception):
+        pass
+
+    cap = {}
+
+    def stop(m, a, k):
+        cap.update(args=a, kwargs=k)
+        raise Stop()
+
+    h = unet.blocks[0].register_forward_pre_hook(stop, with_kwargs=True)
+    laf.set_timestep(net, t.float() * 1000.0)
+    try:
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            unet(x, t, ctx, padding_mask=pad)
+    except Stop:
+        pass
+    finally:
+        h.remove()
+    return cap
 
 
 _BF16_BWD = None
@@ -299,6 +333,34 @@ def test_block_forward_traces_to_one_graph(preset):
     assert ex.graph_count == 1, f"{preset}: {ex.graph_count} graphs"
 
 
+@pytest.mark.parametrize("preset", ["lokr_dora", "lora", "tsm", "tsm_stage2", "tsm_lokr"])
+def test_cold_start_traces_whole_after_priming(preset):
+    """The trainer compiles right after the weights are loaded, so the first traced call is the network's FIRST forward:
+    its lazily filled per-module caches are cold. Traced cold, LoKr+DoRA breaks the graph on lycoris_fast's float(scalar)
+    (.item(), _compute_static_eligible) and dynamo keeps the fragments (21 graphs per Block call, re-specialised per
+    resolution); the other presets trace whole cold. prime_module_caches (called by after_network_loaded before
+    compile_blocks) fills the caches eagerly: every preset then traces to one graph with no break from a cold network."""
+    unet, net, _ = build(preset)
+    unet._block_compile = True
+    x, t, ctx, pad = inputs(t=[0.3])
+    cap = capture_block_args(unet, net, x, t, ctx, pad)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        cold = torch._dynamo.explain(unet.blocks[0]._forward)(*cap["args"], **cap["kwargs"])
+    if preset == "lokr_dora":
+        assert cold.graph_break_count > 0 and all("item" in str(r.reason) for r in cold.break_reasons), cold.break_reasons
+    else:
+        assert cold.graph_break_count == 0, [str(r.reason)[:100] for r in cold.break_reasons]
+    torch._dynamo.reset()
+    unet, net, _ = build(preset)  # fresh again: the cold explain above filled the caches while breaking
+    unet._block_compile = True
+    cap = capture_block_args(unet, net, x, t, ctx, pad)
+    n = laf.prime_module_caches(net)
+    assert n == (len(laf._all_loras(net)) if preset in ("lokr_dora", "lora") else 0)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        primed = torch._dynamo.explain(unet.blocks[0]._forward)(*cap["args"], **cap["kwargs"])
+    assert primed.graph_break_count == 0 and primed.graph_count == 1, [str(r.reason)[:100] for r in primed.break_reasons]
+
+
 @pytest.mark.parametrize("preset,ckpt", [("lokr_dora", "none"), ("lokr_dora", "unsloth"), ("lokr_dora", "torch"),
                                          ("tsm", "none"), ("tsm", "unsloth"), ("tsm_stage2", "none"),
                                          ("tsm_lokr", "none"), ("lora", "torch")])
@@ -312,7 +374,7 @@ def test_compiled_blocks_match_eager(preset, ckpt):
         unet.enable_gradient_checkpointing(unsloth_offload=ckpt == "unsloth")
     x, t, ctx, pad = inputs(t=[0.3])
     ref = step(unet, net, x, t, ctx, pad, checkpoint=ckpt != "none")
-    state = compile_toy(unet)
+    state = compile_toy(unet, net)
     assert unet._block_compile is True
     new = step(unet, net, x, t, ctx, pad, checkpoint=ckpt != "none")
     assert state.compiled_calls >= len(unet.blocks) and state.eager_calls == 0, (state.compiled_calls, state.eager_calls)
@@ -330,7 +392,7 @@ def test_tsm_timesteps_of_one_expert_interval_share_the_graphs():
     picks other experts: at most one new graph per Block dtype regime (the first step's count)."""
     unet, net, _ = build("tsm")
     backend, calls = counting_backend("aot_eager")
-    compile_toy(unet, backend=backend)
+    compile_toy(unet, net, backend=backend)
     x, t, ctx, pad = inputs(t=[0.3])
     step(unet, net, x, t, ctx, pad, backward=False)
     first = len(calls)
@@ -388,7 +450,7 @@ def test_mixed_timestep_chunk_runs_eager_and_single_timestep_batch_compiles():
     ref_mixed = step(unet, net, x, t, ctx, pad)
     x1, t1, ctx1, pad1 = inputs(batch=2, t=[0.3, 0.3])
     ref_same = step(unet, net, x1, t1, ctx1, pad1)
-    state = compile_toy(unet, skip_call=laf.mixed_timestep_chunk)
+    state = compile_toy(unet, net, skip_call=laf.mixed_timestep_chunk)
     new_mixed = step(unet, net, x, t, ctx, pad)
     assert state.eager_calls == len(unet.blocks) and state.compiled_calls == 0, (state.eager_calls, state.compiled_calls)
     assert_same(ref_mixed, new_mixed, "mixed-timestep chunk (eager under block compile)")
@@ -402,7 +464,7 @@ def test_resolution_sweep_inside_the_union_band_shares_the_graphs():
     others run on its graphs (soft marks on the token axis of x and the RoPE tables under attn_mode torch)."""
     unet, net, _ = build("lokr_dora")
     backend, calls = counting_backend("aot_eager")
-    state = compile_toy(unet, backend=backend)
+    state = compile_toy(unet, net, backend=backend)  # cold network, caches primed as the trainer does
     assert state.bands == [(16, 64)]
     x, t, ctx, pad = inputs(latent_hw=(8, 8), t=[0.3])
     step(unet, net, x, t, ctx, pad, backward=False)
@@ -423,6 +485,7 @@ def test_static_plan_compiles_per_token_count():
     """dynamic=static (no marks): every distinct token count compiles its own graphs."""
     unet, net, _ = build("lora")
     backend, calls = counting_backend("eager")
+    laf.prime_module_caches(net)
     bc.compile_blocks(unet, bands=[], backend=backend, dynamic="static", recompile_limit=64, isolate_cache=False)
     x, t, ctx, pad = inputs(latent_hw=(8, 8), t=[0.3])
     step(unet, net, x, t, ctx, pad, backward=False)
@@ -436,7 +499,7 @@ def test_pause_eval_and_restore_run_the_eager_blocks():
     """pause() (sample images) and eval mode (validation) take the eager _forward; restore_blocks removes the wrappers
     and the fake-5D flag."""
     unet, net, _ = build("lora")
-    state = compile_toy(unet, backend="eager")
+    state = compile_toy(unet, net, backend="eager")
     x, t, ctx, pad = inputs(t=[0.3])
     with bc.pause():
         assert not bc.is_active()
@@ -619,7 +682,8 @@ def test_after_network_loaded_compiles_from_the_bucket_token_counts():
     trainer.after_network_loaded(_trainer_args(), accel, net, [], unet)
     state = unet._block_compile_state
     assert unet._block_compile is True and state.bands == [(1024, 4096)]
-    assert printed and "1024, 1536, 4096" in printed[0]
+    assert printed and "1024, 1536, 4096" in printed[0] and f"{len(laf._all_loras(net))} LyCORIS module caches primed" in printed[0]
+    assert all("_laf_fast" in m.__dict__ for m in laf._all_loras(net))  # the lazy caches were filled before compiling
     x, t, ctx, pad = inputs(t=[0.3])
     step(unet, net, x, t, ctx, pad, backward=False)
     assert state.compiled_calls == len(unet.blocks)

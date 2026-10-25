@@ -87,6 +87,10 @@ of them for the eager math:
 - a chunk whose rows carry different timesteps (`mixed_timestep_chunk()`: batch > 1 with per-sample timesteps) runs the
   eager masked path (`_TSMMaskedLinear`): its expert union changes with the chunk, so a compiled graph would be re-traced
   per combination. With `batch_size 1` (also under `--step_rows`) every chunk has one timestep and runs compiled.
+- the per-module caches filled lazily on the first forward (`lycoris_fast._static_eligible`: a `float(scalar)` `.item()`
+  per LoKr module; `_locon_fast_ok`, `_ortho_fast_ok`) are primed by `prime_module_caches` after the weights are loaded
+  and before the Blocks are compiled: traced cold, the `.item()` is a graph break and dynamo keeps the fragments it
+  compiled on that first call (a LoKr+DoRA Block ran as ~20 graphs instead of one, re-specialised per resolution).
 
 Covered by `tests/test_anima_block_compile.py` (lokr+DoRA, lora, tsm stage 1 / 2, tsm-lokr: one graph per Block, no
 graph break, compiled forward + backward identical to eager with and without checkpointing - plain lora's adaLN

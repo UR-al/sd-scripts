@@ -1185,6 +1185,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         bands = anima_block_compile.plan_bands(counts, args.anima_block_compile_dynamic,
                                               widen=float(args.anima_block_compile_band_widen))
         skip = self._lycoris_fixes.mixed_timestep_chunk if getattr(self, "_lycoris_fix_on", False) else None
+        # the per-module caches the fixed paths fill on the first forward (a .item() each for LoKr) must be warm before
+        # the first trace: traced cold, the first call breaks the graph and dynamo keeps those fragments
+        primed = self._lycoris_fixes.prime_module_caches(network) if getattr(self, "_lycoris_fix_on", False) else 0
         if getattr(anima, "split_attn", False):
             logger.warning("--anima_block_compile with --split_attn: the per-row slice by the seqlens tensor is a graph break"
                            " inside every attention call (the Blocks still run, in pieces); attn_mode torch without"
@@ -1203,9 +1206,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         accelerator.print(
             f"block compile: {len(anima.blocks)} Blocks compiled per call (backend {args.anima_block_compile_backend},"
             f" mode {args.anima_block_compile_mode or 'default'}, {args.anima_block_compile_dynamic} bands"
-            f" {state.bands or 'static'}, token counts {counts}); the first steps of every expert choice / checkpointing"
-            " regime compile (minutes on Windows), later runs reuse the inductor cache. Sample images and validation run"
-            " eager; a mixed-timestep TSM chunk (batch > 1 rows with different timesteps) runs eager."
+            f" {state.bands or 'static'}, token counts {counts}, {primed} LyCORIS module caches primed); the first steps of"
+            " every expert choice / checkpointing regime compile (minutes on Windows), later runs reuse the inductor cache."
+            " Sample images and validation run eager; a mixed-timestep TSM chunk (batch > 1 rows with different"
+            " timesteps) runs eager."
         )
 
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):

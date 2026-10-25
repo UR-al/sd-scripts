@@ -1375,6 +1375,32 @@ def rebind_forwards(network) -> int:
     return n
 
 
+def prime_module_caches(network) -> int:
+    """Block compile: fill the per-module caches that the fixed paths and library/lycoris_fast.py populate lazily on the
+    first forward, BEFORE the first compiled trace. lycoris_fast._static_eligible reads float(scalar) - a .item() - once
+    per LoKr module; inside a compiled Block graph that is a graph break, and dynamo keeps the fragmented graphs it
+    compiled on that first call for the rest of the run (a LoKr+DoRA Block traced cold ran as ~20 graphs instead of one
+    and re-specialised per resolution). Call after the network's weights are loaded (the caches depend on them: the LoKr
+    scalar must be 1.0 for the fast path) and before compile_blocks. Returns the number of modules primed."""
+    from library import lycoris_fast
+
+    n = 0
+    for m in _all_loras(network):
+        kind = type(m).__name__
+        if kind == "LokrModule":
+            lycoris_fast._static_eligible(m)  # caches _moss_fast_static (the float(scalar) read happens here, eagerly)
+            if "_fast_lokr_scale" not in m.__dict__:
+                m.__dict__["_fast_lokr_scale"] = float(m.scale)  # what _fast_forward would store on its first call
+            n += 1
+        elif kind == "LoConModule":
+            _locon_fast_ok(m)
+            n += 1
+        elif kind == "OrthoLoRAModule":
+            _ortho_fast_ok(m)
+            n += 1
+    return n
+
+
 def mixed_timestep_chunk() -> bool:
     """True while the current micro-step's rows carry different TSM timesteps (set_timestep stored them per group): the
     block-compile wrapper runs such a chunk through the eager Block._forward (the masked path's expert union changes

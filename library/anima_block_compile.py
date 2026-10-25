@@ -38,6 +38,10 @@
 #   row inside every attention call. Anima's default attention (attn_mode torch, no split) traces whole.
 # * the fork's own ElementwiseChains and LoKr weight-rebuild compiles are switched off under block compile (nested
 #   torch.compile inside a compiled frame exhausts the recompile budget).
+# * the per-module caches the fixed paths fill lazily (lycoris_fast._static_eligible: a float(scalar) .item() per LoKr
+#   module) are primed before the first trace (lycoris_algo_fixes.prime_module_caches, called by the trainer after the
+#   weights are loaded): traced cold, that .item() is a graph break and dynamo keeps the ~20 fragments it compiled on
+#   the first call for the rest of the run.
 # * the inductor cache is routed to a per-signature directory (the persistent caches key on the FX graph but not on the
 #   mark_dynamic ranges; two processes compiled with different bands poison each other through the shared default dir).
 #
