@@ -473,6 +473,21 @@ class NetworkTrainer:
     def post_process_network(self, args, accelerator, network, text_encoders, unet):
         pass
 
+    # Micro-step / step / epoch hooks (no-ops here): a trainer that measures or logs per micro-step (one chunk's forward +
+    # backward: anima_train_network.py --anima_tier_timing) implements them. Called on every micro-step, so an
+    # implementation that is switched off must return after one attribute check.
+    def on_micro_step_start(self, args, accelerator, sub_batch, unet):
+        pass
+
+    def on_micro_step_end(self, args, accelerator):
+        pass
+
+    def on_optimizer_step_end(self, args, accelerator, global_step: int, is_tracking: bool):
+        pass
+
+    def on_epoch_end(self, args, accelerator, epoch: int, global_step: int):
+        pass
+
     def get_noise_scheduler(self, args: argparse.Namespace, device: torch.device) -> Any:
         noise_scheduler = DDPMScheduler(
             beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000, clip_sample=False
@@ -4051,6 +4066,7 @@ class NetworkTrainer:
                     for sub_batch, chunk_weight in chunks:
                         if self._lycoris_fix_on:
                             self._lycoris_fix_defer_clear = True  # keep the T-LoRA mask / TSM timestep until backward
+                        self.on_micro_step_start(args, accelerator, sub_batch, unet)
                         c_loss, c_pre_scaling_loss, c_loss_scaled = self.process_batch(
                             sub_batch,
                             text_encoders,
@@ -4109,6 +4125,7 @@ class NetworkTrainer:
                         accelerator.backward(c_loss if backward_scale == 1.0 else c_loss * backward_scale)
                         if self._lycoris_fix_on:
                             self._lycoris_fix_after_backward(accelerator.unwrap_model(network))
+                        self.on_micro_step_end(args, accelerator)
 
                         if self.should_sync_ramtorch(args, accelerator):
                             torch.cuda.synchronize()
@@ -4257,6 +4274,7 @@ class NetworkTrainer:
                     global_step += 1
                     cuda_memory.maybe_empty_cache(args, accelerator.device, global_step)  # after zero_grad: activations freed
                     memlog.step(global_step)
+                    self.on_optimizer_step_end(args, accelerator, global_step, is_tracking)
 
                     if (train_util.sample_images_check(args, None, global_step) or
                         train_util.calculate_val_loss_check(args, global_step, step, val_dataloader, train_dataloader) or 
@@ -4425,6 +4443,7 @@ class NetworkTrainer:
                     break
 
             # END OF EPOCH
+            self.on_epoch_end(args, accelerator, epoch, global_step)
             if is_tracking:
                 logs = {"loss/epoch_average": loss_recorder.average}
                 accelerator.log(logs, step=global_step)

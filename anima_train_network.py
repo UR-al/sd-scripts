@@ -20,6 +20,7 @@ from library import (
     anima_utils,
     flux_train_utils,
     micro_batch,
+    tier_timing,
     qwen_image_autoencoder_kl,
     sd3_train_utils,
     strategy_anima,
@@ -186,6 +187,15 @@ def validate_block_compile_args(args) -> None:
         refuse("--anima_block_compile_recompile_limit must be >= 8")
 
 
+def validate_tier_timing_args(args) -> None:
+    """--anima_tier_timing_every must be >= 1 when --anima_tier_timing is on. Raises ValueError."""
+    if not getattr(args, "anima_tier_timing", False):
+        return
+    every = int(getattr(args, "anima_tier_timing_every", 50) or 0)
+    if every < 1:
+        raise ValueError(f"--anima_tier_timing_every must be >= 1 (optimizer steps between reports), got {every}")
+
+
 class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def __init__(self):
         super().__init__()
@@ -206,6 +216,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         self._tsm_grouped_supported = True  # TSM-LoKr tsm_grouped_accumulation: see get_noise_pred_and_target
         self._ckpt_modes_logged = set()  # per-token-count checkpointing modes announced once (get_noise_pred_and_target)
         self._train_dataset_group = None  # --anima_block_compile: the buckets' token counts (after_network_loaded)
+        self._tier_timer = None  # --anima_tier_timing: library/tier_timing.TierTimer, created at the first micro-step
         self._micro_batch_logged = set()  # per-sample token counts whose chunking was announced (split_batch_for_backward)
         # Cache of zero padding masks keyed by (batch, height, width, dtype, device).
         # The Anima DiT consumes padding_mask read-only (resize/expand/concat, never
@@ -436,6 +447,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         micro_batch.validate_step_rows(args)  # --step_rows: accumulation 1, batch_loss_norm_rows 0 / N (processes: train())
         self._train_dataset_group = train_dataset_group
         validate_block_compile_args(args)  # --anima_block_compile: no RamTorch / block swap / accelerate compile / stock LyCORIS
+        validate_tier_timing_args(args)  # --anima_tier_timing_every >= 1
 
         if args.unsloth_offload_checkpointing:
             if not args.gradient_checkpointing:
@@ -1212,6 +1224,32 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             " timesteps) runs eager."
         )
 
+    # --anima_tier_timing (library/tier_timing.py): one span per micro-step, keyed by the tier of its tokens per sample
+    def on_micro_step_start(self, args, accelerator, sub_batch, unet):
+        if not getattr(args, "anima_tier_timing", False):
+            return
+        if self._tier_timer is None:
+            self._tier_timer = tier_timing.TierTimer(getattr(accelerator.device, "type", "cpu"))
+        self._tier_timer.start(tier_timing.sample_tokens(sub_batch, anima_patch_spatial(accelerator.unwrap_model(unet))))
+
+    def on_micro_step_end(self, args, accelerator):
+        if self._tier_timer is not None:
+            self._tier_timer.stop()
+
+    def on_optimizer_step_end(self, args, accelerator, global_step: int, is_tracking: bool):
+        timer = self._tier_timer
+        if timer is None or global_step % max(1, int(getattr(args, "anima_tier_timing_every", 50) or 50)):
+            return
+        stats = timer.report()  # the finished spans of the window (CUDA: event pairs already completed, no sync)
+        if is_tracking:
+            accelerator.log(timer.scalars(stats), step=global_step)
+        else:
+            logger.info(timer.format_line(stats, what=f"step {global_step}"))
+
+    def on_epoch_end(self, args, accelerator, epoch: int, global_step: int):
+        if self._tier_timer is not None:
+            logger.info(self._tier_timer.format_line(self._tier_timer.epoch_report(), what=f"epoch {epoch + 1}"))
+
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
         text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]  # compatibility
         te = self.get_models_for_text_encoding(args, accelerator, text_encoders)
@@ -1808,6 +1846,16 @@ def setup_parser() -> argparse.ArgumentParser:
                              " instead of saving them: a memory knob between no checkpointing and checkpointing)."
                              " Ignored under --gradient_checkpointing (the recompute pass could select a different graph,"
                              " pytorch #166926). 1.0 = off")
+    parser.add_argument("--anima_tier_timing", action="store_true",
+                        help="time every micro-step's forward + backward (one chunk: a bucket batch or its token-budget /"
+                             " --step_rows piece) and group the times by resolution tier - the nearest of 512^2 = 1024,"
+                             " 1024^2 = 4096, 1536^2 = 9216, 2048^2 = 16384 DiT tokens per sample on a log scale. CUDA:"
+                             " event pairs on the training stream, read only once finished (no synchronization); CPU:"
+                             " perf_counter. Every --anima_tier_timing_every optimizer steps the window's per-tier count /"
+                             " mean / median go to the tracker (tier_time/<tier>/count|mean_ms|median_ms, tier_time/pending),"
+                             " at the end of every epoch one INFO line. Off (default): one attribute check per micro-step")
+    parser.add_argument("--anima_tier_timing_every", type=int, default=50,
+                        help="optimizer steps between --anima_tier_timing reports (default 50)")
     # Anima-specific default: lower cfm_lambda than the SDXL default of 0.05
     parser.set_defaults(cfm_lambda=0.02)
     parser.add_argument("--ileco", action="store_true", help="enable dataset-backed iLECO prompt-to-prompt training")

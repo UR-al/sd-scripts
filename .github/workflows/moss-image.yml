@@ -69,6 +69,7 @@ jobs:
           tests/test_moss_pipeline.py
           tests/test_precision_logging.py
           tests/test_requirements_pins.py
+          tests/test_tier_timing.py
           tests/test_timestep_presets.py
           tests/test_tsm_lokr.py
           tests/test_tsm_offload.py
