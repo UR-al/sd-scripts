@@ -40,6 +40,86 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def anima_patch_spatial(anima) -> int:
+    """The DiT's spatial patch size (anima_models.Anima.patch_spatial; 2 for every Anima)."""
+    return int(getattr(anima, "patch_spatial", None) or getattr(anima, "spatial_patch_size", None) or 2)
+
+
+def tokens_of_latents(latents: torch.Tensor, patch: int) -> int:
+    """DiT tokens of one sample of this micro-step: ceil(H/p) * ceil(W/p) over the latent grid (one frame)."""
+    h, w = int(latents.shape[-2]), int(latents.shape[-1])
+    return -(-h // patch) * -(-w // patch)
+
+
+# Per-micro-step gradient checkpointing modes of the DiT Blocks (apply_checkpointing_for_tokens).
+CKPT_NONE, CKPT_HALF, CKPT_ALL = "none", "half", "all"
+
+
+def checkpoint_token_limits(args) -> tuple[int, int]:
+    """(N1, N2) = --anima_no_checkpoint_max_tokens / --anima_half_checkpoint_max_tokens; 0 = that regime is off."""
+    n1 = int(getattr(args, "anima_no_checkpoint_max_tokens", 0) or 0)
+    n2 = int(getattr(args, "anima_half_checkpoint_max_tokens", 0) or 0)
+    return max(n1, 0), max(n2, 0)
+
+
+def validate_checkpoint_token_limits(args) -> None:
+    """Both set and N2 < N1: the half band N1 < tokens <= N2 is empty and the two were most likely swapped - refuse."""
+    n1, n2 = checkpoint_token_limits(args)
+    if n1 and n2 and n2 < n1:
+        raise ValueError(
+            f"--anima_half_checkpoint_max_tokens ({n2}) must be >= --anima_no_checkpoint_max_tokens ({n1}): micro-steps"
+            f" of <= {n1} DiT tokens run without checkpointing, {n1} < tokens <= N2 with every other Block checkpointed,"
+            f" above N2 with all Blocks checkpointed"
+            f" / --anima_half_checkpoint_max_tokens({n2}) 는 --anima_no_checkpoint_max_tokens({n1}) 이상이어야 합니다:"
+            f" 토큰 {n1} 이하는 체크포인팅 없이, {n1} 초과 N2 이하는 블록 절반만, N2 초과는 전체 체크포인팅"
+        )
+
+
+def checkpoint_mode_for_tokens(args, tokens: int, swapping: bool) -> str:
+    """The Block checkpointing mode of a micro-step of `tokens` DiT tokens: CKPT_NONE for tokens <= N1, CKPT_HALF for
+    N1 < tokens <= N2, CKPT_ALL above (and always with --blocks_to_swap); CKPT_NONE without --gradient_checkpointing."""
+    if not args.gradient_checkpointing:
+        return CKPT_NONE
+    if swapping:
+        return CKPT_ALL
+    n1, n2 = checkpoint_token_limits(args)
+    if n1 and tokens <= n1:
+        return CKPT_NONE
+    if n2 and tokens <= n2:
+        return CKPT_HALF
+    return CKPT_ALL
+
+
+def apply_checkpointing_for_tokens(anima, args, tokens: int, unsloth: bool, swapping: bool) -> str:
+    """--anima_no_checkpoint_max_tokens N1 (2026-10-25): a micro-step whose samples have <= N1 DiT tokens runs the blocks
+    without gradient checkpointing (no recompute: the small tiers of a multi-resolution dataset are host-bound, so the
+    recompute is a third of their module calls, and their activations are small). --anima_half_checkpoint_max_tokens N2:
+    for N1 < tokens <= N2 only the even-indexed blocks are checkpointed and the odd ones keep their activations (half the
+    recompute for a tier whose full activations would not fit, e.g. the 1024 tier of Anima-2.9B). Above N2, and with
+    --blocks_to_swap, every block runs with the configured checkpointing (unsloth / cpu offload as the trainer set it).
+    The block flags are plain attributes, so this is switched per micro-step; the current mode is kept on the model and
+    the flags are touched only when it changes (640-module micro-steps are host-bound: this must stay cheap). Returns
+    the mode of this micro-step. N1 = N2 = 0: nothing changes."""
+    mode = checkpoint_mode_for_tokens(args, tokens, swapping)
+    if not args.gradient_checkpointing or swapping or not any(checkpoint_token_limits(args)):
+        return mode  # nothing to switch: the flags stay as the trainer set them up
+    if getattr(anima, "_anima_ckpt_mode", None) == mode:
+        return mode
+    cpu_offload = bool(getattr(args, "cpu_offload_checkpointing", False))
+    if mode == CKPT_ALL:
+        anima.enable_gradient_checkpointing(cpu_offload=cpu_offload, unsloth_offload=unsloth)
+    elif mode == CKPT_NONE:
+        anima.disable_gradient_checkpointing()
+    else:
+        for i, block in enumerate(anima.blocks):  # even-indexed checkpointed, odd-indexed kept
+            if i % 2 == 0:
+                block.enable_gradient_checkpointing(cpu_offload=cpu_offload, unsloth_offload=unsloth)
+            else:
+                block.disable_gradient_checkpointing()
+    anima._anima_ckpt_mode = mode
+    return mode
+
+
 class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def __init__(self):
         super().__init__()
@@ -58,6 +138,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         self.ileco_prompt_pairs = None
         self.addift_pair_settings = None
         self._tsm_grouped_supported = True  # TSM-LoKr tsm_grouped_accumulation: see get_noise_pred_and_target
+        self._ckpt_modes_logged = set()  # per-token-count checkpointing modes announced once (get_noise_pred_and_target)
         # Cache of zero padding masks keyed by (batch, height, width, dtype, device).
         # The Anima DiT consumes padding_mask read-only (resize/expand/concat, never
         # mutated in place), so a single reusable buffer per key avoids a fresh CUDA
@@ -280,6 +361,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         assert (
             args.blocks_to_swap is None or args.blocks_to_swap == 0
         ) or not args.cpu_offload_checkpointing, "blocks_to_swap is not supported with cpu_offload_checkpointing"
+
+        validate_checkpoint_token_limits(args)  # --anima_half_checkpoint_max_tokens >= --anima_no_checkpoint_max_tokens
 
         if args.unsloth_offload_checkpointing:
             if not args.gradient_checkpointing:
@@ -1071,6 +1154,20 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         is_train=True,
     ):
         anima: anima_models.Anima = unet
+        if is_train and args.gradient_checkpointing and any(checkpoint_token_limits(args)):
+            m = accelerator.unwrap_model(anima)
+            tokens = tokens_of_latents(latents, anima_patch_spatial(m))
+            mode = apply_checkpointing_for_tokens(m, args, tokens, self._use_unsloth_offload_checkpointing,
+                                                  self.is_swapping_blocks)
+            if mode != CKPT_ALL and mode not in self._ckpt_modes_logged:  # each reduced mode once, with its token count
+                self._ckpt_modes_logged.add(mode)
+                n1, n2 = checkpoint_token_limits(args)
+                if mode == CKPT_NONE:
+                    logger.info(f"gradient checkpointing off for micro-steps of <= {n1} DiT tokens (this one: {tokens});"
+                                f" {'every other Block' if n2 else 'on'} above")
+                else:
+                    logger.info(f"gradient checkpointing on every other Block (even-indexed) for micro-steps of"
+                                f" {n1} < tokens <= {n2} DiT tokens (this one: {tokens}); all Blocks above")
 
         if args.ileco:
             return self.get_ileco_noise_pred_and_target(
@@ -1444,6 +1541,7 @@ def prepare_anima_runtime(args) -> None:
     if not args.anima_stock_lycoris:
         install_fast_lokr_forward()
     anima_models.enable_elementwise_compile(not args.anima_no_compile)
+    anima_models.ADALN_HOIST = bool(getattr(args, "anima_adaln_hoist", False))
     # The fast forward's LoKr+DoRA weight rebuild, fused by torch.compile (~1 bf16 ulp; 1536 b1: 2.66 -> 2.38 s/step)
     enable_compiled_rebuild(not (args.anima_stock_lycoris or args.anima_no_compile or args.anima_no_lokr_compile))
 
@@ -1462,6 +1560,24 @@ def setup_parser() -> argparse.ArgumentParser:
         help="offload activations to CPU RAM using async non-blocking transfers (faster than --cpu_offload_checkpointing). "
         "Cannot be used with --cpu_offload_checkpointing or --blocks_to_swap.",
     )
+    parser.add_argument("--anima_no_checkpoint_max_tokens", type=int, default=0,
+                        help="run the micro-steps whose samples have at most this many DiT tokens (latent H/2 x W/2; a 512^2"
+                             " image = 1024) without gradient checkpointing - no recompute, the activations stay in VRAM -"
+                             " and the larger ones with the configured checkpointing (or half-checkpointed up to"
+                             " --anima_half_checkpoint_max_tokens when that is set). Ignored with --blocks_to_swap."
+                             " 0 = off (no un-checkpointed regime)")
+    parser.add_argument("--anima_half_checkpoint_max_tokens", type=int, default=0,
+                        help="run the micro-steps with more DiT tokens than --anima_no_checkpoint_max_tokens but at most"
+                             " this many with only every other Block checkpointed (the even-indexed Blocks recompute, the"
+                             " odd-indexed ones keep their activations: half the recompute, about half the activation VRAM"
+                             " of no checkpointing; a 1024^2 image = 4096 tokens), larger ones with every Block"
+                             " checkpointed. Must be >= --anima_no_checkpoint_max_tokens when both are set; ignored with"
+                             " --blocks_to_swap. 0 = off")
+    parser.add_argument("--anima_adaln_hoist", action="store_true",
+                        help="compute each checkpointed Block's adaLN modulations once per micro-step outside its gradient"
+                             " checkpoint instead of inside it (forward, recompute and backward of the 6 modulation Linears"
+                             " per Block); same results. Off by default: measured +-0 s/step on Anima 2.9B 4-tier batch 1"
+                             " (library/anima_models.py ADALN_HOIST)")
     parser.add_argument("--anima_no_compile", action="store_true",
                         help="do not torch.compile the Block elementwise chains (LayerNorm+AdaLN, q/k RMSNorm+RoPE, residual)")
     parser.add_argument("--anima_stock_lycoris", action="store_true",

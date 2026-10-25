@@ -265,6 +265,23 @@ def enable_elementwise_compile(enabled: bool = True):
     _CHAINS.enable(enabled)
 
 
+# AdaLN hoist (opt-in, --anima_adaln_hoist): Anima.forward_mini_train_dit computes each checkpointed Block's three adaLN
+# modulations (Block.compute_adaln_modulations) outside the checkpoint and passes them in, so the six modulation Linears
+# per Block (LyCORIS modules with preset anima-exp: 240 of the 640 module calls of a micro-step, each ~1 token of work)
+# run their forward once and their backward once instead of forward + recompute + backward. Same ops, same order within
+# each path; only where they run (bitwise equal: tests/test_anima_adaln_hoist.py). Off (the default): Block._forward
+# computes them inside the checkpoint as before. GPU A/B 2026-10-25 (RTX 5090, Anima 2.9B, TSM dim 32, 4-tier batch 1 x
+# accumulation 8, 16 steps, two interleaved pairs): off 11.18 / 11.31, on 11.20 / 11.25 s/step, max_allocated 24.27 GiB
+# both - no measurable gain on that step (its host floor is elsewhere), so it stays off until a workload shows one.
+ADALN_HOIST = False
+
+
+def _per_block_grad_sum(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """A view of t that collects the gradients of its uses in one Block before they reach t (exact: ViewBackward only
+    reshapes). None or a tensor without grad is returned as is."""
+    return t.view_as(t) if t is not None and t.requires_grad else t
+
+
 def _plain_module(module: nn.Module) -> bool:
     """No instance-level forward patch (e.g. a network wrapping it) and no hooks: safe to inline its math."""
     return "forward" not in module.__dict__ and not module._forward_hooks and not module._forward_pre_hooks
@@ -915,6 +932,56 @@ class Block(nn.Module):
         self.cross_attn.init_weights()
         self.mlp.init_weights()
 
+    def compute_adaln_modulations(
+        self,
+        emb_B_T_D: torch.Tensor,
+        adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
+        use_fp32: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The three (B, T, 3D) adaLN modulation outputs of _forward (self-attn, cross-attn, MLP), each
+        adaln_modulation_*(emb) [+ adaln_lora_B_T_3D] under the same autocast as before (fp32 when use_fp32: fp16 overflow).
+
+        Called by _forward, or by the trainer's block loop before a checkpointed Block (ADALN_HOIST) so the Linears
+        run outside the checkpoint; the chunk into shift / scale / gate stays in _forward."""
+        with torch.autocast(device_type=emb_B_T_D.device.type, dtype=torch.float32, enabled=use_fp32):
+            if self.use_adaln_lora:
+                mods_self_attn = self.adaln_modulation_self_attn(emb_B_T_D) + adaln_lora_B_T_3D
+                mods_cross_attn = self.adaln_modulation_cross_attn(emb_B_T_D) + adaln_lora_B_T_3D
+                mods_mlp = self.adaln_modulation_mlp(emb_B_T_D) + adaln_lora_B_T_3D
+            else:
+                mods_self_attn = self.adaln_modulation_self_attn(emb_B_T_D)
+                mods_cross_attn = self.adaln_modulation_cross_attn(emb_B_T_D)
+                mods_mlp = self.adaln_modulation_mlp(emb_B_T_D)
+        return mods_self_attn, mods_cross_attn, mods_mlp
+
+    def _forward_hoisted(
+        self,
+        x_B_T_H_W_D: torch.Tensor,
+        emb_B_T_D: torch.Tensor,
+        crossattn_emb: torch.Tensor,
+        attn_params: attention.AttentionParams,
+        use_fp32: bool,
+        rope_cos_sin,
+        adaln_lora_B_T_3D,
+        extra_per_block_pos_emb,
+        mods_self_attn_B_T_3D: torch.Tensor,
+        mods_cross_attn_B_T_3D: torch.Tensor,
+        mods_mlp_B_T_3D: torch.Tensor,
+    ) -> torch.Tensor:
+        """_forward with the precomputed modulations as three flat tensor arguments: the checkpoint wrappers
+        (UnslothOffloadedGradientCheckpointer in particular) give gradients only to tensors passed directly."""
+        return self._forward(
+            x_B_T_H_W_D,
+            emb_B_T_D,
+            crossattn_emb,
+            attn_params,
+            use_fp32,
+            rope_cos_sin,
+            adaln_lora_B_T_3D,
+            extra_per_block_pos_emb,
+            (mods_self_attn_B_T_3D, mods_cross_attn_B_T_3D, mods_mlp_B_T_3D),
+        )
+
     def _forward(
         self,
         x_B_T_H_W_D: torch.Tensor,
@@ -925,6 +992,7 @@ class Block(nn.Module):
         rope_cos_sin: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
+        adaln_mods: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         if use_fp32:
             # Cast to float32 for better numerical stability in residual connections. Each module will cast back to float16 by enclosing autocast context.
@@ -933,26 +1001,14 @@ class Block(nn.Module):
         if extra_per_block_pos_emb is not None:
             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
 
-        # Compute AdaLN modulation parameters (in float32 when fp16 to avoid overflow in Linear layers)
-        with torch.autocast(device_type=x_B_T_H_W_D.device.type, dtype=torch.float32, enabled=use_fp32):
-            if self.use_adaln_lora:
-                shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = (
-                    self.adaln_modulation_self_attn(emb_B_T_D) + adaln_lora_B_T_3D
-                ).chunk(3, dim=-1)
-                shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = (
-                    self.adaln_modulation_cross_attn(emb_B_T_D) + adaln_lora_B_T_3D
-                ).chunk(3, dim=-1)
-                shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = (
-                    self.adaln_modulation_mlp(emb_B_T_D) + adaln_lora_B_T_3D
-                ).chunk(3, dim=-1)
-            else:
-                shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = self.adaln_modulation_self_attn(
-                    emb_B_T_D
-                ).chunk(3, dim=-1)
-                shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = self.adaln_modulation_cross_attn(
-                    emb_B_T_D
-                ).chunk(3, dim=-1)
-                shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = self.adaln_modulation_mlp(emb_B_T_D).chunk(3, dim=-1)
+        # AdaLN modulation parameters: computed here (the module-call math of anima_models.py:936-955 before the hoist,
+        # the chunks moved after the three Linears) or taken from the caller (ADALN_HOIST, outside the checkpoint)
+        if adaln_mods is None:
+            adaln_mods = self.compute_adaln_modulations(emb_B_T_D, adaln_lora_B_T_3D, use_fp32)
+        mods_self_attn_B_T_3D, mods_cross_attn_B_T_3D, mods_mlp_B_T_3D = adaln_mods
+        shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = mods_self_attn_B_T_3D.chunk(3, dim=-1)
+        shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = mods_cross_attn_B_T_3D.chunk(3, dim=-1)
+        shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = mods_mlp_B_T_3D.chunk(3, dim=-1)
 
         # Reshape for broadcasting: (B, T, D) -> (B, T, 1, 1, D)
         shift_self_attn_B_T_1_1_D = shift_self_attn_B_T_D[:, :, None, None, :]
@@ -1013,12 +1069,19 @@ class Block(nn.Module):
         rope_cos_sin: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
+        adaln_mods: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         if torch.is_grad_enabled() and self.training and self.gradient_checkpointing:
+            # Precomputed modulations (ADALN_HOIST, compute_adaln_modulations) go in as three flat tensors after the
+            # usual arguments: checkpoint inputs, so their Linears are neither recomputed nor re-run in backward
+            if adaln_mods is None:
+                forward_fn, mods = self._forward, ()
+            else:
+                forward_fn, mods = self._forward_hoisted, tuple(adaln_mods)
             if self.unsloth_offload_checkpointing:
                 # Unsloth: async non-blocking CPU RAM offload (fastest offload method)
                 return unsloth_checkpoint(
-                    self._forward,
+                    forward_fn,
                     x_B_T_H_W_D,
                     emb_B_T_D,
                     crossattn_emb,
@@ -1027,6 +1090,7 @@ class Block(nn.Module):
                     rope_cos_sin,
                     adaln_lora_B_T_3D,
                     extra_per_block_pos_emb,
+                    *mods,
                 )
             elif self.cpu_offload_checkpointing:
                 # Standard cpu offload: blocking transfers
@@ -1040,7 +1104,7 @@ class Block(nn.Module):
                     return custom_forward
 
                 return torch_checkpoint(
-                    create_custom_forward(self._forward),
+                    create_custom_forward(forward_fn),
                     x_B_T_H_W_D,
                     emb_B_T_D,
                     crossattn_emb,
@@ -1049,12 +1113,13 @@ class Block(nn.Module):
                     rope_cos_sin,
                     adaln_lora_B_T_3D,
                     extra_per_block_pos_emb,
+                    *mods,
                     use_reentrant=False,
                 )
             else:
                 # Standard gradient checkpointing (no offload)
                 return torch_checkpoint(
-                    self._forward,
+                    forward_fn,
                     x_B_T_H_W_D,
                     emb_B_T_D,
                     crossattn_emb,
@@ -1063,6 +1128,7 @@ class Block(nn.Module):
                     rope_cos_sin,
                     adaln_lora_B_T_3D,
                     extra_per_block_pos_emb,
+                    *mods,
                     use_reentrant=False,
                 )
         else:
@@ -1075,6 +1141,7 @@ class Block(nn.Module):
                 rope_cos_sin,
                 adaln_lora_B_T_3D,
                 extra_per_block_pos_emb,
+                adaln_mods,
             )
 
 
@@ -1418,11 +1485,26 @@ class Anima(nn.Module):
         # Determine whether to use float32 for block computations based on input dtype (use float32 for better stability when input is float16)
         use_fp32 = x_B_T_H_W_D.dtype == torch.float16
 
+        # ADALN_HOIST: a checkpointed Block gets its adaLN modulations computed here, outside the checkpoint (see the
+        # switch's comment). Not with block swap: the Block's weights may still be on their way to the device.
+        hoist_adaln = ADALN_HOIST and not self.blocks_to_swap and torch.is_grad_enabled()
+
         for block_idx, block in enumerate(self.blocks):
             if self.blocks_to_swap:
                 self.offloader.wait_for_block(block_idx)
 
-            x_B_T_H_W_D = block(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, attn_params, use_fp32, **block_kwargs)
+            adaln_mods = None
+            if hoist_adaln and block.training and block.gradient_checkpointing:  # Block.forward's checkpoint condition
+                emb_in, lora_in = t_embedding_B_T_D, adaln_lora_B_T_3D
+                if block.unsloth_offload_checkpointing:
+                    # UnslothOffloadedGradientCheckpointer.backward sums the Block's three modulation gradients into its
+                    # emb / adaln_lora inputs before they join the sum over Blocks; a view per Block keeps that order
+                    # (bit-identical grads when t_embedder trains). torch_checkpoint(use_reentrant=False) sums flat.
+                    emb_in, lora_in = _per_block_grad_sum(emb_in), _per_block_grad_sum(lora_in)
+                adaln_mods = block.compute_adaln_modulations(emb_in, lora_in, use_fp32)
+            x_B_T_H_W_D = block(
+                x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, attn_params, use_fp32, adaln_mods=adaln_mods, **block_kwargs
+            )
 
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks(self.blocks, block_idx)
