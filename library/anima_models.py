@@ -1221,6 +1221,8 @@ class Anima(nn.Module):
         # Block swap support
         self.blocks_to_swap = None
         self.offloader: Optional[custom_offloading_utils.ModelOffloader] = None
+        # --anima_block_compile (library/anima_block_compile.py): the Blocks see the token grid as (B, 1, L, 1, D)
+        self._block_compile = False
 
         self.build_patch_embed()
         self.build_pos_embed()
@@ -1489,6 +1491,14 @@ class Anima(nn.Module):
         # switch's comment). Not with block swap: the Block's weights may still be on their way to the device.
         hoist_adaln = ADALN_HOIST and not self.blocks_to_swap and torch.is_grad_enabled()
 
+        # Block compile (library/anima_block_compile.py): the Blocks see the token grid as (B, 1, L, 1, D), so a compiled
+        # Block graph keys on the token count alone, not on H and W separately. Block._forward's flatten / unflatten are
+        # the same ops on the fake shape (bit-exact); this reshape and its inverse run outside the compiled graphs.
+        flat_grid = None
+        if self._block_compile and extra_pos_emb is None and x_B_T_H_W_D.dim() == 5:
+            flat_grid = tuple(x_B_T_H_W_D.shape[1:4])
+            x_B_T_H_W_D = x_B_T_H_W_D.flatten(1, 3).unsqueeze(1).unsqueeze(3)
+
         for block_idx, block in enumerate(self.blocks):
             if self.blocks_to_swap:
                 self.offloader.wait_for_block(block_idx)
@@ -1508,6 +1518,9 @@ class Anima(nn.Module):
 
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks(self.blocks, block_idx)
+
+        if flat_grid is not None:
+            x_B_T_H_W_D = x_B_T_H_W_D.squeeze(3).squeeze(1).unflatten(1, flat_grid)
 
         x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D, use_fp32=use_fp32)
         x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)

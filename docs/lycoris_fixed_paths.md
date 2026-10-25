@@ -65,3 +65,30 @@ The module header of `library/lycoris_algo_fixes.py` lists, per algo, what stock
 Known limitation: GoRA / RaLoRA / LoRA² with DoRA on the factored path (`_LowRankDoRA`, RaLoRA blocks): a `dora_scale`
 entry that is exactly 0 on a nonzero base row (LyCORIS never initialises one, it starts at `||W0_i||`; only a file
 trained on another base can bring one) gets that entry's gradient without its base term; everything else stays exact.
+
+## Under `--anima_block_compile`
+
+`anima_train_network.py --anima_block_compile` (`library/anima_block_compile.py`, `docs/anima_train_network.md`) traces
+each DiT Block with the fixed paths' forwards inside the compiled graph. Three things change for LyCORIS networks, none
+of them for the eager math:
+
+- after `apply_to`, every adapted Linear's instance `forward` (LyCORIS binds `org_module.forward = module.forward`) is
+  re-bound to a closure over the module (`rebind_forwards`): dynamo 2.7 cannot read `org_module[0]` through a bound
+  method (every adapted Linear would be a graph break); the closure carries `__self__`, so the sample-time merged LoKr
+  weight cache of `library/lycoris_fast.py` still finds its modules. Stock LyCORIS forwards are not re-bound, which is
+  why `--lycoris_stock` is refused together with block compile.
+- `set_timestep` hoists the TSM step data onto the modules (`_hoist_tsm_step`): the expert tuple (`_hx_experts`), in
+  stage 2 the embedding row as an index tensor (`_hx_tidx`), for `tsm-lokr` the expert indices (`_hx_idx`). While
+  tracing, `_tsm_experts`, `_get_timestep` (patched: a constant instead of the global integer timestep, so the graph
+  guards on the expert choice and not on the timestep value), `_tsm_compute_gates` (`index_select` on the hoisted row)
+  and `_tsm_scale` (the 0-d scale buffer handed to the graph instead of the data_ptr cache) read them: one expert choice
+  is one set of graphs, and a timestep inside the same expert interval never recompiles. Outside a compiled graph the
+  hoisted data is ignored.
+- a chunk whose rows carry different timesteps (`mixed_timestep_chunk()`: batch > 1 with per-sample timesteps) runs the
+  eager masked path (`_TSMMaskedLinear`): its expert union changes with the chunk, so a compiled graph would be re-traced
+  per combination. With `batch_size 1` (also under `--step_rows`) every chunk has one timestep and runs compiled.
+
+Covered by `tests/test_anima_block_compile.py` (lokr+DoRA, lora, tsm stage 1 / 2, tsm-lokr: one graph per Block, no
+graph break, compiled forward + backward identical to eager with and without checkpointing - plain lora's adaLN
+up-weight gradients within a bf16 ulp or two - and no recompile inside an expert interval or across the bucket resolutions of
+the union band).

@@ -150,7 +150,9 @@ def _cache_targets(model: nn.Module):
     targets = []
     for module in model.modules():
         forward = module.__dict__.get("forward")
-        lokr = getattr(forward, "__self__", None)
+        # the bound method LyCORIS installs, or the closure --anima_block_compile re-binds it to (lycoris_algo_fixes.
+        # rebind_forwards: __wrapped_lora__ names the module; a closure must not carry __self__, dynamo refuses to inline it)
+        lokr = getattr(forward, "__wrapped_lora__", None) or getattr(forward, "__self__", None)
         if not isinstance(lokr, cls) or lokr.org_module[0] is not module or not _static_eligible(lokr):
             continue
         if isinstance(module, nn.Linear) or getattr(lokr, "is_ramtorch_org", False):  # plain or RamTorch-streamed Linear

@@ -427,6 +427,10 @@ def _define_module():
         # ------------------------------------------------------------------------------------------- timesteps
 
         def _expert_indices(self, t: int) -> Tuple[int, ...]:
+            if torch.compiler.is_compiling():
+                hx = self.__dict__.get("_hx_idx")  # block compile: the choice set_timestep hoisted (no dict cache in graph)
+                if hx is not None:
+                    return hx
             idx = self._idx_cache.get(t)
             if idx is None:
                 T = self.tsm_num_timesteps
@@ -439,6 +443,8 @@ def _define_module():
         def _timesteps(self) -> Tuple[int, ...]:
             from library import lycoris_algo_fixes as laf
 
+            if torch.compiler.is_compiling() and "_hx_idx" in self.__dict__:
+                return (0,)  # block compile, one timestep per chunk: _expert_indices reads the hoisted choice
             ints = laf._TSM_SAMPLE_T.get(self.mask_group_id)
             if ints:
                 return tuple(ints)

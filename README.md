@@ -277,3 +277,5 @@ The majority of scripts is licensed under ASL 2.0 (including codes from Diffuser
 [bitsandbytes](https://github.com/TimDettmers/bitsandbytes): MIT
 
 [BLIP](https://github.com/salesforce/BLIP): BSD-3-Clause
+
+[anima_lora](https://github.com/sorryhyun/anima_lora): MIT (the per-block compile design of `library/anima_block_compile.py`; see THIRD_PARTY_NOTICES.md)

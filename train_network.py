@@ -464,6 +464,12 @@ class NetworkTrainer:
 
     # region SD/SDXL
 
+    def after_network_loaded(self, args, accelerator, network, text_encoders, unet):
+        """Called once the network is applied (apply_to) and its --network_weights are loaded, before RamTorch, gradient
+        checkpointing and accelerator.prepare: a trainer that torch.compiles the model with the network's patched forwards
+        inside the graphs (anima_train_network.py --anima_block_compile) does it here. Default: nothing."""
+        pass
+
     def post_process_network(self, args, accelerator, network, text_encoders, unet):
         pass
 
@@ -2658,6 +2664,10 @@ class NetworkTrainer:
             # FIXME consider alpha of weights: this assumes that the alpha is not changed
             info = network.load_weights(args.network_weights)
             accelerator.print(f"load network weights from {args.network_weights}: {info}")
+
+        # the network is applied and loaded: a trainer that compiles the model with the network inside does it now
+        # (anima_train_network.py --anima_block_compile)
+        self.after_network_loaded(args, accelerator, network, text_encoders, unet)
 
         if args.use_ramtorch_network:
             #move all network weights to cpu first as base device
