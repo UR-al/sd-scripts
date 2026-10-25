@@ -916,6 +916,7 @@ class BaseDataset(torch.utils.data.Dataset):
         self.bucket_info = None  # for metadata
 
         self.current_epoch: int = 0  # インスタンスがepochごとに新しく作られるようなので外側から渡さないとダメ
+        self._epoch_value = None  # attach_epoch_value: the trainer's shared epoch, read by sync_epoch before a fetch
 
         self.current_step: int = 0
         self.max_train_steps: int = 0
@@ -1014,6 +1015,21 @@ class BaseDataset(torch.utils.data.Dataset):
 
     def set_current_step(self, step):
         self.current_step = step
+
+    def attach_epoch_value(self, value) -> None:
+        """The trainer's shared current_epoch Value (train_network.py). With it attached, __getitem__ brings the dataset's
+        epoch - the bucket shuffle - up to date BEFORE it reads the batch list (sync_epoch). collator_class sets the epoch
+        after the fetch (torch collates after dataset[idx]), so without this the first bucket batch of every epoch (one
+        per DataLoader worker) was read under the previous epoch's permutation: one batch duplicated, another missed,
+        and with --step_rows a number of optimizer steps per epoch that moved by +-1. The Value is shared with the
+        worker processes the way the collator's is (inherited at worker start)."""
+        self._epoch_value = value
+
+    def sync_epoch(self) -> None:
+        """Shuffle for the epoch the trainer is in before this fetch (no-op without attach_epoch_value)."""
+        value = getattr(self, "_epoch_value", None)
+        if value is not None:
+            self.set_current_epoch(value.value)
 
     def set_max_train_steps(self, max_train_steps):
         self.max_train_steps = max_train_steps
@@ -2569,6 +2585,7 @@ class BaseDataset(torch.utils.data.Dataset):
         return self._length
 
     def __getitem__(self, index):
+        self.sync_epoch()  # the epoch's shuffle before its first fetch (attach_epoch_value); the collator's call comes after
         bucket_index = self.buckets_indices[index].bucket_index
         bucket = self.batch_buckets[bucket_index]
         bucket_batch_size = self.buckets_indices[index].bucket_batch_size
@@ -3951,6 +3968,7 @@ class ControlNetDataset(BaseDataset):
         return self.dreambooth_dataset_delegate.__len__()
 
     def __getitem__(self, index):
+        self.sync_epoch()  # as BaseDataset.__getitem__: this dataset's epoch shuffles the delegate's (shared) batch lists
         example = self.dreambooth_dataset_delegate[index]
 
         bucket = self.dreambooth_dataset_delegate.batch_buckets[
@@ -4150,6 +4168,10 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
     def set_current_epoch(self, epoch):
         for dataset in self.datasets:
             dataset.set_current_epoch(epoch)
+
+    def attach_epoch_value(self, value) -> None:
+        for dataset in self.datasets:
+            dataset.attach_epoch_value(value)
 
     def set_current_step(self, step):
         for dataset in self.datasets:

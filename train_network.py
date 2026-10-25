@@ -2708,6 +2708,12 @@ class NetworkTrainer:
         train_dataloader_generator = torch.Generator(device="cpu")
         train_dataloader_generator_init_seed = train_dataloader_generator.initial_seed()
 
+        # The epoch's bucket shuffle must precede the epoch's first fetch: the collator's set_current_epoch runs after
+        # dataset[idx], so the first bucket batch of every epoch (one per worker) was read under the previous epoch's
+        # permutation - one batch duplicated, another missed - and with --step_rows the steps per epoch moved by +-1.
+        if hasattr(train_dataset_group, "attach_epoch_value"):
+            train_dataset_group.attach_epoch_value(current_epoch)
+
         train_dataloader = torch.utils.data.DataLoader(
             train_dataset_group,
             batch_size=1,

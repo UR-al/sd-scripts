@@ -235,9 +235,23 @@ def row_coupling_messages(args: Any, cause: str) -> List[str]:
 
 def step_rows_messages(args: Any, num_processes: int = 1) -> List[str]:
     """validate_step_rows plus, with --step_rows on, the row-coupling checks (a pack runs as one forward per bucket
-    batch or boundary piece): ValueError for the refused options, the warning texts for the others. [] when off."""
+    batch or boundary piece): ValueError for the refused options, the warning texts for the others; a warning for a
+    train_batch_size above N (such a bucket batch is cut over several steps and the loader holds all of it through
+    them) and for --dataset_class (the rows per epoch come from what the dataset reports). [] when off."""
     n = validate_step_rows(args, num_processes)
-    return row_coupling_messages(args, f"--step_rows {n}") if n else []
+    if not n:
+        return []
+    messages = row_coupling_messages(args, f"--step_rows {n}")
+    batch = int(getattr(args, "train_batch_size", 0) or 0)
+    if batch > n:
+        messages.append(f"--train_batch_size {batch} is larger than --step_rows {n}: a bucket batch of more than {n} rows"
+                        f" is cut over several optimizer steps and the loader keeps the whole batch on the device through"
+                        f" them (next to the {n}-row step); keep train_batch_size <= step_rows")
+    if getattr(args, "dataset_class", None):
+        messages.append(f"--step_rows {n} with --dataset_class: the steps per epoch are taken from the dataset's"
+                        f" num_train_images (its rows x repeats as it reports them); the end-of-epoch step count check"
+                        f" tells whether that matched the batches it yielded")
+    return messages
 
 
 def steps_per_epoch(rows_per_epoch: int, rows_per_step: int) -> int:
@@ -263,15 +277,18 @@ def dataset_rows_per_epoch(dataset_group: Any) -> int:
             raise ValueError("--step_rows cannot be combined with resolution jitter: its batch list is resampled every"
                              " epoch, so the rows (and steps) per epoch are not fixed")
         indices = getattr(src, "all_buckets_indices", None)
-        if indices is None:
+        if not indices:  # None, or the [] every BaseDataset starts with (a --dataset_class dataset never makes buckets)
             indices = getattr(src, "buckets_indices", None)
         buckets = getattr(src, "batch_buckets", None)
-        if indices is None or buckets is None:
+        if not indices or buckets is None:
             total += int(getattr(ds, "num_train_images", 0) or 0)
             continue
         for bi in indices:
             remaining = len(buckets[bi.bucket_index]) - bi.batch_index * bi.bucket_batch_size
             total += max(0, min(int(bi.bucket_batch_size), remaining))
+    if total <= 0:
+        raise ValueError("--step_rows: the dataset reports 0 rows per epoch (a --dataset_class dataset must set"
+                         " num_train_images to its rows x repeats); the steps per epoch cannot be formed from it")
     return total
 
 
@@ -281,7 +298,15 @@ class RowPacker:
     the epoch's final pack holds the remainder. len() = ceil(rows_per_epoch / rows_per_step), the optimizer steps per
     epoch (a mismatch with the packs actually formed is logged as a warning at the end of the epoch). skip_first_packs(k)
     is the resume path (accelerate's skip_first_batches needs a DataLoader): the first k packs are formed from the
-    loader's stream and dropped, so the epoch keeps the data order it would have had."""
+    loader's stream and dropped, so the epoch keeps the data order it would have had - at the cost of reading (and
+    placing on the device) the skipped packs' batches once, bounded by one epoch.
+
+    A batch cut at a step boundary is copied into its pieces before any of them is yielded and the packer drops the
+    batch itself, so this generator never holds a parent batch while the consumer runs a step; what still holds it is
+    the prepared DataLoader (accelerate's DataLoaderShard keeps the batch it last yielded until the next one is pulled,
+    i.e. while the next pack forms), so during the step that uses a batch's head piece the whole batch is on the device
+    next to the pack, and a batch larger than rows_per_step stays through every step its pieces fill (step_rows_messages
+    warns for train_batch_size > step_rows)."""
 
     def __init__(self, dataloader: Any, rows_per_step: int, rows_per_epoch: int):
         if int(rows_per_step) <= 0:
@@ -308,23 +333,26 @@ class RowPacker:
             if n <= 0:
                 raise ValueError("--step_rows: a batch without a known row count (no latents / images / loss_weights /"
                                  " captions entry)")
-            start = 0
-            while start < n:
-                take = min(n - start, self.rows_per_step - filled)
-                stop = start + take
-                # a cut piece is a copy (copy=True): a view would keep the whole bucket batch (already on the device
-                # after accelerate's placement) alive through the next optimizer step; a batch used whole is passed as is
-                pending.append(batch if (start == 0 and stop == n) else slice_batch(batch, start, stop, copy=True))
-                filled += take
-                start = stop
-                if start == n:
-                    batch = None  # the generator frame must not pin the parent batch while the consumer runs the step
+            cuts = list(range(self.rows_per_step - filled, n, self.rows_per_step))  # the step boundaries inside this batch
+            if cuts:
+                # every piece is a copy (copy=True: a view would keep the whole bucket batch alive through the steps that
+                # use the other pieces) and the batch is dropped here, before any pack is yielded, so this frame holds no
+                # parent batch while the consumer runs a step; a batch used whole is passed as is
+                bounds = [0] + cuts + [n]
+                pieces = [slice_batch(batch, a, b, copy=True) for a, b in zip(bounds, bounds[1:])]
+                batch = None
+            else:
+                pieces = [batch]
+            for piece in pieces:
+                pending.append(piece)
+                filled += batch_rows(piece)
                 if filled == self.rows_per_step:
                     pack = StepPack(pending)
                     pending, filled = [], 0
                     if yielded >= skip:
                         yield pack
                     yielded += 1
+            del pieces, piece
         if pending:
             pack = StepPack(pending)
             if yielded >= skip:
