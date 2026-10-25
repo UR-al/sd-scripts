@@ -42,6 +42,19 @@ The module header of `library/lycoris_algo_fixes.py` lists, per algo, what stock
 - `full`: the trained weights are fp32 master weights (stock kept them in bf16 and lost small AdamW steps): with AdamW
   that is 16 bytes per adapted base parameter on the GPU, twice the stock footprint (the size is logged at start-up).
 - `algo=tsm-lokr`: see `docs/tsm_lokr.md`.
+- `algo=tsm` (2026-10-25): the training forward is the LoRA family's fused one (base GEMM with the active experts'
+  delta as its C input, hand-written backward) instead of `org_forward` + a separate delta; same math, the output
+  rounded once (under bf16 autocast at least as close to fp64 as the split forward; stage 2 ~2x closer). Measured on
+  the GPU (Anima 2.9B, 4-tier batch 1 x accumulation 8, 16 steps) it is speed-neutral against the split forward
+  (12.6 vs 12.5 s/step; stock LyCORIS 17.6), so expect no step-time change from it. Conv modules, RamTorch base weights (`use_ramtorch`), delta dropout (bypass mode / stage 2 while
+  training), `--fp8_base`, a base weight that needs its gradient and a dtype mix outside autocast keep the split
+  forward, and `network_args` `tsm_fused=False` switches it off everywhere. Stage 2 with `tsm_router_input=bottleneck`
+  computes the core bottleneck once more (no grad) for the gate pooling. The expert projections `x A^T`, `mid B^T` and
+  the expert gradients can run in fp32 with autocast off (`tsm_lowrank_fp32`; not given = stage 2 only, since on the
+  GPU it cost +11% step time and +3 GiB for a stage-1 gain AdamW normalises away; `True` / `False` force it): the base
+  GEMM and the input gradient stay bf16, the delta is rounded once into the base GEMM. `tsm_expert_fn=True` (opt-in,
+  default off) uses one autograd Function per call that takes the expert weights directly (`_TSMExpertLinear`); on the
+  GPU it held ~1.3 GiB more at the 2048-tier peak and was not faster, so the default stays the factor path.
 
 Known limitation: GoRA / RaLoRA / LoRA² with DoRA on the factored path (`_LowRankDoRA`, RaLoRA blocks): a `dora_scale`
 entry that is exactly 0 on a nonzero base row (LyCORIS never initialises one, it starts at `||W0_i||`; only a file

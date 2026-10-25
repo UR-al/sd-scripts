@@ -43,7 +43,10 @@
 #   tsm       nothing sets the timestep; one int per batch; stage 2: the router never sees the input in rebuild mode
 #             (tsm.py:538-545), gate pooling breaks on >3-D inputs (tsm.py:362-371); no Forge adapter. Speed: rebuild
 #             mode builds a dense delta weight per module per call, bypass runs one matmul pair per expert; the flag
-#             runs one fused down/up matmul pair over the concatenated active experts (same math).
+#             runs the base GEMM with the concatenated active experts' delta as its C input and a hand-written backward
+#             (_LowRankLinear / _TSMLinear on the concatenated factors; network_args tsm_fused=False keeps org_forward +
+#             a separate delta, tsm_lowrank_fp32 picks fp32 expert projections - default stage 2 only, tsm_expert_fn=True
+#             the experimental one-Function path _TSMExpertLinear).
 #   lora, locon   PiSSA (init_weights=pissa): saved at half strength (alpha kept for the doubled rank, locon.py:922-941),
 #             with a pissa_converted key Forge does not read; --resume / --network_weights failed (locon.py:898-962);
 #             with alpha != dim the base model changed at step 0 (locon.py:404-407). Speed: see "factored training
@@ -1440,22 +1443,370 @@ def _tsm_grouped_delta(self, x: torch.Tensor, ints: List[int], multiplier) -> to
     return delta if inverse is None else delta.index_select(0, inverse)
 
 
-def _tsm_forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-    if self.module_dropout and self.training:
-        if torch.rand(1) < self.module_dropout:
-            return self.org_forward(x, *args, **kwargs)
+def _tsm_split_forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+    """org_forward(x) + the expert delta as a separate tensor (the fused path's fallback: conv, RamTorch base weights,
+    delta dropout, dtype mixes the stock forward would not run either)."""
     base = self.org_forward(x, *args, **kwargs)
     ints = _TSM_SAMPLE_T.get(self.mask_group_id)
     if ints is not None and len(ints) > 1 and x.dim() >= 2 and x.shape[0] == len(ints) and len(set(ints)) > 1:
         # one expert (stage 1) / one timestep embedding (stage 2) per sample instead of one int per batch
-        delta = self.drop(_tsm_grouped_delta(self, x, ints, self.multiplier))
+        delta = _tsm_grouped_delta(self, x, ints, self.multiplier)
     else:
         # Stage 2 always takes the input path: rebuild mode feeds the router zeros (tsm.py:538-545), router_fc.weight
         # would never get a gradient. Stage 1 rebuild (tsm.py:604-608) is the same math without the dense delta weight.
         delta = _tsm_delta(self, x, self._get_timestep(), self.multiplier)
-        if self.bypass_mode or self.tsm_stage == 2:
-            delta = self.drop(delta)  # bypass dropout (tsm.py:588); the rebuild forward has none
+    if self.bypass_mode or self.tsm_stage == 2:
+        delta = self.drop(delta)  # bypass dropout (tsm.py:588); the stage-1 rebuild forward has none (any batch)
     return base + delta.to(base.dtype)
+
+
+# Fused TSM forward (2026-10-25): y = x W0^T + C, C = (x A^T) B^T + bias with A / B the concatenated active experts: the
+# base GEMM takes the expert delta as its C input and the input gradient comes back the same way (addmm), with a
+# hand-written backward. Against _tsm_split_forward that drops, per module call (forward, checkpoint recompute,
+# backward), the separate delta tensor, the base + delta add, the second input-gradient add and ~10 autograd nodes. GPU
+# A/B 2026-10-25 (RTX 5090, Anima 2.9B, @bjunbae 4-tier batch 1 x accumulation 8, dim 32, unsloth offload on, 16 steps):
+# fused 12.64 vs split 12.48 vs stock LyCORIS 17.61 s/step, peak 21.7 GiB for both fixed paths - the fused call was
+# speed-neutral there (the step is not bound by the TSM modules' launches); the ~30% over stock comes from the split path
+# already. It stays the default for its numerics: under bf16 autocast it is as close to fp64 as the split path in stage 1
+# and ~2x closer in stage 2 (router gradients). Same math; the output is rounded once instead of base and delta each
+# (fp64: identical to the split path). Stage 2: G_j B_j A_j x == (B_j G_j)(A_j x), so the gates (per-batch scalars)
+# scale the context columns of B; the router gets its gradient through that product. A mixed-timestep batch runs one
+# fused call per expert group over its rows (the plan of _tsm_group_plan).
+# Second round (2026-10-25, the GPU profile: a 1024 / 512 micro-step has a ~1.1 s host floor of which the 640 module
+# calls are ~0.5 s of Python, not launches): the factor path (_tsm_factor_linear, the default) builds A = cat(downs) and
+# B = cat(ups) * s (* gates) as autograd ops and hands them to _LowRankLinear (bf16 low-rank) / _TSMLinear (fp32
+# low-rank), runs the stage-2 router through autograd on top of a second core GEMM, and its backward slices B's gradient
+# into per-expert COLUMN blocks that AccumulateGrad clones. _TSMExpertLinear (below) takes the expert weights (and the
+# router) themselves: one autograd node per call, the concatenation / scale / router / gate fold / casts inside it, the
+# expert and router gradients returned contiguous in each parameter's layout. CPU, 32 modules in one checkpointed chain
+# (Anima checkpoints per Block), per module call-set (forward + checkpoint recompute + backward): aten ops under bf16
+# autocast (bf16 base, fp32 experts, m = 2) stage 1 43 -> 43 (fp32 low-rank 50 -> 44), stage 2 85 -> 58 (90 -> 60);
+# Python time (fp32, 1 thread, Linear 64 -> 64 rank 4) stage 1 0.219 -> 0.197 ms (0.239 -> 0.210), stage 2
+# 0.393 -> 0.294 ms (0.397 -> 0.294). On the GPU (the A/B setting above, cap 0.85) it held ~1.3 GiB more at the
+# 2048-tier peak, ran out of memory where the factor path did not, and the run that got through was slower (16.1 vs
+# 11.2 s/step), so the factor path stays the default and the Function is the opt-in tsm_expert_fn=True (_TSM_EXPERT_FN).
+# The fp64 op counts of the test cases: test_lycoris_algo_fixes.py, test_tsm_fused_forward_is_taken_and_dispatches_less.
+_TSM_FUSED = True  # network_args tsm_fused=False: _tsm_split_forward for every call
+# network_args tsm_lowrank_fp32: True = the function runs x A^T, mid B^T and the expert gradients g^T mid / gmid^T x in
+# fp32 with autocast off (the token reductions a bf16 GEMM rounds to 3 digits) and rounds the delta once into the bf16
+# base GEMM; False = everything in the autocast dtype (as _LowRankLinear does for the LoRA family). Default (not given):
+# stage 2 only - the user's choice 2026-10-25 after the GPU A/B: fp32 cost +11% step time and +3 GiB (torch 2.7.1 has no
+# bf16-in / fp32-out mm, so the token-sized tensors are copied to fp32) for a stage-1 gain AdamW mostly normalises away
+# (fp64 gradient error 0.86% -> 0.83% on the CPU toy), while stage 2 (router gates) went 4.2% -> 0.6% and has no
+# expert-gradient GEMMs to pay for. The base GEMM and the input gradient stay bf16 either way.
+_TSM_LOWRANK_FP32: Optional[bool] = None
+_TSM_ONES1: Dict[Tuple[torch.device, torch.dtype], torch.Tensor] = {}  # the core expert's gate (1) per device / dtype
+
+
+def _tsm_lowrank_fp32(self) -> bool:
+    return _TSM_LOWRANK_FP32 if _TSM_LOWRANK_FP32 is not None else int(getattr(self, "tsm_stage", 1)) == 2
+
+
+def _tsm_ones1(like: torch.Tensor) -> torch.Tensor:
+    key = (like.device, like.dtype)
+    one = _TSM_ONES1.get(key)
+    if one is None:  # once per device / dtype, not torch.tensor(...) from Python data per call (a blocking copy on CUDA)
+        one = _TSM_ONES1[key] = torch.ones(1, device=like.device, dtype=like.dtype)
+    return one
+
+
+class _NoCtx:
+    """A no-op context (contextlib.nullcontext without the import): the autocast-off block of _TSMExpertLinear is
+    entered only when autocast is on and would recast the fp32 low-rank GEMMs."""
+    __slots__ = ()
+
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *exc):
+        return False
+
+
+_NOCTX = _NoCtx()
+
+
+_TSM_COLIDX: Dict[Tuple[int, int, torch.device], torch.Tensor] = {}  # (m, r, device) -> [0]*r + [1]*r + .. (m r,)
+
+
+def _tsm_colidx(m: int, r: int, device) -> torch.Tensor:
+    """Column -> expert index of the concatenated B, built once per (m, r, device) (no tensor from Python data per call)."""
+    key = (m, r, device)
+    idx = _TSM_COLIDX.get(key)
+    if idx is None:
+        idx = _TSM_COLIDX[key] = torch.arange(m, device=device).repeat_interleave(r)
+    return idx
+
+
+class _TSMExpertLinear(torch.autograd.Function):
+    """x (t, in) -> x W0^T + C, C = (x A^T) B^T + bias, with A = [down_0; ..; down_{m-1}] (m r, in) and
+    B = [up_0 .. up_{m-1}] * s (* the router gate per context expert in stage 2) (out, m r) of the m active experts,
+    given as the expert weights themselves: concatenation, scale, router, gate fold and casts happen here, with no
+    autograd node each. ld: the dtype of the low-rank GEMMs (x A^T, mid B^T, g^T mid, gmid^T x) and of the saved x -
+    cdt itself (the bf16 variant: every value rounded where _LowRankLinear rounded it) or fp32 / fp64 (tsm_lowrank_fp32:
+    the token reductions in fp32 and the delta rounded once into the cdt base GEMM, as _TSMLinear does). s: a Python
+    float (scalar * scale * multiplier; k None) or the scalar Parameter / a buffer written in place (k = scale *
+    multiplier applied here; the Parameter gets its gradient). Stage 2 (rw given): the router of tsm.py:325-390 as
+    _tsm_compute_gates runs it - the tokens of the core bottleneck (the first r columns of mid; core=True) or of the
+    input pooled in fp32, gates = rw z + rb + ew[ti] (ti the clamped t - 1, a Python int), and the context columns of B
+    carry gate * s; rw / rb / ew get their gradients (ew's dense, one row set, as select's backward did). Saved: x in ld
+    (the fp32 LayerNorm output itself for most Anima modules with the fp32 variant), W0 in cdt, A, B, mid (small); the
+    unscaled B, the gate vector, z only when the scalar or the router need gradients. Backward: gb = g^T mid (out, m r)
+    once; the up gradients leave it as one contiguous (m, out, r) buffer (cast, scale and relayout in one kernel) unbound
+    into m tensors with the parameters' own strides - no column slices for AccumulateGrad to clone; the down gradients
+    are the contiguous row blocks of ga = gmid^T x; gx = (gmid A -> cdt) + g W0 as one addmm. GEMMs nobody needs are
+    skipped (stage 2: frozen experts -> no ga, gb only for the gate / scalar gradient; no input gradient -> no gmid)."""
+
+    @staticmethod
+    def forward(ctx, x, W0, bias, s, k, rw, rb, ew, ti, core, cdt, ld, *weights):
+        m = len(weights) // 2
+        downs, ups = weights[0::2], weights[1::2]
+        out, r = ups[0].shape
+        dev = x.device.type
+        # autocast would recast the ld GEMMs to its dtype: switched off only when that differs (the bf16 variant feeds
+        # it bf16 operands already; torch.autocast's enter/exit is ~1.7 us, x3 per call-set)
+        noac = ld != cdt and torch.is_autocast_enabled(dev)
+        with torch.autocast(dev, enabled=False) if noac else _NOCTX:
+            A = downs[0] if m == 1 else torch.cat(downs, 0)
+            Bf = ups[0] if m == 1 else torch.cat(ups, 1)  # (out, m r): column block j = up_j
+            sk = s if k is None else s * k
+            xl, Al = x.to(ld), A.to(ld)
+            xc = xl if ld == cdt else x.to(cdt)
+            W0c = W0.to(cdt)
+            mid = torch.mm(xl, Al.t())
+            gv = z = None
+            if rw is None:
+                Bs = Bf if k is None and sk == 1.0 else Bf * sk
+            else:
+                src = mid.narrow(1, 0, r) if core else x
+                z = src.mean(0, dtype=torch.float32).to(rw.dtype)  # fp32 pooling over the tokens (tsm.py:362)
+                gates = torch.addmv(rb, rw, z) + ew[ti]  # (m - 1,): FC(z) + the embedding row (tsm.py:380-389)
+                gv = torch.cat((_tsm_ones1(gates), gates))  # (m,): 1 for the core expert, the gate per context expert
+                Bs = Bf * (gv * sk)[_tsm_colidx(m, r, gates.device)]
+            Bl = Bs.to(ld)
+            Cl = torch.mm(mid, Bl.t()) if bias is None else torch.addmm(bias.to(ld), mid, Bl.t())
+            y = torch.addmm(Cl.to(cdt), xc, W0c.t())
+        need = ctx.needs_input_grad
+        keep = need[3] or need[5] or need[6] or need[7]  # scalar / router gradients: the unscaled B, gv, z
+        ctx.save_for_backward(xl, W0c, Al, Bl, mid, Bf if keep else None, gv if keep else None,
+                              sk if k is not None else None, z if keep else None, ew if need[7] else None)
+        ctx.meta = (m, r, x.dtype, downs[0].dtype, ups[0].dtype, cdt, sk if k is None else None, k, noac, ti)
+        return y
+
+    @staticmethod
+    def backward(ctx, g):
+        xl, W0c, Al, Bl, mid, Bf, gv, skt, z, ew = ctx.saved_tensors
+        m, r, xdt, adt, bdt, cdt, skf, k, noac, ti = ctx.meta
+        with torch.autocast(g.device.type, enabled=False) if noac else _NOCTX:
+            sk = skf if skt is None else skt
+            need = ctx.needs_input_grad
+            need_x, need_s, need_rw, need_rb, need_ew, need_w = need[0], need[3], need[5], need[6], need[7], need[12:]
+            need_g = need_rw or need_rb or need_ew
+            need_up, need_down = any(need_w[1::2]), any(need_w[0::2])
+            gl = g.to(xl.dtype)
+            gx = gs = grw = grb = gew = None
+            gw = [None] * (2 * m)
+            if need_up or need_s or need_g:
+                gb = torch.mm(gl.t(), mid).to(bdt)  # (out, m r): the gradient of the scaled, gated B
+                out = gb.shape[0]
+                if need_s or need_g:
+                    red = (gb.view(out, m, r) * Bf.view(out, m, r)).sum((0, 2))  # (m,) sum_j gb_j . up_j
+                    if need_g:
+                        gg = (red.narrow(0, 1, m - 1) * sk).to(z.dtype)  # the gates' gradient
+                        if need_rw:
+                            grw = torch.outer(gg, z)
+                        if need_rb:
+                            grb = gg
+                        if need_ew:
+                            gew = torch.select_scatter(torch.zeros_like(ew), gg, 0, ti)
+                    if need_s:
+                        gs = ((red.sum() if gv is None else torch.dot(red, gv.to(red.dtype))) * k).to(skt.dtype)
+                if need_up:
+                    buf = torch.empty((m, out, r), dtype=bdt, device=gb.device)  # each [j] has up_j's own strides
+                    torch.mul(gb.view(out, m, r).transpose(0, 1), sk if gv is None else (gv * sk).view(m, 1, 1), out=buf)
+                    for j, gu in enumerate(buf.unbind(0)):
+                        if need_w[2 * j + 1]:
+                            gw[2 * j + 1] = gu
+            if need_x or need_down:
+                gmid = torch.mm(gl, Bl)  # (t, m r) in ld
+                if need_down:
+                    ga = torch.mm(gmid.t(), xl).to(adt)  # (m r, in): row block j = down_j's gradient, contiguous
+                    for j, gd in enumerate(ga.view(m, r, -1).unbind(0)):
+                        if need_w[2 * j]:
+                            gw[2 * j] = gd
+                if need_x:
+                    gx = torch.addmm(torch.mm(gmid, Al).to(cdt), g.to(cdt), W0c).to(xdt)
+        return (gx, None, None, gs, None, grw, grb, gew, None, None, None, None, *gw)
+
+
+def _tsm_fused_plan(self, x: torch.Tensor) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor], torch.dtype]]:
+    """(W0, bias, compute dtype) when the fused forward applies to this call, else None (the split forward runs)."""
+    if not _TSM_FUSED or self.isconv or self.module_type != "linear" or not x.is_floating_point() or x.dim() < 2:
+        return None
+    if self.dropout and self.training and (self.bypass_mode or self.tsm_stage == 2):
+        return None  # self.drop applies to the delta alone there (the stage-1 rebuild forward has no dropout)
+    if self.__dict__.get("is_ramtorch_org", False):  # RamTorch streams the base weight in its own forward / backward
+        return None
+    org = self.org_module[0]
+    w, b = org.weight, org.bias  # not RamTorch here: no get_org_weight_for_compute transfer
+    if w is None or w.requires_grad or (b is not None and b.requires_grad):
+        return None
+    if w.dtype not in _FLOATS or (b is not None and b.dtype not in _FLOATS):
+        return None  # --fp8_base: the stock org_forward casts it
+    lowp = _lowp_autocast(x.device.type)
+    if lowp is None and (w.dtype != x.dtype or (b is not None and b.dtype != x.dtype)):
+        return None  # outside autocast the split path computes the base in the module dtype and the delta in x's
+    ok = self.__dict__.get("_tsm_one_rank")
+    if ok is None:  # _TSMExpertLinear views B as (out, m, r): one rank for every expert (tsm.py:258-260 always)
+        ok = self._tsm_one_rank = len({ex["down"].weight.shape[0] for sc in self.experts for ex in sc}) == 1
+    return (w, b, x.dtype if lowp is None else lowp) if ok else None
+
+
+def _tsm_fused_ok(self, x: torch.Tensor) -> bool:
+    return _tsm_fused_plan(self, x) is not None
+
+
+def _tsm_scale(self) -> Tuple[Any, Optional[float]]:
+    """(s, k) for the fused forward (_tsm_factor_linear and _TSMExpertLinear). The non-trainable scalar buffer (torch.tensor(1.0), tsm.py:244; apply_max_norm
+    tsm.py:807 and load_weight_hook :784-787 write it in place) goes in as one Python float scale * multiplier * value,
+    read as 1.0 while untouched and re-read with float() only when its storage or version counter changes (an in-place
+    write, a module.to() copy after one) - no host sync and no 0-d tensor op per call. The scalar Parameter (use_scalar=True) goes in as the tensor with
+    k = scale * multiplier applied inside the function, whether or not it currently requires grad."""
+    sc = self.scalar
+    k = float(self.scale) * self.multiplier
+    if isinstance(sc, nn.Parameter):  # use_scalar: trained (or frozen) value, never assumed to be 1.0
+        return sc, k
+    key = (sc.data_ptr(), sc._version)
+    cached = self.__dict__.get("_tsm_scalar_cache")
+    if cached is None or cached[0] != key:
+        # The buffer starts as torch.tensor(1.0) (tsm.py:244) and is not in the state dict: no host sync while it is
+        # untouched. load_weight_hook (tsm.py:784-787, run by every load_state_dict: --network_weights / --resume) resets
+        # it to 1.0 in place and apply_max_norm (tsm.py:807) scales it - both bump the version - and a module.to() copy
+        # afterwards changes the storage: each makes the first call re-read the value once with float(). (A write
+        # followed by a copy before the first call would still look untouched; the trainers never move the network
+        # after training starts.)
+        value = 1.0 if (cached is None and sc._version == 0) else float(sc)
+        cached = self.__dict__["_tsm_scalar_cache"] = (key, value)
+    return k * cached[1], None
+
+
+def _tsm_active_weights(self, t) -> List[torch.Tensor]:
+    """down_0, up_0, .., down_{m-1}, up_{m-1} of the experts active at t, read through the module dicts (each
+    nn.Module.__getattr__ / ModuleList.__getitem__ is ~1 us; 12 of them per call on 640 modules)."""
+    scales = self.experts._modules
+    ws = []
+    for si, e in enumerate(_tsm_experts(self, t)):
+        ex = scales[str(si)]._modules[str(e)]._modules
+        ws.append(ex["down"]._parameters["weight"])
+        ws.append(ex["up"]._parameters["weight"])
+    return ws
+
+
+# network_args tsm_expert_fn=True: _TSMExpertLinear (above) for every call. Default False (GPU A/B 2026-10-25 16:4x, Anima
+# 2.9B 4-tier batch 1 x accumulation 8, 16 steps, cap 0.85): the Function held ~1.3 GiB more at the 2048-tier peak
+# (max_allocated 25.5 vs 24.3 GiB), ran out of memory at the cap where the factor path did not, and the one run that
+# got past step 8 was slower (16.1 vs 11.2 s/step) - the CPU gain of the hand-written path (-10% Python per call) did not
+# reach the GPU step. Kept as an opt-in for a later look (where the extra tensor comes from is not found yet).
+_TSM_EXPERT_FN = False
+
+
+class _TSMLinear(torch.autograd.Function):
+    """x (t, in) -> x W0^T + C, C = (x A^T) B^T + bias with the low-rank part in ld (fp32, or fp64 for fp64 experts) and
+    the frozen base GEMM in cdt (the autocast dtype): the fp32 low-rank variant of the factor path (A, B built outside as
+    autograd ops), used when tsm_lowrank_fp32 applies. Saved: x in ld (the fp32 LayerNorm output itself for most Anima
+    modules), W0 in cdt, A, B, mid (small). Backward: gb = g^T mid and ga = gmid^T x in ld (fp32 reductions over the
+    tokens), gx = (gmid A -> cdt) + g W0 as one addmm."""
+
+    @staticmethod
+    def forward(ctx, x, W0, bias, A, B, cdt, ld):
+        with torch.autocast(x.device.type, enabled=False):
+            xl, Al, Bl = x.to(ld), A.to(ld), B.to(ld)
+            W0c = W0.to(cdt)
+            mid = torch.mm(xl, Al.t())
+            Cl = torch.mm(mid, Bl.t()) if bias is None else torch.addmm(bias.to(ld), mid, Bl.t())
+            y = torch.addmm(Cl.to(cdt), x.to(cdt), W0c.t())
+        ctx.save_for_backward(xl, W0c, Al, Bl, mid)
+        ctx.dtypes = (x.dtype, A.dtype, B.dtype, cdt)
+        return y
+
+    @staticmethod
+    def backward(ctx, g):
+        with torch.autocast(g.device.type, enabled=False):
+            xl, W0c, Al, Bl, mid = ctx.saved_tensors
+            xdt, adt, bdt, cdt = ctx.dtypes
+            need_x, _, _, need_a, need_b, _, _ = ctx.needs_input_grad
+            gl = g.to(xl.dtype)
+            gx = ga = gb = None
+            if need_b:
+                gb = torch.mm(gl.t(), mid).to(bdt)
+            if need_x or need_a:
+                gmid = torch.mm(gl, Bl)  # (t, r) in ld
+                if need_a:
+                    ga = torch.mm(gmid.t(), xl).to(adt)
+                if need_x:
+                    gx = torch.addmm(torch.mm(gmid, Al).to(cdt), g.to(cdt), W0c).to(xdt)
+        return gx, None, None, ga, gb, None, None
+
+
+def _tsm_factor_linear(self, x2: torch.Tensor, t, W0, bias, s, k, cdt: torch.dtype, ld: torch.dtype,
+                       weights: List[torch.Tensor]) -> torch.Tensor:
+    """The factor path (the default): A = cat(downs), B = cat(ups) * scalar * scale * multiplier (* the router gates on
+    the context columns in stage 2) as autograd ops, then _LowRankLinear (ld == cdt) or _TSMLinear (fp32 low-rank).
+    Stage 2: G_j B_j A_j x == (B_j G_j)(A_j x), per-batch scalars, so a column scale of B; the router gets its gradient
+    through that product. x2 (tokens, in) is the router input of this expert group."""
+    A = torch.cat(weights[0::2], 0)
+    B = torch.cat(weights[1::2], 1) * (s * k if k is not None else s)
+    if self.tsm_stage == 2:
+        bottleneck = None
+        if self.tsm_router_input == "bottleneck":
+            with torch.no_grad():  # the core bottleneck the router pools (detached in _tsm_compute_gates anyway)
+                bottleneck = F.linear(x2.to(cdt), weights[0].to(cdt))
+        gates = self._compute_gates(bottleneck, x2, t)  # (num_context,), fp32
+        ranks = [w.shape[0] for w in weights[0::2]]
+        g = torch.cat([gates.new_ones(ranks[0])] + [gates[j].expand(r) for j, r in enumerate(ranks[1:])])
+        B = B * g.to(B.dtype)
+    if ld == cdt:
+        return _LowRankLinear.apply(x2, W0, bias, A, B, None, cdt, 1, False)
+    return _TSMLinear.apply(x2, W0, bias, A, B, cdt, ld)
+
+
+def _tsm_fused_linear(self, x2: torch.Tensor, t, W0, bias, s, k, cdt: torch.dtype) -> torch.Tensor:
+    """One fused call for the rows x2 (tokens, in) of one expert group at timestep t."""
+    weights = _tsm_active_weights(self, t)
+    ld = torch.promote_types(weights[0].dtype, torch.float32) if _tsm_lowrank_fp32(self) else cdt
+    if not _TSM_EXPERT_FN:
+        return _tsm_factor_linear(self, x2, t, W0, bias, s, k, cdt, ld, weights)
+    if self.tsm_stage != 2:
+        return _TSMExpertLinear.apply(x2, W0, bias, s, k, None, None, None, 0, False, cdt, ld, *weights)
+    mods = self._modules  # router_fc / timestep_embed through the dicts (as _tsm_active_weights)
+    rf = mods["router_fc"]._parameters
+    ti = min(max(int(t) - 1, 0), self.tsm_num_timesteps - 1)  # the embedding row tsm.py:384 picks
+    ew = mods["timestep_embed"]._parameters["weight"]
+    return _TSMExpertLinear.apply(x2, W0, bias, s, k, rf["weight"], rf["bias"], ew, ti,
+                                  self.tsm_router_input == "bottleneck", cdt, ld, *weights)
+
+
+def _tsm_forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+    if self.module_dropout and self.training:
+        if torch.rand(1) < self.module_dropout:
+            return self.org_forward(x, *args, **kwargs)
+    plan = _tsm_fused_plan(self, x)
+    if plan is None:
+        return _tsm_split_forward(self, x, *args, **kwargs)
+    W0, bias, cdt = plan
+    s, k = _tsm_scale(self)
+    shape = x.shape
+    ints = _TSM_SAMPLE_T.get(self.mask_group_id)
+    if ints is not None and len(ints) > 1 and shape[0] == len(ints) and len(set(ints)) > 1:
+        entries, inverse = _tsm_group_plan(self, ints, x.device)
+        parts = []
+        for t, rows in entries:
+            xg = x.narrow(0, rows[0], rows[1]) if isinstance(rows, tuple) else x.index_select(0, rows)
+            yg = _tsm_fused_linear(self, xg.reshape(-1, shape[-1]), t, W0, bias, s, k, cdt)
+            parts.append(yg.view(*xg.shape[:-1], yg.shape[-1]))
+        y = parts[0] if len(parts) == 1 else torch.cat(parts, 0)
+        return y if inverse is None else y.index_select(0, inverse)
+    y = _tsm_fused_linear(self, x.reshape(-1, shape[-1]), self._get_timestep(), W0, bias, s, k, cdt)
+    return y.view(*shape[:-1], y.shape[-1])
 
 
 # ======================================================================================================================
@@ -2834,7 +3185,10 @@ def apply_module_patches() -> None:
     add(TLoraModule, "bypass_forward_diff", _tlora_bypass_forward_diff, "lambda in the input dtype (tlora.py:636-637)")
 
     add(TSMModule, "forward", _tsm_forward,
-        "per-sample experts; stage 2 routes through the real input (tsm.py:538-545); one fused down/up matmul pair")
+        "per-sample experts; stage 2 routes through the real input (tsm.py:538-545); base GEMM with the concatenated"
+        " active experts' delta as its C input and a hand-written backward on the concatenated factors (_LowRankLinear,"
+        " or _TSMLinear for the fp32 low-rank part; tsm_expert_fn=True: the experimental _TSMExpertLinear;"
+        " tsm_fused=False: org_forward + separate delta)")
     add(TSMModule, "_compute_gates", _tsm_compute_gates, "gate pooling over all leading axes (tsm.py:362-371), no sync")
 
     add(LoConModule, "forward", _locon_forward,
@@ -2965,6 +3319,23 @@ def prepare_network_kwargs(algo: str, net_kwargs: dict, logger=logger) -> dict:
         logger.warning(
             "tsm: Forge has no TSM adapter; files are saved in LyCORIS' native TSM format"
         )
+        global _TSM_FUSED, _TSM_LOWRANK_FP32
+        fused = kw.pop("tsm_fused", None)  # not a TSMModule argument
+        _TSM_FUSED = True if fused in (None, "") else _str_bool(fused)
+        if not _TSM_FUSED:
+            logger.warning("tsm: tsm_fused=False - org_forward + a separate expert delta per call (the slower split path)")
+        global _TSM_EXPERT_FN
+        efn = kw.pop("tsm_expert_fn", None)  # not a TSMModule argument
+        _TSM_EXPERT_FN = False if efn in (None, "") else _str_bool(efn)
+        if _TSM_EXPERT_FN:
+            logger.warning("tsm: tsm_expert_fn=True - experimental _TSMExpertLinear (GPU A/B 10-25: +1.3 GiB at the peak,"
+                           " not faster); the default is the factor path")
+        lr32 = kw.pop("tsm_lowrank_fp32", None)  # not a TSMModule argument
+        _TSM_LOWRANK_FP32 = None if lr32 in (None, "") else _str_bool(lr32)
+        if _TSM_FUSED:
+            logger.info("tsm: expert projections / gradients in fp32 (autocast off): "
+                        + {None: "stage 2 only (default)", True: "on (tsm_lowrank_fp32=True, ~+11% step time)",
+                           False: "off (tsm_lowrank_fp32=False)"}[_TSM_LOWRANK_FP32])
         if int(float(kw.get("tsm_stage", 1) or 1)) == 2:
             logger.info("tsm stage 2: start from the stage-1 file with --network_weights (not --resume)")
             gate = float(kw.get("tsm_gate_init", 0.0) or 0.0)

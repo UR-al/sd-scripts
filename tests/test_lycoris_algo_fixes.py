@@ -1066,6 +1066,17 @@ def _assert_same(a, b, rtol=1e-9, atol=1e-12):
             assert torch.allclose(a[k], b[k], rtol=rtol, atol=atol), (k, (a[k] - b[k]).abs().max())
 
 
+def _tsm_mixed(stage, router="input"):
+    """fp64 experts / router / scalar Parameter over an fp32 base Linear, for an fp32 input without autocast: the fused
+    plan's cdt is the input dtype (fp32) and ld = promote(fp64, fp32) = fp64 != cdt, so tsm_lowrank_fp32=True really
+    changes the path (_TSMLinear, or the fp32-mode branch of _TSMExpertLinear) - in an all-fp64 module ld == cdt and
+    both modes take _LowRankLinear. The base GEMM and the input gradient are fp32 on every path, so comparisons are at
+    fp32 level."""
+    m = _tsm_module(stage, router=router, use_scalar=True)
+    m.org_module[0].to(torch.float32)
+    return m
+
+
 @pytest.mark.parametrize("bypass", [False, True])
 @pytest.mark.parametrize("scales", [(8, 1), (4, 2, 1)])
 @pytest.mark.parametrize("t", [1.0, 125.0, 126.0, 999.0, 1000.0])
@@ -1192,6 +1203,497 @@ def test_tsm_expert_cache_and_no_host_sync():
                     torch.utils.checkpoint.checkpoint(m, x, use_reentrant=False).sum().backward()
                 assert len(w.hits) <= (first_ok if k == 0 else 0), (stage, ts, k, w.hits)
             laf.clear_timestep(net)
+
+
+@pytest.mark.parametrize("stage", [1, 2])
+@pytest.mark.parametrize("lowrank_fp32", [False, True])
+def test_tsm_factor_path_is_the_default_and_matches_the_expert_function(monkeypatch, stage, lowrank_fp32):
+    """The default (tsm_expert_fn not given) is the factor path: A/B as autograd ops, then _LowRankLinear (low-rank part
+    in the compute dtype) or _TSMLinear (fp32 low-rank); network_args tsm_expert_fn=True switches to _TSMExpertLinear.
+    Same values and gradients (mixed-timestep batch, use_scalar Parameter, both stages). tsm_lowrank_fp32 goes through
+    network_args (prepare_network_kwargs resets the global): False = all fp64, exact; True = _tsm_mixed (fp64 experts
+    over an fp32 base and input: ld = fp64 != cdt = fp32, so the call lands in _TSMLinear, counted), fp32-level
+    agreement."""
+    monkeypatch.setattr(laf, "_TSM_FUSED", True)
+    monkeypatch.setattr(laf, "_TSM_EXPERT_FN", False)
+    monkeypatch.setattr(laf, "_TSM_LOWRANK_FP32", None)  # set through network_args below; restored after the test
+    xdt = torch.float32 if lowrank_fp32 else torch.float64
+    x = torch.randn(2, 1, 3, 4, 24, generator=torch.Generator().manual_seed(6), dtype=xdt)
+    make = (lambda: _tsm_mixed(stage)) if lowrank_fp32 else (lambda: _tsm_module(stage, use_scalar=True))
+    tol = dict(rtol=1e-5, atol=1e-6) if lowrank_fp32 else {}
+    calls = {"lr": [], "tl": [], "efn": []}
+    for name, cls in (("lr", laf._LowRankLinear), ("tl", laf._TSMLinear), ("efn", laf._TSMExpertLinear)):
+        orig = cls.apply
+        monkeypatch.setattr(cls, "apply", (lambda n, o: lambda *a: calls[n].append(1) or o(*a))(name, orig))
+    kw = laf.prepare_network_kwargs("tsm", {"algo": "tsm", "tsm_lowrank_fp32": str(lowrank_fp32)}, LOG)
+    assert laf._TSM_EXPERT_FN is False and laf._TSM_LOWRANK_FP32 is lowrank_fp32
+    factor = _tsm_run(make(), x, [100.0, 900.0], checkpoint=True)
+    assert not calls["efn"]
+    assert len(calls["tl" if lowrank_fp32 else "lr"]) == 4 and not calls["lr" if lowrank_fp32 else "tl"]  # 2 groups x 2
+    kw = laf.prepare_network_kwargs("tsm", {"algo": "tsm", "tsm_expert_fn": "True",
+                                            "tsm_lowrank_fp32": str(lowrank_fp32)}, LOG)
+    assert "tsm_expert_fn" not in kw and laf._TSM_EXPERT_FN is True and laf._TSM_LOWRANK_FP32 is lowrank_fp32
+    for v in calls.values():
+        v.clear()
+    fn = _tsm_run(make(), x, [100.0, 900.0], checkpoint=True)
+    assert len(calls["efn"]) == 4 and not calls["lr"] and not calls["tl"]
+    _assert_same(factor, fn, **tol)
+
+
+def test_tsm_scalar_buffer_written_in_place_then_copied_is_read(monkeypatch):
+    """_tsm_scale: the non-trainable scalar buffer is assumed 1.0 only while untouched; after an in-place write
+    (apply_max_norm) and after a module.to() copy that follows it, the fused path reads the new value (== split path),
+    with one float() (aten _local_scalar_dense, counted over the fused forward + recompute + backward) per change and
+    none per call. A scalar Parameter always goes in as a tensor, frozen or not, with no float() at all."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class Syncs(TorchDispatchMode):
+        def __init__(self):
+            super().__init__()
+            self.n = 0
+
+        def __torch_dispatch__(self, func, types_, args=(), kwargs=None):
+            if func.overloadpacket.__name__ == "_local_scalar_dense":
+                self.n += 1
+            return func(*args, **(kwargs or {}))
+
+    x = torch.randn(1, 1, 3, 4, 24, generator=torch.Generator().manual_seed(4), dtype=torch.float64)
+    monkeypatch.setattr(laf, "_TSM_FUSED", True)
+
+    def both(m, syncs):
+        """fused == split; the fused run reads the scalar with float() exactly `syncs` times."""
+        s = Syncs()
+        with s:
+            fused = _tsm_run(m, x, [250.0], checkpoint=True)
+        assert s.n == syncs, (s.n, syncs)
+        monkeypatch.setattr(laf, "_TSM_FUSED", False)
+        split = _tsm_run(m, x, [250.0], checkpoint=True)
+        monkeypatch.setattr(laf, "_TSM_FUSED", True)
+        _assert_same(fused, split)
+        return fused
+
+    m = _tsm_module(1)
+    out1 = both(m, 0)["out"]  # untouched: 1.0 without a read
+    both(m, 0)
+    with torch.no_grad():
+        m.scalar.fill_(0.5)  # apply_max_norm style in-place write
+    out2 = both(m, 1)["out"]  # one float() for the new value, shared by forward and checkpoint recompute
+    both(m, 0)
+    assert not torch.allclose(out1, out2)
+    m.to(torch.float64)  # a copy of the written buffer: storage changes, version back to 0
+    m.scalar.data = m.scalar.data.clone()  # force a new storage even where .to() is a no-op
+    out3 = both(m, 1)["out"]
+    both(m, 0)
+    assert torch.allclose(out2, out3, rtol=1e-12, atol=1e-12)
+    p = _tsm_module(1, use_scalar=True)
+    p.scalar.requires_grad_(False)  # a frozen scalar Parameter keeps its value
+    assert isinstance(laf._tsm_scale(p)[0], torch.Tensor)
+    both(p, 0)
+
+
+def _count_ops(fn) -> int:
+    """aten ops dispatched while fn() runs (a proxy for kernel launches)."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class Count(TorchDispatchMode):
+        def __init__(self):
+            super().__init__()
+            self.n = 0
+
+        def __torch_dispatch__(self, func, types_, args=(), kwargs=None):
+            self.n += 1
+            return func(*args, **(kwargs or {}))
+
+    c = Count()
+    with c:
+        fn()
+    return c.n
+
+
+# For the record (CPU, torch 2.7.1, 2026-10-25): aten ops over forward + checkpoint recompute + backward of _tsm_run for
+# the fp64 cases of the test below - the factor path (the default) 239 / 302 / 310 (stage 1) and 273 / 368 / 376
+# (stage 2), _TSMExpertLinear 233 / 292 / 300 and 258 / 328 / 336. The test compares counts measured in the same process
+# (torch versions split ops differently), not against these numbers.
+
+
+@pytest.mark.parametrize("stage", [1, 2])
+@pytest.mark.parametrize("ts", [[300.0], [100.0, 900.0], [900.0, 100.0, 900.0]])
+def test_tsm_fused_forward_is_taken_and_dispatches_less(monkeypatch, stage, ts):
+    """The fused forward runs one fused call per expert group (not org_forward + delta; a mixed-timestep batch: one call
+    per group of _tsm_group_plan) - the factor path by default, _TSMExpertLinear with tsm_expert_fn=True - and each
+    dispatches fewer aten ops over forward + checkpoint recompute + backward than the split forward it replaces (the
+    Function fewer still on the CPU count; the GPU step did not follow, see _TSM_EXPERT_FN); all three give the same
+    result (fp64). _TSM_FUSED=False (network_args tsm_fused=False) takes the split forward for every call."""
+    x = torch.randn(len(ts), 1, 3, 4, 24, generator=torch.Generator().manual_seed(2), dtype=torch.float64)
+    fused_calls, split_calls, factor_calls, fn_calls = [], [], [], []
+    orig_fused, orig_split = laf._tsm_fused_linear, laf._tsm_split_forward
+    orig_factor, orig_fn = laf._tsm_factor_linear, laf._TSMExpertLinear.apply
+    monkeypatch.setattr(laf, "_tsm_fused_linear", lambda *a: fused_calls.append(1) or orig_fused(*a))
+    monkeypatch.setattr(laf, "_tsm_split_forward", lambda *a, **k: split_calls.append(1) or orig_split(*a, **k))
+    monkeypatch.setattr(laf, "_tsm_factor_linear", lambda *a: factor_calls.append(1) or orig_factor(*a))
+    monkeypatch.setattr(laf._TSMExpertLinear, "apply", lambda *a: fn_calls.append(1) or orig_fn(*a))
+    monkeypatch.setattr(laf, "_TSM_FUSED", True)
+    monkeypatch.setattr(laf, "_TSM_EXPERT_FN", False)
+    groups = len({tuple(laf._tsm_experts(_tsm_module(stage), int(t))) if stage == 1 else t for t in ts})
+    got = _tsm_run(_tsm_module(stage), x, ts, checkpoint=True)
+    assert len(fused_calls) == len(factor_calls) == 2 * groups  # forward + checkpoint recompute
+    assert not split_calls and not fn_calls
+    n_factor = _count_ops(lambda: _tsm_run(_tsm_module(stage), x, ts, checkpoint=True))
+
+    monkeypatch.setattr(laf, "_TSM_EXPERT_FN", True)
+    fused_calls.clear()
+    factor_calls.clear()
+    got_fn = _tsm_run(_tsm_module(stage), x, ts, checkpoint=True)
+    assert len(fused_calls) == len(fn_calls) == 2 * groups and not split_calls and not factor_calls
+    n_fn = _count_ops(lambda: _tsm_run(_tsm_module(stage), x, ts, checkpoint=True))
+
+    monkeypatch.setattr(laf, "_TSM_FUSED", False)
+    fused_calls.clear()
+    fn_calls.clear()
+    ref = _tsm_run(_tsm_module(stage), x, ts, checkpoint=True)
+    assert split_calls and not fused_calls and not fn_calls and not factor_calls
+    n_split = _count_ops(lambda: _tsm_run(_tsm_module(stage), x, ts, checkpoint=True))
+    _assert_same(got, ref)
+    _assert_same(got_fn, ref)
+    assert n_factor < n_split, (n_factor, n_split)
+    assert n_fn < n_factor, (n_fn, n_factor)
+
+
+def test_tsm_fused_network_arg_and_fallbacks(monkeypatch):
+    """network_args tsm_fused=False is popped before TSMModule sees it and switches the flag; the fused path steps aside
+    for conv modules, delta dropout while training, RamTorch base weights and a dtype mix outside autocast (all keep
+    the split forward == stock)."""
+    from lycoris.modules.tsm import TSMModule
+
+    monkeypatch.setattr(laf, "_TSM_FUSED", True)
+    kw = laf.prepare_network_kwargs("tsm", {"algo": "tsm", "tsm_fused": "False", "tsm_n_scales": "4,1"}, LOG)
+    assert "tsm_fused" not in kw and laf._TSM_FUSED is False
+    kw = laf.prepare_network_kwargs("tsm", {"algo": "tsm", "tsm_n_scales": "4,1"}, LOG)
+    assert laf._TSM_FUSED is True
+    kw = laf.prepare_network_kwargs("tsm", {"algo": "tsm", "tsm_fused": "1"}, LOG)
+    assert laf._TSM_FUSED is True
+    kw = laf.prepare_network_kwargs("tsm", {"algo": "tsm", "tsm_fused": ""}, LOG)  # an empty value = not given
+    assert "tsm_fused" not in kw and laf._TSM_FUSED is True
+    monkeypatch.setattr(laf, "_TSM_LOWRANK_FP32", True)
+    kw = laf.prepare_network_kwargs("tsm", {"algo": "tsm", "tsm_lowrank_fp32": "False"}, LOG)
+    assert "tsm_lowrank_fp32" not in kw and laf._TSM_LOWRANK_FP32 is False
+    assert not laf._tsm_lowrank_fp32(_tsm_module(1)) and not laf._tsm_lowrank_fp32(_tsm_module(2))
+    kw = laf.prepare_network_kwargs("tsm", {"algo": "tsm"}, LOG)  # not given: fp32 low-rank part in stage 2 only
+    assert laf._TSM_LOWRANK_FP32 is None
+    assert not laf._tsm_lowrank_fp32(_tsm_module(1)) and laf._tsm_lowrank_fp32(_tsm_module(2))
+    kw = laf.prepare_network_kwargs("tsm", {"algo": "tsm", "tsm_lowrank_fp32": "True"}, LOG)
+    assert laf._TSM_LOWRANK_FP32 is True and laf._tsm_lowrank_fp32(_tsm_module(1))
+
+    m = _tsm_module(1)
+    x = torch.randn(2, 6, 24, dtype=torch.float64)
+    assert laf._tsm_fused_ok(m, x)
+    assert not laf._tsm_fused_ok(m, x.float())  # module fp64, input fp32, no autocast: the split path's dtype mix
+    m.dropout = 0.1
+    assert laf._tsm_fused_ok(m, x)  # stage-1 rebuild: no delta dropout anywhere, the fused path stays
+    for md in (_tsm_module(2), _tsm_module(1, bypass=True)):
+        md.dropout = 0.1
+        assert not laf._tsm_fused_ok(md, x)  # self.drop(delta) in training
+        md.eval()
+        assert laf._tsm_fused_ok(md, x)
+    m.dropout = 0.0
+    m.is_ramtorch_org = True
+    assert not laf._tsm_fused_ok(m, x)
+    m.is_ramtorch_org = False
+    m.org_module[0].weight.requires_grad_(True)
+    assert not laf._tsm_fused_ok(m, x)
+    m.org_module[0].weight.requires_grad_(False)
+    assert laf._tsm_fused_ok(m, x)
+
+    torch.manual_seed(0)
+    conv = nn.Conv2d(6, 8, 3, padding=1).to(torch.float64)
+    conv.requires_grad_(False)
+    mc = TSMModule("c", conv, multiplier=0.7, lora_dim=4, alpha=2, tsm_n_scales=[4, 1], tsm_stage=1)
+    with torch.no_grad():
+        for p in mc.parameters():
+            p.copy_(torch.randn(p.shape, generator=torch.Generator().manual_seed(5)) * 0.2)
+    mc.to(torch.float64)
+    xi = torch.randn(2, 6, 5, 5, dtype=torch.float64)
+    assert not laf._tsm_fused_ok(mc, xi)
+    got = _tsm_run(mc, xi, [400.0], checkpoint=True)
+
+    def stock():
+        from lycoris.modules.tsm import clear_tsm_timestep, set_tsm_timestep
+
+        torch.manual_seed(0)
+        conv2 = nn.Conv2d(6, 8, 3, padding=1).to(torch.float64)
+        conv2.requires_grad_(False)
+        ms = TSMModule("c", conv2, multiplier=0.7, lora_dim=4, alpha=2, tsm_n_scales=[4, 1], tsm_stage=1)
+        with torch.no_grad():
+            for p in ms.parameters():
+                p.copy_(torch.randn(p.shape, generator=torch.Generator().manual_seed(5)) * 0.2)
+        ms.to(torch.float64)
+        set_tsm_timestep(400)
+        try:
+            xs = xi.clone().requires_grad_(True)
+            out = ms(xs)
+            (out * torch.randn(out.shape, generator=torch.Generator().manual_seed(3), dtype=out.dtype)).sum().backward()
+        finally:
+            clear_tsm_timestep()
+        res = {"out": out.detach(), "x": xs.grad}
+        res.update({n: (None if p.grad is None else p.grad.clone()) for n, p in ms.named_parameters()})
+        return res
+
+    _assert_same(got, _with_stock(stock))
+
+
+@pytest.mark.parametrize("expert_fn", [False, True])
+@pytest.mark.parametrize("stage", [1, 2])
+def test_tsm_fused_bf16_autocast_no_worse_than_split(monkeypatch, stage, expert_fn):
+    """Under bf16 autocast (fp32 experts, bf16 base, Anima-like >3-D input) the fused forward is as close to the fp64
+    result as the split forward - loss error within 1e-4 absolute, gradient error within 1.1x - with absolute ceilings
+    on the gradient error (the output is rounded once instead of base and delta each; the two paths round at different
+    places, so they are not compared with each other). The exact checks are the fp64 tests above; this one also makes
+    sure the bf16 paths really run (tsm_fused / tsm_expert_fn / tsm_lowrank_fp32 through network_args; the low-rank
+    Function each call lands in, with its dtypes): the factor path (_LowRankLinear for the bf16 low-rank part,
+    _TSMLinear for fp32) and _TSMExpertLinear."""
+    monkeypatch.setattr(laf, "_TSM_FUSED", True)  # prepare_network_kwargs sets all three below; restored after the test
+    monkeypatch.setattr(laf, "_TSM_LOWRANK_FP32", True)
+    monkeypatch.setattr(laf, "_TSM_EXPERT_FN", expert_fn)
+    calls = []
+    orig = laf._tsm_fused_linear
+    monkeypatch.setattr(laf, "_tsm_fused_linear", lambda *a: calls.append(1) or orig(*a))
+    fn_calls = []  # (Function, ld, cdt) of every low-rank Function call
+    for name, cls, pick in (("lr", laf._LowRankLinear, lambda a: (a[6], a[6])),  # x, W0, bias, A, B, None, cdt, ..
+                            ("tl", laf._TSMLinear, lambda a: (a[6], a[5])),  # x, W0, bias, A, B, cdt, ld
+                            ("efn", laf._TSMExpertLinear, lambda a: (a[11], a[10]))):  # .., cdt, ld, *weights
+        monkeypatch.setattr(cls, "apply",
+                            (lambda n, o, p: lambda *a: fn_calls.append((n, *p(a))) or o(*a))(name, cls.apply, pick))
+
+    def run(fused, dtype, lowrank_fp32=True):
+        calls.clear()
+        fn_calls.clear()
+        model = make_model(dtype=dtype)
+        net = make_net(model, "tsm", 4, 4, tsm_n_scales="4,1", tsm_stage=stage, tsm_fused=fused,
+                       tsm_lowrank_fp32=lowrank_fp32, tsm_expert_fn=expert_fn)
+        assert laf._TSM_FUSED is fused and laf._TSM_LOWRANK_FP32 is lowrank_fp32 and laf._TSM_EXPERT_FN is expert_fn
+        with torch.no_grad():
+            for m in net.unet_loras:
+                for n, p in m.named_parameters():
+                    if stage == 2 and ("router" in n or "timestep_embed" in n or "experts" in n):
+                        p.copy_(torch.randn(p.shape, generator=torch.Generator().manual_seed(9)) * 0.2)
+        if dtype == torch.float64:
+            net.to(torch.float64)
+        b = make_batch(1)
+        laf.set_timestep(net, torch.tensor([300.0, 800.0]))
+        if dtype == torch.float64:  # the reference: no autocast, everything fp64
+            with torch.autocast("cpu", enabled=False):
+                h, _ = model(b["x"].double(), b["c"].double(), None, checkpoint=True)
+            loss = F.mse_loss(h, b["y"].double())
+        else:
+            loss = loss_fn(model, b, checkpoint=True)
+        loss.backward()
+        laf.clear_timestep(net)
+        assert bool(calls) is fused and bool(fn_calls) is fused
+        if fused:  # fp64 without autocast: ld == cdt, so the factor path takes _LowRankLinear in both low-rank modes
+            want = "efn" if expert_fn else ("tl" if lowrank_fp32 and dtype != torch.float64 else "lr")
+            assert {n for n, _, _ in fn_calls} == {want}, fn_calls[:3]
+        if fused and lowrank_fp32:  # the fp32 low-rank variant: ld = promote(expert dtype, fp32), not the bf16 cdt
+            assert all(ld in (torch.float32, torch.float64) for _, ld, _ in fn_calls), fn_calls[:3]
+            assert dtype == torch.float64 or any(cdt == torch.bfloat16 and ld == torch.float32 for _, ld, cdt in fn_calls)
+        elif fused:  # the bf16 variant: every low-rank GEMM in the compute dtype itself
+            assert all(ld == cdt for _, ld, cdt in fn_calls) and any(cdt == torch.bfloat16 for _, _, cdt in fn_calls)
+        g = torch.cat([p.grad.reshape(-1).double() for m in net.unet_loras for _, p in sorted(m.named_parameters())
+                       if p.grad is not None])
+        return float(loss), g
+
+    lr, gr = run(True, torch.float64)
+    lf, gf = run(True, torch.bfloat16)  # fused, low-rank part in fp32 (tsm_lowrank_fp32=True forced; default: stage 2 only)
+    lb, gb = run(True, torch.bfloat16, lowrank_fp32=False)  # fused, low-rank part in bf16 (_LowRankLinear)
+    ls, gs = run(False, torch.bfloat16)
+    assert gf.shape == gb.shape == gs.shape == gr.shape and gf.numel()
+    err = {k: (abs(l - lr) / abs(lr), float((g - gr).norm() / gr.norm())) for k, (l, g) in
+           {"fused": (lf, gf), "fused_bf16": (lb, gb), "split": (ls, gs)}.items()}
+    for k in ("fused", "fused_bf16"):  # no worse than the split forward: loss within 1e-4 absolute, gradients 1.1x
+        assert err[k][0] <= err["split"][0] + 1e-4, (k, err)
+        assert err[k][1] <= 1.1 * err["split"][1] + 1e-4, (k, err)
+    # absolute ceilings, ~2x over the measured values (CPU, torch 2.7.1): fp32 low-rank gradient error 8.3e-3 (stage 1),
+    # 6.5e-3 factor / 1.0e-2 Function (stage 2); bf16 low-rank 8.6e-3 (stage 1) / 4.7e-2 (stage 2); split 1.0e-1 (stage 2)
+    assert err["fused"][1] < 2e-2 and err["fused_bf16"][1] < (2e-2 if stage == 1 else 1e-1), err
+    # the fp32 low-rank part is at least as close to fp64 as the bf16 one, in loss and gradients
+    assert err["fused"][0] <= err["fused_bf16"][0] + 1e-4 and err["fused"][1] <= err["fused_bf16"][1] + 1e-4, err
+
+
+@pytest.mark.parametrize("stage", [1, 2])
+@pytest.mark.parametrize("core", [False, True])
+@pytest.mark.parametrize("cdt", [torch.float64, torch.float32])
+@pytest.mark.parametrize("scalar", ["float", "tensor"])
+def test_tsm_expert_function_matches_autograd_reference(stage, core, cdt, scalar):
+    """_TSMExpertLinear against the same math written in plain autograd ops (fp64 parameters): output, input gradient,
+    the experts' down / up gradients - only the ones asked for (needs_input_grad), each contiguous with its parameter's
+    strides - the scalar's (a Parameter; a float scale gets none) and the router's (stage 2) gradients, with the router
+    pooling the input or the core bottleneck. ld == cdt == fp64 is exact; cdt = fp32 under ld = fp64 takes the fp32-variant
+    branch (two dtypes, the delta rounded once into the fp32 base GEMM) and is compared at fp32 precision."""
+    t, inn, out, r, m, ti = 7, 24, 20, 4, 3, 699
+    k = 0.35
+
+    def params():
+        g = torch.Generator().manual_seed(4)
+
+        def mk(*s):
+            return (torch.randn(*s, generator=g, dtype=torch.float64) * 0.3).requires_grad_(True)
+
+        downs, ups = [mk(r, inn) for _ in range(m)], [mk(out, r) for _ in range(m)]
+        if stage == 1:
+            downs[1].requires_grad_(False)
+            ups[2].requires_grad_(False)
+        else:
+            for p in downs + ups:
+                p.requires_grad_(False)
+        rw, rb, ew = mk(m - 1, r if core else inn), mk(m - 1), mk(1000, m - 1)  # the router reads z of that width
+        for p in (rw, rb, ew):
+            p.requires_grad_(stage == 2)
+        s = torch.tensor(0.8, dtype=torch.float64, requires_grad=True) if scalar == "tensor" else None
+        return mk(t, inn), mk(out, inn).detach(), mk(out).detach(), downs, ups, rw, rb, ew, s
+
+    w = torch.randn(t, out, generator=torch.Generator().manual_seed(3), dtype=cdt)
+
+    x, W0, b, downs, ups, rw, rb, ew, s = params()
+    weights = [p for pair in zip(downs, ups) for p in pair]
+    if scalar == "tensor":
+        y = laf._TSMExpertLinear.apply(x, W0, b, s, k, *((rw, rb, ew) if stage == 2 else (None, None, None)), ti, core,
+                                       cdt, torch.float64, *weights)
+    else:
+        y = laf._TSMExpertLinear.apply(x, W0, b, 0.8 * k, None, *((rw, rb, ew) if stage == 2 else (None, None, None)),
+                                       ti, core, cdt, torch.float64, *weights)
+    assert y.dtype == cdt
+    (y * w).sum().backward()
+    got = {"y": y.detach(), "x": x.grad, "s": None if s is None else s.grad, "rw": rw.grad, "rb": rb.grad, "ew": ew.grad}
+    got.update({f"d{j}": p.grad for j, p in enumerate(downs)})
+    got.update({f"u{j}": p.grad for j, p in enumerate(ups)})
+    for j, p in enumerate(ups):
+        if p.grad is not None:
+            assert p.grad.is_contiguous() and p.grad.stride() == p.stride() and p.grad.dtype == p.dtype, j
+    for j, p in enumerate(downs):
+        if p.grad is not None:
+            assert p.grad.is_contiguous() and p.grad.stride() == p.stride(), j
+
+    x, W0, b, downs, ups, rw, rb, ew, s = params()
+    sk = (s if s is not None else 0.8) * k
+    A = torch.cat(downs, 0)
+    B = torch.cat(ups, 1) * sk
+    if stage == 2:
+        src = x @ downs[0].T if core else x
+        z = src.detach().mean(0, dtype=torch.float32).double()
+        gates = rw @ z + rb + ew[ti]
+        B = (B.view(out, m, r) * torch.cat([torch.ones(1, dtype=torch.float64), gates]).view(1, m, 1)).view(out, m * r)
+    y = (x @ W0.T + (x @ A.T) @ B.T + b).to(cdt)
+    (y * w).sum().backward()
+    ref = {"y": y.detach(), "x": x.grad, "s": None if s is None else s.grad, "rw": rw.grad, "rb": rb.grad, "ew": ew.grad}
+    ref.update({f"d{j}": p.grad for j, p in enumerate(downs)})
+    ref.update({f"u{j}": p.grad for j, p in enumerate(ups)})
+    tol = dict(rtol=1e-9, atol=1e-12) if cdt == torch.float64 else dict(rtol=2e-4, atol=1e-5)
+    _assert_same(got, ref, **tol)
+    assert (got["s"] is not None) is (scalar == "tensor")
+    assert (got["rw"] is not None) is (stage == 2) and (got["ew"] is not None) is (stage == 2)
+    if stage == 1:
+        assert got["d1"] is None and got["u2"] is None and all(got[n] is not None for n in ("d0", "d2", "u0", "u1"))
+    else:
+        assert all(got[f"d{j}"] is None and got[f"u{j}"] is None for j in range(m))
+        nz = got["ew"].abs().sum(1).nonzero().flatten().tolist()
+        assert nz == [ti]  # one embedding row, as select's backward gave
+
+
+@pytest.mark.parametrize("stage", [1, 2])
+@pytest.mark.parametrize("lowrank_fp32", [False, True])
+@pytest.mark.parametrize("router", ["input", "bottleneck"])
+def test_tsm_fused_both_lowrank_modes_match_split_fp64(monkeypatch, stage, lowrank_fp32, router):
+    """Both low-rank dtype modes of the fused path == the split forward (== stock, the tests above) on a mixed-timestep
+    batch with use_scalar=True: output, input gradient, expert / router gradients and the scalar's gradient; the stage-2
+    router pooling the input or the core bottleneck. tsm_lowrank_fp32 off: everything fp64 through _LowRankLinear,
+    exact. On: _tsm_mixed (fp64 experts over an fp32 base and input), so the calls really land in _TSMLinear (counted,
+    one per expert group per forward / recompute) and the agreement is at fp32 level."""
+    ts = [900.0, 100.0, 900.0, 5.0]
+    xdt = torch.float32 if lowrank_fp32 else torch.float64
+    x = torch.randn(len(ts), 1, 3, 4, 24, generator=torch.Generator().manual_seed(6), dtype=xdt)
+    make = ((lambda: _tsm_mixed(stage, router)) if lowrank_fp32
+            else (lambda: _tsm_module(stage, router=router, use_scalar=True)))
+    monkeypatch.setattr(laf, "_TSM_LOWRANK_FP32", lowrank_fp32)
+    monkeypatch.setattr(laf, "_TSM_FUSED", True)
+    monkeypatch.setattr(laf, "_TSM_EXPERT_FN", False)
+    calls = {"lr": [], "tl": []}
+    for name, cls in (("lr", laf._LowRankLinear), ("tl", laf._TSMLinear)):
+        orig = cls.apply
+        monkeypatch.setattr(cls, "apply", (lambda n, o: lambda *a: calls[n].append(1) or o(*a))(name, orig))
+    got = _tsm_run(make(), x, ts, checkpoint=True)
+    groups = len({tuple(laf._tsm_experts(make(), int(t))) if stage == 1 else t for t in ts})
+    assert len(calls["tl" if lowrank_fp32 else "lr"]) == 2 * groups and not calls["lr" if lowrank_fp32 else "tl"]
+    monkeypatch.setattr(laf, "_TSM_FUSED", False)
+    ref = _tsm_run(make(), x, ts, checkpoint=True)
+    _assert_same(got, ref, **(dict(rtol=2e-4, atol=1e-5) if lowrank_fp32 else {}))
+    assert got["scalar"] is not None and bool(torch.any(got["scalar"] != 0))
+
+
+@pytest.mark.parametrize("expert_fn", [False, True])
+@pytest.mark.parametrize("stage", [1, 2])
+def test_tsm_expert_grads_dtype_layout_active_only(monkeypatch, stage, expert_fn):
+    """Anima-like (bf16 base, fp32 experts, fp32 input, bf16 autocast, checkpointing), the factor path and
+    _TSMExpertLinear: every gradient lands in its parameter's dtype, contiguous with the parameter's strides, only for
+    the experts active at the batch's timestep (stage 1) or for the router (stage 2: experts frozen; one embedding row
+    non-zero); the input gradient comes back in the input's dtype. The raw gradients are contiguous in the parameter's
+    layout only from _TSMExpertLinear (read from what its backward returns: a tensor hook on a leaf the Function saved
+    for backward does not fire under the non-reentrant checkpoint, torch 2.7.1) - the factor path hands AccumulateGrad
+    a column slice of cat(ups)' gradient (tensor hooks), which it clones."""
+    monkeypatch.setattr(laf, "_TSM_FUSED", True)
+    monkeypatch.setattr(laf, "_TSM_EXPERT_FN", expert_fn)
+    t = 650
+    m = _tsm_module(stage, dtype=torch.float32)
+    m.org_module[0].to(torch.bfloat16)
+    net = argparse.Namespace(loras=[m])
+    raw = {}  # parameter -> (contiguous, same strides) of the gradient as the autograd graph delivered it
+    for p in m.parameters():
+        if p.requires_grad:
+            p.register_hook(lambda g, p=p: raw.__setitem__(p, (g.is_contiguous(), g.stride() == p.stride())))
+    applied, returned = [], []  # the Function's inputs (last apply) and what its backward returned
+    orig_apply, orig_bwd = laf._TSMExpertLinear.apply, laf._TSMExpertLinear.backward
+    monkeypatch.setattr(laf._TSMExpertLinear, "apply", lambda *a: applied.append(a) or orig_apply(*a))
+    monkeypatch.setattr(laf._TSMExpertLinear, "backward",
+                        staticmethod(lambda ctx, g: returned.append(orig_bwd(ctx, g)) or returned[-1]))
+    x = torch.randn(2, 5, 24, requires_grad=True)
+    laf.set_timestep(net, torch.tensor([float(t)]))
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = torch.utils.checkpoint.checkpoint(m, x, use_reentrant=False)
+    assert out.dtype == torch.bfloat16
+    (out.float() * torch.randn(out.shape, generator=torch.Generator().manual_seed(3))).sum().backward()
+    laf.clear_timestep(net)
+    assert x.grad is not None and x.grad.dtype == torch.float32 and x.grad.shape == x.shape
+    fn_raw = {}  # id(parameter) -> (contiguous, same strides, dtype) of the gradient _TSMExpertLinear returned for it
+    if expert_fn:
+        assert len(applied) == 2 and len(returned) == 1  # forward + checkpoint recompute, one backward
+        for a, g in zip(applied[-1], returned[-1]):
+            if isinstance(a, torch.Tensor) and a.requires_grad and g is not None:
+                fn_raw[id(a)] = (g.is_contiguous(), g.stride() == a.stride(), g.dtype)
+    else:
+        assert not applied and not returned
+    active = {(si, e) for si, e in enumerate(laf._tsm_experts(m, t))}
+    for si, scale in enumerate(m.experts):
+        for e, ex in enumerate(scale):
+            for p in (ex["down"].weight, ex["up"].weight):
+                if stage == 1 and (si, e) in active:
+                    assert p.grad is not None and p.grad.dtype == p.dtype == torch.float32, (si, e)
+                    assert p.grad.is_contiguous() and p.grad.stride() == p.stride(), (si, e)
+                    assert bool(torch.any(p.grad != 0)), (si, e)
+                    if expert_fn:  # the Function's own layout and dtype, nothing for AccumulateGrad to clone or cast
+                        assert fn_raw[id(p)] == (True, True, p.dtype), (si, e, fn_raw[id(p)])
+                else:
+                    assert p.grad is None, (stage, si, e)
+    router = (m.router_fc.weight, m.router_fc.bias, m.timestep_embed.weight)
+    if stage == 1:
+        assert all(p.grad is None for p in router)
+    else:
+        for p in router:
+            assert p.grad is not None and p.grad.dtype == p.dtype == torch.float32 and p.grad.is_contiguous()
+            if expert_fn:
+                assert fn_raw[id(p)] == (True, True, p.dtype), fn_raw[id(p)]
+        rows = m.timestep_embed.weight.grad.abs().sum(1).nonzero().flatten().tolist()
+        assert rows == [t - 1]
+    if stage == 1 and not expert_fn:  # the factor path: a column slice (ups) reaches AccumulateGrad, which clones it
+        ups = [m.experts[si][e]["up"].weight for si, e in active]
+        assert any(raw[p] != (True, True) for p in ups), {p.shape: raw[p] for p in ups}
 
 
 # ------------------------------------------------------------------------------- LoRA family: factored forward (speed)
