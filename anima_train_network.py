@@ -89,38 +89,23 @@ def validate_checkpoint_token_limits(args) -> None:
         )
 
 
-# Options that couple the rows of one forward: under --anima_micro_batch_max_tokens a chunk is not the batch. Refused:
-# the objective itself changes with the chunking. Warned: still unbiased, but the pairing / strata / OT matching form
-# within each chunk (none in a 1-row chunk). See library/micro_batch.py.
-_MICRO_BATCH_REFUSED = (
-    ("contrastive_flow_matching", "contrastive flow matching rolls its negatives within the forward (a 1-row chunk has none)"),
-    ("adaptive_timestep_sampling", "the adaptive sampler's Algorithm 2 / REINFORCE update would see the last chunk only"),
-    ("anchor_snr_weighting", "the anchor SNR gate is normalised to batch-mean 1 over the forward"),
-    ("adv_snr_weighting", "the adv SNR gate is normalised to batch-mean 1 over the forward"),
-)
-_MICRO_BATCH_WARNED = ("antithetic_timestep_sampling", "antithetic_noise_pairing", "stratified_timestep_sampling",
-                       "qmc_timestep_sampling", "flow_use_ot")
+# Options that couple the rows of one forward: under --anima_micro_batch_max_tokens a chunk is not the batch (and under
+# --step_rows a pack is several forwards: micro_batch.step_rows_messages, checked by train_network.py for every
+# trainer). The lists live in library/micro_batch.py.
+_MICRO_BATCH_REFUSED = micro_batch.ROW_COUPLING_REFUSED
+_MICRO_BATCH_WARNED = micro_batch.ROW_COUPLING_WARNED
 
 
 def validate_micro_batch_args(args) -> list[str]:
     """--anima_micro_batch_max_tokens: >= 0, and when > 0 the row-coupling options above: ValueError for the refused ones,
-    a message (returned; assert_extra_args logs it) for the warned ones. 0 accepts anything."""
+    a message (returned; assert_extra_args logs it) for the warned ones. 0 accepts anything (--step_rows has its own
+    call of the same checks)."""
     budget = int(getattr(args, "anima_micro_batch_max_tokens", 0) or 0)
     if budget < 0:
         raise ValueError(f"--anima_micro_batch_max_tokens must be >= 0 (0 = off), got {budget}")
     if budget == 0:
         return []
-    for name, why in _MICRO_BATCH_REFUSED:
-        if getattr(args, name, False):
-            raise ValueError(f"--{name} cannot be combined with --anima_micro_batch_max_tokens {budget}: {why}."
-                             f" Set the budget to 0 (one forward per batch) or drop the option")
-    dyn = str(getattr(args, "patch_topology_dynamic_weighting", "none") or "none").lower()
-    if getattr(args, "patch_topology_loss", False) and dyn != "none":
-        raise ValueError(f"--patch_topology_dynamic_weighting {dyn} cannot be combined with --anima_micro_batch_max_tokens"
-                         f" {budget}: the weight would be updated per chunk, not per batch. Use 'none' or the budget 0")
-    return [f"--{name} with --anima_micro_batch_max_tokens {budget}: the pairing / strata / matching are formed within each"
-            f" chunk (none in a 1-row chunk); the marginal timestep / noise distribution is unchanged"
-            for name in _MICRO_BATCH_WARNED if getattr(args, name, None)]
+    return micro_batch.row_coupling_messages(args, f"--anima_micro_batch_max_tokens {budget}")
 
 
 def checkpoint_mode_for_tokens(args, tokens: int, swapping: bool) -> str:
@@ -415,6 +400,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         validate_checkpoint_token_limits(args)  # --anima_half_checkpoint_max_tokens >= --anima_no_checkpoint_max_tokens
         for message in validate_micro_batch_args(args):  # --anima_micro_batch_max_tokens >= 0; row-coupling options
             logger.warning(message)
+        micro_batch.validate_step_rows(args)  # --step_rows: accumulation 1, batch_loss_norm_rows 0 / N (processes: train())
 
         if args.unsloth_offload_checkpointing:
             if not args.gradient_checkpointing:
@@ -1194,14 +1180,27 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         budget runs as even chunks of rows that fit, each its own forward + backward weighted by rows / batch rows: the
         gradient of the batch mean for the per-sample loss (options that couple the rows of one forward are refused or
         warned about by validate_micro_batch_args). The token count comes from the cached latents or, without them,
-        from the pixel size. Announced once per distinct per-sample token count. 0 = off."""
+        from the pixel size. Announced once per distinct per-sample token count. 0 = off. A --step_rows StepPack: each
+        of its bucket batches is chunked the same way, the weights are rows / the pack's rows."""
+        if isinstance(batch, micro_batch.StepPack):
+            return [(chunk, rows / batch.rows) for sb in batch.sub_batches
+                    for chunk, rows in self._token_budget_chunks(args, accelerator, sb, unet)]
+        chunks = self._token_budget_chunks(args, accelerator, batch, unet)
+        if len(chunks) == 1:
+            return [(batch, 1.0)]
+        total = sum(rows for _, rows in chunks)
+        return [(chunk, rows / total) for chunk, rows in chunks]
+
+    def _token_budget_chunks(self, args, accelerator, batch, unet) -> list:
+        """[(chunk, rows)] of one collate_fn batch under --anima_micro_batch_max_tokens: even row chunks whose rows x DiT
+        tokens per sample fit the budget; [(batch, its rows)] when it fits, has one row or the budget is off."""
         budget = int(getattr(args, "anima_micro_batch_max_tokens", 0) or 0)
         if budget <= 0 or not isinstance(batch, dict):
-            return [(batch, 1.0)]
+            return [(batch, micro_batch.batch_rows(batch))]
         latents, images = batch.get("latents"), batch.get("images")
         src = latents if isinstance(latents, torch.Tensor) else images  # latents not cached: the pixels (VAE in process_batch)
         if not isinstance(src, torch.Tensor) or src.ndim < 3 or int(src.shape[0]) <= 1:
-            return [(batch, 1.0)]
+            return [(batch, micro_batch.batch_rows(batch))]
         n = int(src.shape[0])
         patch = anima_patch_spatial(accelerator.unwrap_model(unet))
         if src is latents:
@@ -1210,7 +1209,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             per_sample = tokens_of_grid(int(src.shape[-2]) // VAE_SPATIAL_DOWNSCALE, int(src.shape[-1]) // VAE_SPATIAL_DOWNSCALE, patch)
         sizes = micro_batch.chunk_sizes(n, max(1, budget // max(1, per_sample)))
         if len(sizes) == 1:
-            return [(batch, 1.0)]
+            return [(batch, n)]
         if not self._micro_batch_logged:  # one INFO line for the first chunked batch; every bucket has its own token
             logger.info(f"micro-batching on: a batch of {n} x {per_sample} DiT tokens exceeds --anima_micro_batch_max_tokens"
                         f" {budget} -> {len(sizes)} chunks of {sizes} rows, each its own forward + backward (same gradient)."
@@ -1218,7 +1217,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         elif per_sample not in self._micro_batch_logged:  # count, so a line per bucket would break the progress bar
             logger.debug(f"micro-batching: {n} x {per_sample} DiT tokens -> {len(sizes)} chunks of {sizes} rows")
         self._micro_batch_logged.add(per_sample)
-        return [(sub, s / n) for sub, s in zip(micro_batch.split_batch(batch, sizes), sizes)]
+        return list(zip(micro_batch.split_batch(batch, sizes), sizes))
 
     def get_noise_pred_and_target(
         self,

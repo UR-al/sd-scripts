@@ -5897,6 +5897,22 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         " trainers, train_network.py and *_train_network.py)",
     )
     parser.add_argument(
+        "--step_rows",
+        type=int,
+        default=0,
+        help="make every optimizer step exactly N rows (images x repeats): consecutive bucket batches are packed into N-row"
+        " steps (a batch crossing the boundary is cut there and its tail opens the next step; the epoch's last step holds"
+        " the remainder) and every row weighs 1/N - the step size and per-sample weight of batch 1 x accumulation N however"
+        " ragged the buckets are, and the same rows per step on every dataset without retuning the accumulation (with"
+        " bucket_no_upscale a batch_size 8 x accumulation 2 gives steps of 2..16 rows whose gradient magnitude swings with"
+        " the bucket fill). Needs gradient_accumulation_steps 1, --batch_loss_norm_rows 0 (N is used) and a single process;"
+        " steps per epoch = ceil(rows per epoch / N); not with resolution jitter. A step is several forwards (one per"
+        " bucket batch or boundary piece), so the options that couple the rows of one forward are refused"
+        " (--contrastive_flow_matching, --adaptive_timestep_sampling, --anchor_snr_weighting, --adv_snr_weighting, a dynamic"
+        " --patch_topology_dynamic_weighting) or warned about (antithetic / stratified / QMC sampling, --antithetic_noise_pairing,"
+        " --flow_use_ot), as with --anima_micro_batch_max_tokens. 0 = off (network trainers)",
+    )
+    parser.add_argument(
         "--cuda_memory_fraction",
         type=float,
         default=None,

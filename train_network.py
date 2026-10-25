@@ -445,7 +445,9 @@ class NetworkTrainer:
         rows (library/micro_batch.py): the weighted sum of the chunks' mean losses is the batch's mean loss, so the
         accumulated gradient is the one the whole batch would give in one forward. The default is the batch itself; a
         trainer that knows its token count splits large batches into chunks that fit in VRAM (anima_train_network.py,
-        --anima_micro_batch_max_tokens)."""
+        --anima_micro_batch_max_tokens). A --step_rows StepPack: its bucket batches, weight = their rows / the pack's."""
+        if isinstance(batch, micro_batch.StepPack):
+            return [(sb, micro_batch.batch_rows(sb) / batch.rows) for sb in batch.sub_batches]
         return [(batch, 1.0)]
 
     def should_sync_ramtorch(self, args, accelerator) -> bool:
@@ -2424,6 +2426,12 @@ class NetworkTrainer:
 
         self.assert_extra_args(args, train_dataset_group, val_dataset_group)  # may change some args
 
+        # --step_rows (library/micro_batch.py), every trainer, before the models load: accumulation 1, batch_loss_norm_rows
+        # 0 / N, and the options that couple the rows of one forward (a pack is several forwards) refused / warned about;
+        # the process count is checked again once the accelerator exists
+        for message in micro_batch.step_rows_messages(args):
+            logger.warning(message)
+
         # acceleratorを準備する
         logger.info(f"preparing accelerator")
         accelerator = train_util.prepare_accelerator(args)
@@ -2722,11 +2730,21 @@ class NetworkTrainer:
                 pin_memory=args.pin_data_loader_memory or args.pin_memory,
             )
 
+        # --step_rows N (library/micro_batch.py): the optimizer step is N rows packed from consecutive bucket batches (the
+        # prepared loader is wrapped in a RowPacker below), so the steps per epoch are ceil(rows per epoch / N) - not
+        # batches / gradient_accumulation_steps, which must be 1 with step_rows - for max_train_steps and the LR schedule
+        step_rows = micro_batch.validate_step_rows(args, accelerator.num_processes)
+        rows_per_epoch = micro_batch.dataset_rows_per_epoch(train_dataset_group) if step_rows else 0
+        pack_steps_per_epoch = micro_batch.steps_per_epoch(rows_per_epoch, step_rows) if step_rows else None
+
         # 学習ステップ数を計算する
         if args.max_train_epochs is not None:
-            args.max_train_steps = args.max_train_epochs * math.ceil(
-                len(train_dataloader) / accelerator.num_processes / args.gradient_accumulation_steps
-            )
+            if pack_steps_per_epoch is not None:
+                args.max_train_steps = args.max_train_epochs * pack_steps_per_epoch
+            else:
+                args.max_train_steps = args.max_train_epochs * math.ceil(
+                    len(train_dataloader) / accelerator.num_processes / args.gradient_accumulation_steps
+                )
             accelerator.print(
                 f"override steps. steps for {args.max_train_epochs} epochs is / 指定エポックまでのステップ数: {args.max_train_steps}"
             )
@@ -3046,6 +3064,11 @@ class NetworkTrainer:
             )
             training_model = network
 
+        if step_rows:
+            # from here on train_dataloader yields StepPacks (len = optimizer steps per epoch); the loop's batch code
+            # goes through micro_batch.sub_batches / batch_rows, split_batch_for_backward chunks each sub-batch
+            train_dataloader = micro_batch.RowPacker(train_dataloader, step_rows, rows_per_epoch)
+
         if val_dataset_group is not None:
             val_dataloader = accelerator.prepare(val_dataloader)
             cyclic_val_dataloader = itertools.cycle(val_dataloader)
@@ -3227,7 +3250,10 @@ class NetworkTrainer:
 
         # 学習する
         # TODO: find a way to handle total batch size when there are multiple datasets
-        total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+        if step_rows:
+            total_batch_size = step_rows * accelerator.num_processes  # --step_rows: the optimizer step is N rows
+        else:
+            total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
         accelerator.print("running training / 学習開始")
         accelerator.print(f"  num train images * repeats / 学習画像の数×繰り返し回数: {train_dataset_group.num_train_images}")
@@ -3236,6 +3262,13 @@ class NetworkTrainer:
         )
         accelerator.print(f"  num reg images / 正則化画像の数: {train_dataset_group.num_reg_images}")
         accelerator.print(f"  num batches per epoch / 1epochのバッチ数: {len(train_dataloader)}")
+        if step_rows:
+            last_rows = rows_per_epoch - (len(train_dataloader) - 1) * step_rows
+            accelerator.print(
+                f"  step_rows {step_rows}: {rows_per_epoch} rows / epoch from {len(train_dataloader.dataloader)} bucket"
+                f" batches -> {len(train_dataloader)} optimizer steps of {step_rows} rows (the epoch's last: {last_rows});"
+                f" every row weighs 1/{step_rows} (the line above counts these steps)"
+            )
         accelerator.print(f"  num epochs / epoch数: {num_train_epochs}")
         accelerator.print(
             f"  batch size per device / バッチサイズ: {', '.join([str(d.batch_size) for d in train_dataset_group.datasets])}"
@@ -3260,6 +3293,8 @@ class NetworkTrainer:
             "ss_num_epochs": num_train_epochs,
             "ss_gradient_checkpointing": args.gradient_checkpointing,
             "ss_gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "ss_step_rows": step_rows,  # --step_rows: N rows per optimizer step, every row 1/N; then ss_num_batches_per_epoch counts these steps (0 = off)
+            "ss_batch_loss_norm_rows": int(getattr(args, "batch_loss_norm_rows", 0) or 0),  # --batch_loss_norm_rows (0 = off)
             "ss_max_train_steps": args.max_train_steps,
             "ss_lr_warmup_steps": args.lr_warmup_steps,
             "ss_lr_scheduler": args.lr_scheduler,
@@ -3957,7 +3992,10 @@ class NetworkTrainer:
             # TRAINING
             skipped_dataloader = None
             if initial_step > 0:
-                skipped_dataloader = accelerator.skip_first_batches(train_dataloader, initial_step - 1)
+                if isinstance(train_dataloader, micro_batch.RowPacker):
+                    skipped_dataloader = train_dataloader.skip_first_packs(initial_step - 1)  # packs, not DataLoader batches
+                else:
+                    skipped_dataloader = accelerator.skip_first_batches(train_dataloader, initial_step - 1)
                 initial_step = 1
 
             for step, batch in enumerate(skipped_dataloader or train_dataloader):
@@ -3976,20 +4014,14 @@ class NetworkTrainer:
 
                     accumulation_counter += 1
 
-                    # Track actual micro-batch size for accurate effective batch size
-                    _actual_bs = None
-                    if "latents" in batch and batch["latents"] is not None:
-                        _actual_bs = batch["latents"].shape[0]
-                    elif "images" in batch and batch["images"] is not None:
-                        _actual_bs = batch["images"].shape[0]
-                    elif "captions" in batch:
-                        _actual_bs = len(batch["captions"])
-                    if _actual_bs is None:
-                        _actual_bs = args.train_batch_size
+                    # Track actual micro-batch size for accurate effective batch size (latents / images / loss_weights /
+                    # captions rows; a --step_rows StepPack: its rows)
+                    _actual_bs = micro_batch.batch_rows(batch) or args.train_batch_size
                     accumulated_samples += _actual_bs
 
-                    # preprocess batch for each model
-                    self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True)
+                    # preprocess batch for each model (a StepPack: each of its bucket batches)
+                    for sb in micro_batch.sub_batches(batch):
+                        self.on_step_start(args, accelerator, network, text_encoders, unet, sb, weight_dtype, is_train=True)
 
                     # Update patch topology current step for warmup/start_step logic
                     self._patch_topology_current_step = global_step
@@ -4243,9 +4275,9 @@ class NetworkTrainer:
                                                                                                         vae_dtype, 
                                                                                                         weight_dtype, 
                                                                                                         accelerator, 
-                                                                                                        args, 
+                                                                                                        args,
                                                                                                         current_epoch.value,
-                                                                                                        batch,
+                                                                                                        micro_batch.sub_batches(batch)[0],  # a StepPack: its first bucket batch
                                                                                                         train_text_encoder)
                             else:
                                 current_val_loss, average_val_loss, val_logs = None, None, {}

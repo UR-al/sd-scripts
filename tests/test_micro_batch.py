@@ -7,6 +7,7 @@ Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe -m pytest tests/test_micro_
 import argparse
 import logging
 import types
+from typing import NamedTuple
 
 import pytest
 import torch
@@ -183,6 +184,7 @@ def _anima_split(args, batch, patch=2, logged=None):
     from anima_train_network import AnimaNetworkTrainer
 
     fake_self = types.SimpleNamespace(_micro_batch_logged=set() if logged is None else logged)
+    fake_self._token_budget_chunks = types.MethodType(AnimaNetworkTrainer._token_budget_chunks, fake_self)
     accel = types.SimpleNamespace(unwrap_model=lambda m: m)
     unet = types.SimpleNamespace(patch_spatial=patch)
     return AnimaNetworkTrainer.split_batch_for_backward(fake_self, args, accel, batch, unet)
@@ -326,3 +328,237 @@ def test_anima_split_uses_images_when_latents_are_not_cached():
     assert chunks[1][0]["captions"] == ["2", "3"] and chunks[0][0]["latents"] is None
     one = {"images": torch.zeros(1, 3, 512, 512), "latents": None}
     assert _anima_split(args, one) == [(one, 1.0)]
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# --step_rows: N-row optimizer steps packed from the bucket batches
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+class _BBI(NamedTuple):
+    """train_util.BucketBatchIndex's fields (dataset_rows_per_epoch reads them by name)."""
+
+    bucket_index: int
+    bucket_batch_size: int
+    batch_index: int
+
+
+def _fake_dataset(bucket_sizes, batch_size=8, jitter=False, delegate=False):
+    """A dataset as train_util.BaseDataset.make_buckets leaves it: batch_buckets (image keys per bucket) and
+    all_buckets_indices (ceil(len / batch_size) BucketBatchIndex per bucket); delegate=True wraps it the way the
+    FineTuning / ControlNet datasets hold a DreamBooth delegate."""
+    buckets = [[f"b{b}_{i}" for i in range(n)] for b, n in enumerate(bucket_sizes)]
+    indices = [_BBI(b, batch_size, k) for b, bucket in enumerate(buckets) for k in range(-(-len(bucket) // batch_size))]
+    ds = types.SimpleNamespace(batch_buckets=buckets, all_buckets_indices=indices, buckets_indices=list(indices),
+                               has_resolution_jitter=jitter, num_train_images=sum(bucket_sizes))
+    if delegate:
+        return types.SimpleNamespace(dreambooth_dataset_delegate=ds, num_train_images=ds.num_train_images)
+    return ds
+
+
+def test_dataset_rows_per_epoch_counts_the_bucket_batch_rows():
+    ds = _fake_dataset([20, 3, 1, 8, 9])  # 20 -> 8, 8, 4; 3; 1; 8; 9 -> 8, 1: 41 rows in 8 batches
+    assert len(ds.all_buckets_indices) == 8
+    assert micro_batch.dataset_rows_per_epoch(ds) == 41
+    group = types.SimpleNamespace(datasets=[ds, _fake_dataset([5], delegate=True)], num_train_images=46)
+    assert micro_batch.dataset_rows_per_epoch(group) == 46
+    # a dataset without the bucket structure counts its num_train_images
+    plain = types.SimpleNamespace(datasets=[types.SimpleNamespace(num_train_images=7)])
+    assert micro_batch.dataset_rows_per_epoch(plain) == 7
+    with pytest.raises(ValueError, match="resolution jitter"):
+        micro_batch.dataset_rows_per_epoch(types.SimpleNamespace(datasets=[_fake_dataset([4], jitter=True)]))
+    assert micro_batch.steps_per_epoch(725, 8) == 91 and micro_batch.steps_per_epoch(728, 8) == 91
+    assert micro_batch.steps_per_epoch(729, 8) == 92 and micro_batch.steps_per_epoch(0, 8) == 0
+    with pytest.raises(ValueError):
+        micro_batch.steps_per_epoch(10, 0)
+
+
+def test_validate_step_rows():
+    ns = argparse.Namespace
+    assert micro_batch.validate_step_rows(ns()) == 0
+    assert micro_batch.validate_step_rows(ns(step_rows=0, gradient_accumulation_steps=4)) == 0
+    assert micro_batch.validate_step_rows(ns(step_rows=8, gradient_accumulation_steps=1, batch_loss_norm_rows=0)) == 8
+    assert micro_batch.validate_step_rows(ns(step_rows=8, gradient_accumulation_steps=1, batch_loss_norm_rows=8)) == 8
+    assert micro_batch.validate_step_rows(ns(step_rows=8)) == 8  # accumulation absent = 1
+    with pytest.raises(ValueError, match="gradient_accumulation_steps 1"):
+        micro_batch.validate_step_rows(ns(step_rows=8, gradient_accumulation_steps=2))
+    with pytest.raises(ValueError, match="batch_loss_norm_rows 4 contradicts"):
+        micro_batch.validate_step_rows(ns(step_rows=8, gradient_accumulation_steps=1, batch_loss_norm_rows=4))
+    with pytest.raises(ValueError, match="single process"):
+        micro_batch.validate_step_rows(ns(step_rows=8, gradient_accumulation_steps=1), num_processes=2)
+    with pytest.raises(ValueError, match=">= 0"):
+        micro_batch.validate_step_rows(ns(step_rows=-1))
+    # the Anima trainer validates at assert_extra_args (before the models load); train() again with the process count
+    import inspect
+
+    from anima_train_network import AnimaNetworkTrainer
+
+    assert "micro_batch.validate_step_rows(args)" in inspect.getsource(AnimaNetworkTrainer.assert_extra_args)
+    # a pack is several forwards: the row-coupling options are refused / warned about as under the token budget, with
+    # the budget off, for every trainer (step_rows_messages = validate_step_rows + row_coupling_messages)
+    assert micro_batch.step_rows_messages(ns(step_rows=8, anima_micro_batch_max_tokens=0)) == []
+    assert micro_batch.step_rows_messages(ns(step_rows=0, contrastive_flow_matching=True, adaptive_timestep_sampling=True)) == []
+    for flag in ("contrastive_flow_matching", "adaptive_timestep_sampling", "anchor_snr_weighting", "adv_snr_weighting"):
+        with pytest.raises(ValueError, match=f"--{flag} cannot be combined with --step_rows 8"):
+            micro_batch.step_rows_messages(ns(step_rows=8, anima_micro_batch_max_tokens=0, **{flag: True}))
+    with pytest.raises(ValueError, match="gradnorm cannot be combined with --step_rows 8"):
+        micro_batch.step_rows_messages(ns(step_rows=8, patch_topology_loss=True, patch_topology_dynamic_weighting="gradnorm"))
+    warns = micro_batch.step_rows_messages(ns(step_rows=8, antithetic_noise_pairing=True, flow_use_ot=True))
+    assert len(warns) == 2 and all("with --step_rows 8" in w and "within each chunk" in w for w in warns), warns
+    with pytest.raises(ValueError, match="gradient_accumulation_steps 1"):  # the step_rows checks come first
+        micro_batch.step_rows_messages(ns(step_rows=8, gradient_accumulation_steps=2, contrastive_flow_matching=True))
+
+
+def test_slice_batch_step_pack_and_rows_norm():
+    b = _collated(8)
+    part = micro_batch.slice_batch(b, 3, 7)
+    assert micro_batch.batch_rows(part) == 4 and part["captions"] == ["cap 3", "cap 4", "cap 5", "cap 6"]
+    assert torch.equal(part["latents"], b["latents"][3:7]) and part["text_encoder_outputs_list"][1] is None
+    assert torch.equal(part["text_encoder_outputs_list"][2], b["text_encoder_outputs_list"][2][3:7])
+    assert part["shared_scalar"] == 3 and part["shared_tensor"] is b["shared_tensor"] and part["images"] is None
+    assert micro_batch.slice_batch(b, 0, 8) is b
+    assert part["latents"].data_ptr() == b["latents"][3:7].data_ptr()  # a view by default ...
+    cp = micro_batch.slice_batch(b, 3, 7, copy=True)  # ... a copy on request (the packer's cut pieces)
+    assert torch.equal(cp["latents"], part["latents"]) and cp["latents"].data_ptr() != b["latents"][3:7].data_ptr()
+    assert cp["text_encoder_outputs_list"][2].data_ptr() != b["text_encoder_outputs_list"][2][3:7].data_ptr()
+    assert cp["captions"] == part["captions"] and cp["shared_tensor"] is b["shared_tensor"]
+    for bad in ((0, 0), (5, 3), (-1, 2), (2, 9)):
+        with pytest.raises(ValueError):
+            micro_batch.slice_batch(b, *bad)
+    pack = micro_batch.StepPack([micro_batch.slice_batch(b, 0, 3), _collated(5)])
+    assert pack.rows == 8 and len(pack) == 2 and micro_batch.batch_rows(pack) == 8
+    assert micro_batch.sub_batches(pack) == pack.sub_batches and micro_batch.sub_batches(b) == [b]
+    assert [micro_batch.batch_rows(sb) for sb in pack] == [3, 5] and "rows=8" in repr(pack)
+    with pytest.raises(ValueError):
+        micro_batch.StepPack([])
+    ns = argparse.Namespace
+    assert micro_batch.rows_norm(ns(step_rows=8, gradient_accumulation_steps=1), pack) == 1.0  # a full pack
+    short = micro_batch.StepPack([_collated(5)])
+    assert micro_batch.rows_norm(ns(step_rows=8, gradient_accumulation_steps=1), short) == 5 / 8  # the epoch's last pack
+    assert micro_batch.rows_norm(ns(step_rows=8, batch_loss_norm_rows=8), short) == 5 / 8  # the same N given twice
+    assert micro_batch.rows_norm(ns(step_rows=0, batch_loss_norm_rows=4), _collated(2)) == 0.5  # step_rows off: the old flag
+
+
+def _loader(sizes):
+    return [_collated(n) for n in sizes]
+
+
+def test_row_packer_packs_exact_rows_and_cuts_at_the_boundary(caplog):
+    """Ragged bucket batches 3, 8, 1, 2, 6, 4 (24 rows) -> three 8-row packs: [3, 5 of the 8] [3 rest, 1, 2, 2 of the 6]
+    [4 rest, 4]; the cut pieces of one batch carry consecutive rows; len() is the step count; 21 rows -> 8, 8, 5;
+    skip_first_packs drops whole packs; a wrong rows_per_epoch is warned about at the end of the epoch."""
+    loader = _loader([3, 8, 1, 2, 6, 4])
+    packer = micro_batch.RowPacker(loader, 8, 24)
+    assert len(packer) == 3
+    packs = list(packer)
+    assert [p.rows for p in packs] == [8, 8, 8]
+    assert [[micro_batch.batch_rows(sb) for sb in p] for p in packs] == [[3, 5], [3, 1, 2, 2], [4, 4]]
+    assert packs[0].sub_batches[0] is loader[0]  # a batch that fits whole is passed through, not copied
+    assert packs[0].sub_batches[1]["latents"].data_ptr() != loader[1]["latents"].data_ptr()  # a cut piece is a copy ...
+    assert packs[1].sub_batches[0]["latents"].data_ptr() != loader[1]["latents"][5:].data_ptr()  # ... both of them
+    assert packs[0].sub_batches[1]["captions"] == [f"cap {i}" for i in range(5)]  # the 8-row batch: rows 0..4 ...
+    assert packs[1].sub_batches[0]["captions"] == [f"cap {i}" for i in range(5, 8)]  # ... and 5..7 open the next pack
+    assert packs[1].sub_batches[3]["captions"] == ["cap 0", "cap 1"]
+    assert packs[2].sub_batches[0]["captions"] == [f"cap {i}" for i in range(2, 6)]
+    assert torch.equal(torch.cat([packs[1].sub_batches[3]["latents"], packs[2].sub_batches[0]["latents"]]), loader[4]["latents"])
+    assert [p.rows for p in packer] == [8, 8, 8]  # re-iterable: one epoch per iteration
+    # the epoch's remainder, and the step count
+    short = micro_batch.RowPacker(_loader([8, 3, 8, 2]), 8, 21)
+    assert len(short) == 3 and [p.rows for p in short] == [8, 8, 5]
+    assert [[micro_batch.batch_rows(sb) for sb in p] for p in short] == [[8], [3, 5], [3, 2]]
+    skipped = short.skip_first_packs(1)  # the resume path: len() = the remaining packs (calculate_val_loss_check reads it)
+    assert len(skipped) == 2 and [p.rows for p in skipped] == [8, 5] and [p.rows for p in skipped] == [8, 5]
+    assert len(short.skip_first_packs(3)) == 0 and [p.rows for p in short.skip_first_packs(3)] == []
+    # a mismatching rows_per_epoch: every pack is still yielded, the mismatch is logged once per epoch
+    with caplog.at_level(logging.WARNING, logger="library.micro_batch"):
+        right = micro_batch.RowPacker(_loader([8, 3]), 8, 11)
+        assert [p.rows for p in right] == [8, 3] and len(right) == 2
+        assert not [r for r in caplog.records if "step_rows" in r.getMessage()]
+        wrong = micro_batch.RowPacker(_loader([8, 3, 8]), 8, 16)  # 19 rows -> 3 packs, 2 expected
+        assert [p.rows for p in wrong] == [8, 8, 3]
+    assert [r.levelname for r in caplog.records if "step_rows" in r.getMessage()] == ["WARNING"]
+    with pytest.raises(ValueError, match="row count"):
+        list(micro_batch.RowPacker([{"x": 1}], 8, 8))
+    with pytest.raises(ValueError):
+        micro_batch.RowPacker(loader, 0, 24)
+
+
+def test_step_pack_gradient_is_one_over_n_per_row():
+    """A StepPack through the trainer's formula (chunk_weight x rows_norm, gradient_accumulation_steps 1, Anima's token
+    chunking inside each bucket batch): a full 8-row pack of bucket batches [3, 5] (the 5 chunked [3, 2] by the budget)
+    accumulates the gradient of (sum of the 8 per-sample losses) / 8; the epoch's last 5-row pack that of (sum of its 5)
+    / 8 - every row 1/8 either way, as batch 1 x accumulation 8 gives."""
+    torch.manual_seed(0)
+    x, y = torch.randn(13, 5, dtype=torch.float64), torch.randn(13, 3, dtype=torch.float64)
+    args = argparse.Namespace(step_rows=8, gradient_accumulation_steps=1, anima_micro_batch_max_tokens=3100)
+
+    def pack_of(row_groups):  # bucket batches with 512^2 latents: 1024 tokens a row, 3 rows per 3100-token chunk
+        subs = []
+        for rows in row_groups:
+            sb = _latents_batch(len(rows), 512)
+            sb["x"], sb["y"] = x[rows], y[rows]
+            subs.append(sb)
+        return micro_batch.StepPack(subs)
+
+    def grads(pack):
+        torch.manual_seed(1)
+        lin = torch.nn.Linear(5, 3, dtype=torch.float64)
+        rn = micro_batch.rows_norm(args, pack)
+        chunks = _anima_split(args, pack)
+        for chunk, w in chunks:
+            (((lin(chunk["x"]) - chunk["y"]) ** 2).mean() * w * rn).backward()  # accumulation 1: no division
+        return chunks, lin.weight.grad.clone()
+
+    def ref(rows):
+        torch.manual_seed(1)
+        lin = torch.nn.Linear(5, 3, dtype=torch.float64)
+        (((lin(x[rows]) - y[rows]) ** 2).mean(1).sum() / 8).backward()
+        return lin.weight.grad.clone()
+
+    chunks, g = grads(pack_of([list(range(0, 3)), list(range(3, 8))]))
+    assert [c["x"].shape[0] for c, _ in chunks] == [3, 3, 2] and [w for _, w in chunks] == [3 / 8, 3 / 8, 2 / 8]
+    assert torch.allclose(g, ref(list(range(8))), rtol=1e-12, atol=1e-12)
+    last = pack_of([list(range(8, 11)), list(range(11, 13))])  # the epoch's last pack: 5 rows
+    assert micro_batch.rows_norm(args, last) == 5 / 8
+    chunks, g = grads(last)
+    assert [w for _, w in chunks] == [3 / 5, 2 / 5]
+    assert torch.allclose(g, ref(list(range(8, 13))), rtol=1e-12, atol=1e-12)
+    # the base trainer (no token budget): the pack's bucket batches themselves, weights rows / pack rows
+    import train_network
+
+    pack = pack_of([[0, 1, 2], [3, 4, 5, 6, 7]])
+    base = train_network.NetworkTrainer.split_batch_for_backward(types.SimpleNamespace(), args, None, pack, None)
+    assert [b is sb for (b, _), sb in zip(base, pack.sub_batches)] == [True, True] and [w for _, w in base] == [3 / 8, 5 / 8]
+
+
+def test_trainer_wires_step_rows():
+    """train_network.NetworkTrainer.train (source): validates --step_rows with the process count, counts the epoch's rows
+    from the datasets, takes max_train_steps from ceil(rows / N), wraps the prepared loader in a RowPacker (after
+    accelerator.prepare, before the loop), reads the step's rows through micro_batch.batch_rows, calls on_step_start per
+    bucket batch, hands the validation path one bucket batch, and resumes through skip_first_packs instead of
+    accelerate's skip_first_batches. --step_rows is a train_util argument."""
+    import inspect
+
+    import train_network
+    from library import train_util
+
+    src = inspect.getsource(train_network.NetworkTrainer.train)
+    for needle in (
+        "for message in micro_batch.step_rows_messages(args):",  # every trainer, right after assert_extra_args
+        "step_rows = micro_batch.validate_step_rows(args, accelerator.num_processes)",
+        '"ss_step_rows": step_rows,',
+        "total_batch_size = step_rows * accelerator.num_processes",
+        "rows_per_epoch = micro_batch.dataset_rows_per_epoch(train_dataset_group) if step_rows else 0",
+        "args.max_train_steps = args.max_train_epochs * pack_steps_per_epoch",
+        "train_dataloader = micro_batch.RowPacker(train_dataloader, step_rows, rows_per_epoch)",
+        "_actual_bs = micro_batch.batch_rows(batch) or args.train_batch_size",
+        "for sb in micro_batch.sub_batches(batch):",
+        "micro_batch.sub_batches(batch)[0],",
+        "skipped_dataloader = train_dataloader.skip_first_packs(initial_step - 1)",
+    ):
+        assert needle in src, needle
+    assert src.index("self.assert_extra_args(args, train_dataset_group, val_dataset_group)") \
+        < src.index("micro_batch.step_rows_messages(args)") < src.index("train_util.prepare_accelerator(args)")
+    assert src.index("training_model = network") < src.index("micro_batch.RowPacker(train_dataloader") \
+        < src.index("for step, batch in enumerate(skipped_dataloader or train_dataloader)")
+    assert '"--step_rows"' in inspect.getsource(train_util)
