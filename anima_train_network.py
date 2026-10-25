@@ -14,6 +14,7 @@ from library.device_utils import init_ipex, clean_memory_on_device
 init_ipex()
 
 from library import (
+    anima_block_compile,
     anima_models,
     anima_train_utils,
     anima_utils,
@@ -154,6 +155,37 @@ def apply_checkpointing_for_tokens(anima, args, tokens: int, unsloth: bool, swap
     return mode
 
 
+def validate_block_compile_args(args) -> None:
+    """--anima_block_compile (library/anima_block_compile.py): refused with what its compiled Block graphs cannot hold or
+    would re-trace every step. Raises ValueError."""
+    if not getattr(args, "anima_block_compile", False):
+        return
+
+    def refuse(why: str):
+        raise ValueError(f"--anima_block_compile: {why}")
+
+    if getattr(args, "use_ramtorch", False) or getattr(args, "use_ramtorch_network", False):
+        refuse("not with RamTorch (--use_ramtorch / --use_ramtorch_network): the streamed base weights change device"
+               " inside the graph")
+    if getattr(args, "blocks_to_swap", None):
+        refuse("not with --blocks_to_swap: a swapped Block's weights change device between calls (a re-trace per step)")
+    if getattr(args, "torch_compile", False):
+        refuse("not together with --torch_compile (accelerate's regional compile): the Blocks are compiled here")
+    if getattr(args, "lycoris_stock", False) and str(getattr(args, "network_module", "") or "").startswith("lycoris"):
+        refuse("not with --lycoris_stock: the stock LyCORIS forwards read org_module[0] through a bound method, which"
+               " dynamo cannot trace; the fixed paths re-bind them")
+    mode = getattr(args, "anima_block_compile_dynamic", "union")
+    if mode not in anima_block_compile.DYNAMIC_MODES:
+        refuse(f"--anima_block_compile_dynamic must be one of {anima_block_compile.DYNAMIC_MODES}, got {mode!r}")
+    raw = getattr(args, "anima_activation_memory_budget", None)
+    budget = 1.0 if raw is None else float(raw)
+    if not 0.0 < budget <= 1.0:
+        refuse(f"--anima_activation_memory_budget must be in (0, 1], got {budget}")
+    raw = getattr(args, "anima_block_compile_recompile_limit", None)
+    if (128 if raw is None else int(raw)) < 8:
+        refuse("--anima_block_compile_recompile_limit must be >= 8")
+
+
 class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def __init__(self):
         super().__init__()
@@ -173,6 +205,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         self.addift_pair_settings = None
         self._tsm_grouped_supported = True  # TSM-LoKr tsm_grouped_accumulation: see get_noise_pred_and_target
         self._ckpt_modes_logged = set()  # per-token-count checkpointing modes announced once (get_noise_pred_and_target)
+        self._train_dataset_group = None  # --anima_block_compile: the buckets' token counts (after_network_loaded)
         self._micro_batch_logged = set()  # per-sample token counts whose chunking was announced (split_batch_for_backward)
         # Cache of zero padding masks keyed by (batch, height, width, dtype, device).
         # The Anima DiT consumes padding_mask read-only (resize/expand/concat, never
@@ -401,6 +434,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         for message in validate_micro_batch_args(args):  # --anima_micro_batch_max_tokens >= 0; row-coupling options
             logger.warning(message)
         micro_batch.validate_step_rows(args)  # --step_rows: accumulation 1, batch_loss_norm_rows 0 / N (processes: train())
+        self._train_dataset_group = train_dataset_group
+        validate_block_compile_args(args)  # --anima_block_compile: no RamTorch / block swap / accelerate compile / stock LyCORIS
 
         if args.unsloth_offload_checkpointing:
             if not args.gradient_checkpointing:
@@ -1135,6 +1170,44 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
         return model_pred, target, timesteps, weighting, noise
 
+    def after_network_loaded(self, args, accelerator, network, text_encoders, unet):
+        """--anima_block_compile: torch.compile every Block's _forward with the (applied, loaded) network inside the graphs;
+        the token bands come from the training buckets (library/anima_block_compile.py)."""
+        if not getattr(args, "anima_block_compile", False):
+            return
+        anima = accelerator.unwrap_model(unet)
+        patch = anima_patch_spatial(anima)
+        counts = []
+        if self._train_dataset_group is not None:
+            counts = anima_block_compile.token_counts_from_dataset_group(self._train_dataset_group, patch)
+        if not counts:
+            logger.warning("--anima_block_compile: no bucket resolutions known; every token count compiles its own graph")
+        bands = anima_block_compile.plan_bands(counts, args.anima_block_compile_dynamic,
+                                              widen=float(args.anima_block_compile_band_widen))
+        skip = self._lycoris_fixes.mixed_timestep_chunk if getattr(self, "_lycoris_fix_on", False) else None
+        if getattr(anima, "split_attn", False):
+            logger.warning("--anima_block_compile with --split_attn: the per-row slice by the seqlens tensor is a graph break"
+                           " inside every attention call (the Blocks still run, in pieces); attn_mode torch without"
+                           " split_attn compiles whole")
+        state = anima_block_compile.compile_blocks(
+            anima,
+            bands=bands,
+            backend=args.anima_block_compile_backend,
+            mode=args.anima_block_compile_mode,
+            dynamic=args.anima_block_compile_dynamic,
+            recompile_limit=int(args.anima_block_compile_recompile_limit),
+            skip_call=skip,
+        )
+        anima_block_compile.apply_activation_memory_budget(float(args.anima_activation_memory_budget),
+                                                           bool(args.gradient_checkpointing))
+        accelerator.print(
+            f"block compile: {len(anima.blocks)} Blocks compiled per call (backend {args.anima_block_compile_backend},"
+            f" mode {args.anima_block_compile_mode or 'default'}, {args.anima_block_compile_dynamic} bands"
+            f" {state.bands or 'static'}, token counts {counts}); the first steps of every expert choice / checkpointing"
+            " regime compile (minutes on Windows), later runs reuse the inductor cache. Sample images and validation run"
+            " eager; a mixed-timestep TSM chunk (batch > 1 rows with different timesteps) runs eager."
+        )
+
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
         text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]  # compatibility
         te = self.get_models_for_text_encoding(args, accelerator, text_encoders)
@@ -1142,18 +1215,19 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
         text_encoding_strategy = strategy_base.TextEncodingStrategy.get_strategy()
         tokenize_strategy = strategy_base.TokenizeStrategy.get_strategy()
-        anima_train_utils.sample_images(
-            accelerator,
-            args,
-            epoch,
-            global_step,
-            unet,
-            vae,
-            qwen3_te,
-            tokenize_strategy,
-            text_encoding_strategy,
-            self.sample_prompts_te_outputs,
-        )
+        with anima_block_compile.pause():  # --anima_block_compile: sampling runs the eager Blocks (no extra graphs)
+            anima_train_utils.sample_images(
+                accelerator,
+                args,
+                epoch,
+                global_step,
+                unet,
+                vae,
+                qwen3_te,
+                tokenize_strategy,
+                text_encoding_strategy,
+                self.sample_prompts_te_outputs,
+            )
 
     def _lycoris_fix_sampler_timestep_scale(self):
         # LyCORIS fixed paths: the sampler calls dit(x, sigma, ...) with sigma in [0, 1]; training masks use sigma*1000
@@ -1621,12 +1695,21 @@ def prepare_anima_runtime(args) -> None:
     binds LokrModule.forward) and the compiled Block elementwise chains (~1 bf16 ulp)."""
     timestep_presets.resolve(args)  # sigmoid_scale presets; scale_resume extends max_train_epochs
     logger.info(f"Anima timestep_sampling={args.timestep_sampling}, {timestep_presets.describe(args)}")
+    block_compile = bool(getattr(args, "anima_block_compile", False))
     if not args.anima_stock_lycoris:
         install_fast_lokr_forward()
-    anima_models.enable_elementwise_compile(not args.anima_no_compile)
+    if block_compile:
+        from library import lycoris_algo_fixes
+
+        # re-bind the adapted forwards after apply_to and hoist the TSM step data (library/anima_block_compile.py)
+        lycoris_algo_fixes.set_block_compile(True)
+    # Under block compile the compiled Block graphs contain the elementwise chains and the LoKr rebuild: their own
+    # torch.compile would nest inside the Block graphs (recompile-budget storms), so both stay eager there.
+    anima_models.enable_elementwise_compile(not args.anima_no_compile and not block_compile)
     anima_models.ADALN_HOIST = bool(getattr(args, "anima_adaln_hoist", False))
     # The fast forward's LoKr+DoRA weight rebuild, fused by torch.compile (~1 bf16 ulp; 1536 b1: 2.66 -> 2.38 s/step)
-    enable_compiled_rebuild(not (args.anima_stock_lycoris or args.anima_no_compile or args.anima_no_lokr_compile))
+    enable_compiled_rebuild(not (args.anima_stock_lycoris or args.anima_no_compile or args.anima_no_lokr_compile
+                                 or block_compile))
 
 
 def setup_parser() -> argparse.ArgumentParser:
@@ -1683,6 +1766,44 @@ def setup_parser() -> argparse.ArgumentParser:
                              " per step at Anima-3.8B shapes; compiled results differ by ~1 bf16 ulp)")
     parser.add_argument("--anima_no_sample_cache", action="store_true",
                         help="sample images without the merged LoKr weight cache (slower; same results)")
+    parser.add_argument("--anima_block_compile", action="store_true",
+                        help="torch.compile every DiT Block's _forward with the LyCORIS-adapted Linears inside the graph"
+                             " (library/anima_block_compile.py): a micro-step runs ~3 compiled graph calls per Block"
+                             " instead of ~16 Python module calls and their kernels. Aimed at the host-bound small tiers"
+                             " of a multi-resolution set (the 512 / 1024 micro-steps of Anima 2.9B); the 2048 tier is"
+                             " GPU-bound and changes little. Same math; inductor rounds some fused elementwise chains"
+                             " differently (~1 bf16 ulp). The first steps of every expert choice (TSM: n_core) and"
+                             " checkpointing regime compile (minutes; later runs reuse the inductor cache). Sample images,"
+                             " validation and mixed-timestep TSM chunks (batch > 1 rows with different timesteps) run"
+                             " eager. Not with --blocks_to_swap, RamTorch, --torch_compile or --lycoris_stock. Off by"
+                             " default; measure with docs/anima_train_network.md's A/B before adopting")
+    parser.add_argument("--anima_block_compile_backend", choices=["inductor", "aot_eager", "eager"], default="inductor",
+                        help="torch.compile backend for --anima_block_compile (aot_eager / eager: tracing without"
+                             " codegen, for debugging; no speed gain)")
+    parser.add_argument("--anima_block_compile_mode", choices=["default", "reduce-overhead", "max-autotune",
+                                                                "max-autotune-no-cudagraphs"], default=None,
+                        help="inductor mode for --anima_block_compile (torch.compile(mode=...)); default = inductor's."
+                             " reduce-overhead records CUDA graphs per input shape (static tensor addresses; untested"
+                             " with the unsloth offload)")
+    parser.add_argument("--anima_block_compile_dynamic", choices=list(anima_block_compile.DYNAMIC_MODES), default="union",
+                        help="how the token axis of a compiled Block graph is marked dynamic: union (default) = one band"
+                             " from the smallest to the largest bucket token count (one graph per expert choice and"
+                             " checkpointing regime); bands = one band per resolution tier; static = no marks (one graph"
+                             " per distinct token count: every bucket compiles once)")
+    parser.add_argument("--anima_block_compile_band_widen", type=float, default=0.0,
+                        help="widen each dynamic band by this fraction on both sides (a token count outside every band runs"
+                             " a static specialization of its own); 0 = the buckets' exact range")
+    parser.add_argument("--anima_block_compile_recompile_limit", type=int, default=128,
+                        help="torch._dynamo.config.recompile_limit under --anima_block_compile: at least 2 (Block 0's"
+                             " bf16 input vs the fp32 residual) x expert choices (TSM stage 1: n_core) x checkpointing"
+                             " regimes (3 with gradient checkpointing) x bands; past it dynamo runs the Blocks eager")
+    parser.add_argument("--anima_activation_memory_budget", type=float, default=1.0,
+                        help="with --anima_block_compile and WITHOUT gradient checkpointing: torch._functorch.config."
+                             "activation_memory_budget - the fraction of the saved-for-backward activations the AOT"
+                             " partitioner may keep (below 1.0 it recomputes the cheapest intermediates in backward"
+                             " instead of saving them: a memory knob between no checkpointing and checkpointing)."
+                             " Ignored under --gradient_checkpointing (the recompute pass could select a different graph,"
+                             " pytorch #166926). 1.0 = off")
     # Anima-specific default: lower cfm_lambda than the SDXL default of 0.05
     parser.set_defaults(cfm_lambda=0.02)
     parser.add_argument("--ileco", action="store_true", help="enable dataset-backed iLECO prompt-to-prompt training")

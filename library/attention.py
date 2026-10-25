@@ -189,9 +189,16 @@ def attention(
             attn_params = AttentionParams.create_attention_params(attn_params.attn_mode, True)  # do not in-place modify
             attn_params.seqlens = torch.tensor([q.shape[1]] * q.shape[0], device=q.device)
             attn_params.max_seqlen = q.shape[1]
-        q = [transpose_fn(q[i : i + 1, : attn_params.seqlens[i]]) for i in range(len(q))]
-        k = [transpose_fn(k[i : i + 1, : attn_params.seqlens[i]]) for i in range(len(k))]
-        v = [transpose_fn(v[i : i + 1, : attn_params.seqlens[i]]) for i in range(len(v))]
+        # Loops, not comprehensions: a comprehension makes q / k / v closure cells, which turns the `del q, k, v` below
+        # into DELETE_DEREF - a bytecode torch.compile (dynamo, torch 2.7) does not trace, i.e. a graph break per
+        # attention call under --anima_block_compile. With plain locals the del is DELETE_FAST.
+        qs, ks, vs = [], [], []
+        for i in range(len(q)):
+            n = attn_params.seqlens[i]
+            qs.append(transpose_fn(q[i : i + 1, :n]))
+            ks.append(transpose_fn(k[i : i + 1, :n]))
+            vs.append(transpose_fn(v[i : i + 1, :n]))
+        q, k, v = qs, ks, vs
     else:
         q = transpose_fn(q)
         k = transpose_fn(k)

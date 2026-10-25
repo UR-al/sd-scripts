@@ -1329,12 +1329,100 @@ def _tlora_bypass_forward_diff(self, x: torch.Tensor, scale: float = 1.0) -> tor
 # ======================================================================================================================
 
 _TSM_SAMPLE_T: Dict[int, List[int]] = {}  # group id -> per-sample integer timesteps of the current batch
+
+# --anima_block_compile (library/anima_block_compile.py): set by the trainer before the network is created. The
+# compiled Block graphs trace the LyCORIS module forwards, so (1) after apply_to the adapted Linears' forwards are
+# re-bound through closures (rebind_forwards: dynamo 2.7 builds a bound method's __self__ without a source and then
+# cannot read org_module[0]), (2) set_timestep hoists the TSM expert choice / stage-2 embedding row onto the modules
+# (_hoist_tsm_step) so the graphs read a per-step tuple / index tensor instead of the integer timestep, (3) a chunk whose
+# rows carry different timesteps runs eager (mixed_timestep_chunk; its expert union changes per chunk).
+BLOCK_COMPILE = False
+
+
+def set_block_compile(enabled: bool) -> None:
+    global BLOCK_COMPILE
+    BLOCK_COMPILE = bool(enabled)
+
+
+def rebind_forwards(network) -> int:
+    """Re-bind every adapted Linear's instance forward (LyCORIS apply_to: `org_module.forward = self.forward`, a bound
+    method) to a closure over the LyCORIS module. Same call, same results; the closure cell gives dynamo a source for
+    the module, so the compiled Block graph can read `self.org_module[0]` (a plain list) - with the bound method every
+    adapted Linear is a graph break. The closure names its module as __wrapped_lora__ (NOT __self__: dynamo refuses to
+    inline any function carrying a __self__ attribute, "Inline attempt with __self__"), and lycoris_fast's sample-time
+    merged weight cache reads that name next to a bound method's __self__. Idempotent."""
+    n = 0
+    for lora in _all_loras(network):
+        org = getattr(lora, "org_module", None)
+        lin = org[0] if isinstance(org, (list, tuple)) and org else None
+        if lin is None:
+            continue
+        bound = lin.__dict__.get("forward")
+        if bound is None or getattr(bound, "__wrapped_lora__", None) is lora:
+            continue  # not patched by this module, or already re-bound
+        if getattr(bound, "__self__", None) is not lora:
+            continue  # someone else's patch (RamTorch streaming forward, a cached merge): leave it
+
+        def _make(module):
+            def forward(x, *args, **kwargs):
+                return module.forward(x, *args, **kwargs)
+
+            forward.__wrapped_lora__ = module
+            return forward
+
+        lin.forward = _make(lora)
+        n += 1
+    return n
+
+
+def mixed_timestep_chunk() -> bool:
+    """True while the current micro-step's rows carry different TSM timesteps (set_timestep stored them per group): the
+    block-compile wrapper runs such a chunk through the eager Block._forward (the masked path's expert union changes
+    with the chunk, so a compiled graph would be re-traced per combination)."""
+    return any(len(set(v)) > 1 for v in _TSM_SAMPLE_T.values())
+
+
+def _hoist_tsm_step(modules, ints: List[int]) -> None:
+    """Block compile: store this micro-step's expert choice (and the stage-2 embedding row as an index tensor) on each
+    TSM module, read by _tsm_experts / _get_timestep / _tsm_compute_gates while tracing (a single timestep); for a
+    mixed-timestep chunk clear them (the chunk runs eager, see mixed_timestep_chunk)."""
+    single = len(set(ints)) == 1
+    for m in modules:
+        d = m.__dict__
+        if not single:
+            d.pop("_hx_experts", None)
+            d.pop("_hx_tidx", None)
+            d.pop("_hx_idx", None)
+            continue
+        t = ints[0]
+        if type(m).__name__ == "TSMModule":
+            d["_hx_experts"] = _tsm_experts(m, t)
+            if int(getattr(m, "tsm_stage", 1)) == 2 and hasattr(m, "timestep_embed"):
+                w = m.timestep_embed.weight
+                t_idx = min(max(int(t) - 1, 0), int(m.tsm_num_timesteps) - 1)
+                prev = d.get("_hx_tidx")
+                if prev is not None and prev.device == w.device:
+                    prev.fill_(t_idx)  # in place: the compiled graph keeps the tensor identity (no re-guarding)
+                else:
+                    d["_hx_tidx"] = torch.tensor([t_idx], dtype=torch.long, device=w.device)
+            else:
+                d.pop("_hx_tidx", None)
+        else:  # TSMLokrModule (library/tsm_lokr.py): its own expert selection
+            idx_fn = getattr(m, "_expert_indices", None)
+            if idx_fn is not None:
+                d["_hx_idx"] = idx_fn(t)
 _TSM_EXPERTS: Dict[Tuple[Any, int, Tuple[int, ...]], Tuple[int, ...]] = {}  # (t, T, n_scales) -> expert per scale
 _TSM_PLANS: Dict[Any, Any] = {}  # per-step grouping of a mixed-timestep batch (device index tensors)
 
 
 def _tsm_experts(self, t) -> Tuple[int, ...]:
-    """Active expert per scale for timestep t (tsm.py:297-315), computed once per (t, T, n_scales)."""
+    """Active expert per scale for timestep t (tsm.py:297-315), computed once per (t, T, n_scales). Under block compile
+    the choice set_timestep hoisted onto the module (_hx_experts): the graph then guards on the expert tuple (one entry
+    per expert choice) instead of on the integer timestep (one per distinct value) and never mutates this cache."""
+    if torch.compiler.is_compiling():
+        hx = self.__dict__.get("_hx_experts")
+        if hx is not None:
+            return hx
     key = (t, self.tsm_num_timesteps, tuple(self.tsm_n_scales))
     idx = _TSM_EXPERTS.get(key)
     if idx is None:
@@ -1342,6 +1430,18 @@ def _tsm_experts(self, t) -> Tuple[int, ...]:
             _TSM_EXPERTS.clear()
         idx = _TSM_EXPERTS[key] = tuple(self._get_expert_index(t, s) for s in range(len(self.tsm_n_scales)))
     return idx
+
+
+def _tsm_get_timestep(self) -> int:
+    """TSMModule._get_timestep. Under block compile with a hoisted step (one timestep per chunk) the graph needs no
+    integer timestep - _tsm_experts reads the hoisted expert choice and _tsm_compute_gates the hoisted embedding row - so
+    a constant is returned instead of the global dict's value, which would be a guard per distinct timestep value."""
+    from lycoris.modules.tsm import TSMModule
+
+    if torch.compiler.is_compiling() and "_hx_experts" in self.__dict__:
+        if int(getattr(self, "tsm_stage", 1)) == 1 or "_hx_tidx" in self.__dict__:
+            return 0
+    return _original(TSMModule, "_get_timestep")(self)
 
 
 def _tsm_compute_gates(self, bottleneck, input_features, timestep):
@@ -1363,6 +1463,10 @@ def _tsm_compute_gates(self, bottleneck, input_features, timestep):
             fc_b = self.router_fc.bias.to(device)
             embed_w = self.timestep_embed.weight.to(device)
             fc_out = F.linear(z.to(fc_w.dtype), fc_w, fc_b)
+            if torch.compiler.is_compiling():
+                hx_idx = self.__dict__.get("_hx_tidx")  # block compile: the row as a per-step index tensor (set_timestep)
+                if hx_idx is not None:
+                    return fc_out + embed_w.index_select(0, hx_idx.to(embed_w.device)).squeeze(0)
             t_idx = min(max(int(timestep) - 1, 0), self.tsm_num_timesteps - 1)
             # the row tsm.py:384 picks, by a Python int: torch.tensor(t, device=cuda) is a blocking copy per call
             return fc_out + embed_w[t_idx]
@@ -1678,6 +1782,10 @@ def _tsm_scale(self) -> Tuple[Any, Optional[float]]:
     k = float(self.scale) * self.multiplier
     if isinstance(sc, nn.Parameter):  # use_scalar: trained (or frozen) value, never assumed to be 1.0
         return sc, k
+    if torch.compiler.is_compiling():
+        # block compile: the data_ptr / version cache below is not traceable; hand the 0-d buffer itself to the graph
+        # (read at run time, so an apply_max_norm / load_weight_hook write is seen; one fused multiply, no host sync)
+        return sc * k, None
     key = (sc.data_ptr(), sc._version)
     cached = self.__dict__.get("_tsm_scalar_cache")
     if cached is None or cached[0] != key:
@@ -3340,6 +3448,8 @@ def apply_module_patches() -> None:
         " or _TSMLinear for the fp32 low-rank part; tsm_expert_fn=True: the experimental _TSMExpertLinear;"
         " tsm_fused=False: org_forward + separate delta)")
     add(TSMModule, "_compute_gates", _tsm_compute_gates, "gate pooling over all leading axes (tsm.py:362-371), no sync")
+    add(TSMModule, "_get_timestep", _tsm_get_timestep,
+        "block compile: no integer timestep inside a compiled graph (hoisted expert choice / embedding row)")
 
     add(LoConModule, "forward", _locon_forward,
         "plain LoRA/LoCon Linear rebuild as two thin matmuls (DoRA keeps the stock forward; GoRA/RaLoRA/LoRA2: _lf_forward)")
@@ -3587,6 +3697,9 @@ def after_network_created(network, args, logger=logger) -> None:
     net_args = _parse_network_args(args)
     algo = (net_args.get("algo", "lora") or "lora").lower()
     cfg.update({"installed": True, "algo": algo})
+    if BLOCK_COMPILE:
+        n = rebind_forwards(network)
+        logger.info(f"block compile: {n} adapted module forwards re-bound through closures (traceable by dynamo)")
     if algo == "tsm" and int(float(net_args.get("tsm_stage", 1) or 1)) == 2:
         cfg["tsm_gate_init"] = float(net_args.get("tsm_gate_init", 0.0) or 0.0)
     dim = getattr(args, "network_dim", None)
@@ -4212,6 +4325,8 @@ def set_timestep(network, timesteps, max_timestep: int = 1000) -> None:
                 _TSM_SAMPLE_T[g] = ints
             else:
                 _TSM_SAMPLE_T.pop(g, None)
+        if BLOCK_COMPILE:
+            _hoist_tsm_step(tsm, ints)
         cfg = _network_cfg(network)
         if cfg.get("tsm_lokr") and torch.is_grad_enabled() and "tsm_timestep_dtype" not in cfg:
             from library import tsm_lokr

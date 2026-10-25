@@ -54,6 +54,7 @@ jobs:
           python -m pytest
           tests/test_anima38_integration.py
           tests/test_anima_adaln_hoist.py
+          tests/test_anima_block_compile.py
           tests/test_anima_te_caption_cache.py
           tests/test_anima_speedups.py
           tests/test_caption_lines_and_alpha.py
