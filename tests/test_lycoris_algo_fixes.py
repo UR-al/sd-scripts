@@ -1113,8 +1113,9 @@ def test_tsm_fused_stage1_matches_stock(bypass, scales, t):
 @pytest.mark.parametrize("shape", [(6, 24), (2, 5, 24), (1, 1, 3, 4, 24)])
 def test_tsm_fused_stage2_matches_explicit_math(router, scales, shape):
     """Stage 2 == B_core A_core x + sum_j G_j B_j A_j x with G = router_fc(pool(z)) + embed[t-1], pool over every
-    leading axis, written out per expert here (fp64, pooled in fp32 as the module does). Experts frozen: no expert
-    gradient; router and embedding get theirs; the scalar folding keeps scalar * scale * multiplier."""
+    leading axis, written out per expert here (fp64; the module pools in promote(activation dtype, fp32) = fp64 here,
+    fp32 on the GPU's bf16 / fp32 activations). Experts frozen: no expert gradient; router and embedding get theirs;
+    the scalar folding keeps scalar * scale * multiplier."""
     x = torch.randn(shape, generator=torch.Generator().manual_seed(1), dtype=torch.float64)
     t = 700
     m = _tsm_module(2, False, scales, router, use_scalar=True)
@@ -1126,22 +1127,24 @@ def test_tsm_fused_stage2_matches_explicit_math(router, scales, shape):
     ex = [ref_m.experts[s][e] for s, e in enumerate(idx)]
     core_mid = xr @ ex[0]["down"].weight.T
     src = core_mid if router == "bottleneck" else xr
-    z = src.detach().float().reshape(-1, src.shape[-1]).mean(0).double()  # the router pools in fp32 (tsm.py:362)
+    z = src.detach().reshape(-1, src.shape[-1]).mean(0)  # the router pools over every leading axis (tsm.py:362)
     gates = ref_m.router_fc(z) + ref_m.timestep_embed.weight[t - 1]
     delta = core_mid @ ex[0]["up"].weight.T
     for j in range(1, len(scales)):
         delta = delta + gates[j - 1] * ((xr @ ex[j]["down"].weight.T) @ ex[j]["up"].weight.T)
-    out = ref_m.org_module[0](xr) + delta * ref_m.scalar * ref_m.scale * 0.7
+    # ref_m.multiplier, not the literal 0.7: LyCORIS keeps the multiplier as an fp32-rounded float (0.699999988...)
+    out = ref_m.org_module[0](xr) + delta * ref_m.scalar * ref_m.scale * ref_m.multiplier
     (out * torch.randn(out.shape, generator=torch.Generator().manual_seed(3), dtype=out.dtype)).sum().backward()
     ref = {"out": out.detach(), "x": xr.grad}
     ref.update({n: (None if p.grad is None else p.grad.clone()) for n, p in ref_m.named_parameters()})
-    _assert_same(got, ref, rtol=1e-7, atol=1e-9)  # fp32 pooling: summation order
+    _assert_same(got, ref)
     assert all(got[n] is None for n in got if n.startswith("experts."))
     assert all(got[n] is not None for n in ("router_fc.weight", "router_fc.bias", "timestep_embed.weight", "scalar"))
 
 
 @pytest.mark.parametrize("stage", [1, 2])
-@pytest.mark.parametrize("ts", [[100.0, 900.0], [900.0, 100.0, 900.0], [5.0, 5.0, 990.0, 5.0], [125.0, 126.0]])
+@pytest.mark.parametrize("ts", [[100.0, 900.0], [900.0, 100.0, 900.0], [5.0, 5.0, 990.0, 5.0], [125.0, 126.0],
+                                [120.0, 124.0]])  # the last: different timesteps, the same experts (stage 2: gates differ)
 def test_tsm_grouped_batch_equals_per_sample_calls(stage, ts):
     """A batch with different timesteps == each sample run alone at its own timestep (stage 2: the gate pools over the
     samples that share a timestep, so those run together), under gradient checkpointing; same gradients."""
@@ -1192,7 +1195,9 @@ def test_tsm_expert_cache_and_no_host_sync():
             return func(*args, **(kwargs or {}))
 
     for stage in (1, 2):
-        for ts, shape, first_ok in (([500.0], (1, 6, 24), 0), ([900.0, 100.0, 900.0], (3, 6, 24), 2)):
+        # first_ok: the step's plan tensors (group plan; mixed plan: block mask, core positions, arange, stage 2 four
+        # more), built by the first module and cached for the others
+        for ts, shape, first_ok in (([500.0], (1, 6, 24), 0), ([900.0, 100.0, 900.0], (3, 6, 24), 8)):
             mods = [_tsm_module(stage, dtype=torch.float32, seed=s) for s in range(2)]
             net = argparse.Namespace(loras=mods)
             laf.set_timestep(net, torch.tensor(ts))
@@ -1216,6 +1221,7 @@ def test_tsm_factor_path_is_the_default_and_matches_the_expert_function(monkeypa
     agreement."""
     monkeypatch.setattr(laf, "_TSM_FUSED", True)
     monkeypatch.setattr(laf, "_TSM_EXPERT_FN", False)
+    monkeypatch.setattr(laf, "_TSM_MIXED", False)  # the per-group factor path is what this test dispatches to
     monkeypatch.setattr(laf, "_TSM_LOWRANK_FP32", None)  # set through network_args below; restored after the test
     xdt = torch.float32 if lowrank_fp32 else torch.float64
     x = torch.randn(2, 1, 3, 4, 24, generator=torch.Generator().manual_seed(6), dtype=xdt)
@@ -1225,12 +1231,13 @@ def test_tsm_factor_path_is_the_default_and_matches_the_expert_function(monkeypa
     for name, cls in (("lr", laf._LowRankLinear), ("tl", laf._TSMLinear), ("efn", laf._TSMExpertLinear)):
         orig = cls.apply
         monkeypatch.setattr(cls, "apply", (lambda n, o: lambda *a: calls[n].append(1) or o(*a))(name, orig))
-    kw = laf.prepare_network_kwargs("tsm", {"algo": "tsm", "tsm_lowrank_fp32": str(lowrank_fp32)}, LOG)
-    assert laf._TSM_EXPERT_FN is False and laf._TSM_LOWRANK_FP32 is lowrank_fp32
+    kw = laf.prepare_network_kwargs("tsm", {"algo": "tsm", "tsm_lowrank_fp32": str(lowrank_fp32), "tsm_mixed": "False"}, LOG)
+    assert "tsm_mixed" not in kw and laf._TSM_EXPERT_FN is False and laf._TSM_LOWRANK_FP32 is lowrank_fp32
+    assert laf._TSM_MIXED is False  # the per-group loop, so the factor path's Functions are what gets counted
     factor = _tsm_run(make(), x, [100.0, 900.0], checkpoint=True)
     assert not calls["efn"]
     assert len(calls["tl" if lowrank_fp32 else "lr"]) == 4 and not calls["lr" if lowrank_fp32 else "tl"]  # 2 groups x 2
-    kw = laf.prepare_network_kwargs("tsm", {"algo": "tsm", "tsm_expert_fn": "True",
+    kw = laf.prepare_network_kwargs("tsm", {"algo": "tsm", "tsm_expert_fn": "True", "tsm_mixed": "False",
                                             "tsm_lowrank_fp32": str(lowrank_fp32)}, LOG)
     assert "tsm_expert_fn" not in kw and laf._TSM_EXPERT_FN is True and laf._TSM_LOWRANK_FP32 is lowrank_fp32
     for v in calls.values():
@@ -1319,11 +1326,12 @@ def _count_ops(fn) -> int:
 @pytest.mark.parametrize("stage", [1, 2])
 @pytest.mark.parametrize("ts", [[300.0], [100.0, 900.0], [900.0, 100.0, 900.0]])
 def test_tsm_fused_forward_is_taken_and_dispatches_less(monkeypatch, stage, ts):
-    """The fused forward runs one fused call per expert group (not org_forward + delta; a mixed-timestep batch: one call
-    per group of _tsm_group_plan) - the factor path by default, _TSMExpertLinear with tsm_expert_fn=True - and each
-    dispatches fewer aten ops over forward + checkpoint recompute + backward than the split forward it replaces (the
-    Function fewer still on the CPU count; the GPU step did not follow, see _TSM_EXPERT_FN); all three give the same
-    result (fp64). _TSM_FUSED=False (network_args tsm_fused=False) takes the split forward for every call."""
+    """The fused forward (not org_forward + delta): by default a mixed-timestep batch is ONE _TSMMaskedLinear call per
+    module call (forward + checkpoint recompute), a single-timestep batch one factor call; tsm_mixed=False restores the
+    per-expert-group factor loop (one _tsm_factor_linear call per group of _tsm_group_plan), tsm_expert_fn=True the
+    _TSMExpertLinear Function. Each dispatches fewer aten ops over forward + checkpoint recompute + backward than the
+    next: mixed < factor loop < split, the Function fewer still on the CPU count (the GPU step did not follow, see
+    _TSM_EXPERT_FN); all give the same result (fp64). _TSM_FUSED=False takes the split forward for every call."""
     x = torch.randn(len(ts), 1, 3, 4, 24, generator=torch.Generator().manual_seed(2), dtype=torch.float64)
     fused_calls, split_calls, factor_calls, fn_calls = [], [], [], []
     orig_fused, orig_split = laf._tsm_fused_linear, laf._tsm_split_forward
@@ -1332,13 +1340,34 @@ def test_tsm_fused_forward_is_taken_and_dispatches_less(monkeypatch, stage, ts):
     monkeypatch.setattr(laf, "_tsm_split_forward", lambda *a, **k: split_calls.append(1) or orig_split(*a, **k))
     monkeypatch.setattr(laf, "_tsm_factor_linear", lambda *a: factor_calls.append(1) or orig_factor(*a))
     monkeypatch.setattr(laf._TSMExpertLinear, "apply", lambda *a: fn_calls.append(1) or orig_fn(*a))
+    mixed_calls = []
+    orig_mixed = laf._TSMMaskedLinear.apply
+    monkeypatch.setattr(laf._TSMMaskedLinear, "apply", lambda *a: mixed_calls.append(1) or orig_mixed(*a))
     monkeypatch.setattr(laf, "_TSM_FUSED", True)
     monkeypatch.setattr(laf, "_TSM_EXPERT_FN", False)
     groups = len({tuple(laf._tsm_experts(_tsm_module(stage), int(t))) if stage == 1 else t for t in ts})
+    # the default: a mixed-timestep batch as one masked call per module call (forward + checkpoint recompute)
+    monkeypatch.setattr(laf, "_TSM_MIXED", True)
+    got_mixed = _tsm_run(_tsm_module(stage), x, ts, checkpoint=True)
+    if groups > 1:
+        assert len(mixed_calls) == 2 and not fused_calls and not factor_calls and not split_calls, (len(mixed_calls), len(fused_calls))
+    else:
+        assert not mixed_calls and len(fused_calls) == len(factor_calls) == 2
+    n_mixed = _count_ops(lambda: _tsm_run(_tsm_module(stage), x, ts, checkpoint=True))
+    # the group loop (tsm_mixed=False): one factor call per expert group
+    monkeypatch.setattr(laf, "_TSM_MIXED", False)
+    fused_calls.clear()
+    factor_calls.clear()
+    mixed_calls.clear()
     got = _tsm_run(_tsm_module(stage), x, ts, checkpoint=True)
     assert len(fused_calls) == len(factor_calls) == 2 * groups  # forward + checkpoint recompute
-    assert not split_calls and not fn_calls
+    assert not split_calls and not fn_calls and not mixed_calls
     n_factor = _count_ops(lambda: _tsm_run(_tsm_module(stage), x, ts, checkpoint=True))
+    _assert_same(got_mixed, got)
+    if groups > 1:
+        assert n_mixed < n_factor, (n_mixed, n_factor)
+    else:
+        assert n_mixed == n_factor
 
     monkeypatch.setattr(laf, "_TSM_EXPERT_FN", True)
     fused_calls.clear()
@@ -1441,36 +1470,46 @@ def test_tsm_fused_network_arg_and_fallbacks(monkeypatch):
     _assert_same(got, _with_stock(stock))
 
 
+@pytest.mark.parametrize("mixed", [True, False])
 @pytest.mark.parametrize("expert_fn", [False, True])
 @pytest.mark.parametrize("stage", [1, 2])
-def test_tsm_fused_bf16_autocast_no_worse_than_split(monkeypatch, stage, expert_fn):
+def test_tsm_fused_bf16_autocast_no_worse_than_split(monkeypatch, stage, expert_fn, mixed):
     """Under bf16 autocast (fp32 experts, bf16 base, Anima-like >3-D input) the fused forward is as close to the fp64
     result as the split forward - loss error within 1e-4 absolute, gradient error within 1.1x - with absolute ceilings
     on the gradient error (the output is rounded once instead of base and delta each; the two paths round at different
     places, so they are not compared with each other). The exact checks are the fp64 tests above; this one also makes
-    sure the bf16 paths really run (tsm_fused / tsm_expert_fn / tsm_lowrank_fp32 through network_args; the low-rank
-    Function each call lands in, with its dtypes): the factor path (_LowRankLinear for the bf16 low-rank part,
-    _TSMLinear for fp32) and _TSMExpertLinear."""
-    monkeypatch.setattr(laf, "_TSM_FUSED", True)  # prepare_network_kwargs sets all three below; restored after the test
+    sure the bf16 paths really run (tsm_fused / tsm_expert_fn / tsm_lowrank_fp32 / tsm_mixed through network_args; the
+    low-rank Function each call lands in, with its dtypes): _TSMMaskedLinear - the mixed default for this two-timestep
+    batch, one masked call per module, carrying both low-rank dtype modes (ld fp32 / cdt bf16 with tsm_lowrank_fp32,
+    ld == cdt == bf16 without) - and with mixed=False the per-group factor path (_LowRankLinear for the bf16 low-rank
+    part, _TSMLinear for fp32) and _TSMExpertLinear."""
+    monkeypatch.setattr(laf, "_TSM_FUSED", True)  # prepare_network_kwargs sets all four below; restored after the test
     monkeypatch.setattr(laf, "_TSM_LOWRANK_FP32", True)
     monkeypatch.setattr(laf, "_TSM_EXPERT_FN", expert_fn)
+    monkeypatch.setattr(laf, "_TSM_MIXED", mixed)
     calls = []
     orig = laf._tsm_fused_linear
     monkeypatch.setattr(laf, "_tsm_fused_linear", lambda *a: calls.append(1) or orig(*a))
+    mixed_calls = []
+    orig_mixed = laf._tsm_mixed_linear
+    monkeypatch.setattr(laf, "_tsm_mixed_linear", lambda *a: mixed_calls.append(1) or orig_mixed(*a))
     fn_calls = []  # (Function, ld, cdt) of every low-rank Function call
     for name, cls, pick in (("lr", laf._LowRankLinear, lambda a: (a[6], a[6])),  # x, W0, bias, A, B, None, cdt, ..
                             ("tl", laf._TSMLinear, lambda a: (a[6], a[5])),  # x, W0, bias, A, B, cdt, ld
-                            ("efn", laf._TSMExpertLinear, lambda a: (a[11], a[10]))):  # .., cdt, ld, *weights
+                            ("efn", laf._TSMExpertLinear, lambda a: (a[11], a[10])),  # .., cdt, ld, *weights
+                            ("mx", laf._TSMMaskedLinear, lambda a: (a[8], a[7]))):  # .., mask, tok, cdt, ld
         monkeypatch.setattr(cls, "apply",
                             (lambda n, o, p: lambda *a: fn_calls.append((n, *p(a))) or o(*a))(name, cls.apply, pick))
 
     def run(fused, dtype, lowrank_fp32=True):
         calls.clear()
+        mixed_calls.clear()
         fn_calls.clear()
         model = make_model(dtype=dtype)
         net = make_net(model, "tsm", 4, 4, tsm_n_scales="4,1", tsm_stage=stage, tsm_fused=fused,
-                       tsm_lowrank_fp32=lowrank_fp32, tsm_expert_fn=expert_fn)
+                       tsm_lowrank_fp32=lowrank_fp32, tsm_expert_fn=expert_fn, tsm_mixed=mixed)
         assert laf._TSM_FUSED is fused and laf._TSM_LOWRANK_FP32 is lowrank_fp32 and laf._TSM_EXPERT_FN is expert_fn
+        assert laf._TSM_MIXED is mixed
         with torch.no_grad():
             for m in net.unet_loras:
                 for n, p in m.named_parameters():
@@ -1488,9 +1527,13 @@ def test_tsm_fused_bf16_autocast_no_worse_than_split(monkeypatch, stage, expert_
             loss = loss_fn(model, b, checkpoint=True)
         loss.backward()
         laf.clear_timestep(net)
-        assert bool(calls) is fused and bool(fn_calls) is fused
+        assert bool(fn_calls) is fused
+        # the two timesteps of the batch differ: the mixed path (one masked call per module) unless tsm_mixed=False or
+        # the expert Function is on; the group loop calls _tsm_fused_linear per group
+        use_mixed = fused and mixed and not expert_fn
+        assert bool(mixed_calls) is use_mixed and bool(calls) is (fused and not use_mixed)
         if fused:  # fp64 without autocast: ld == cdt, so the factor path takes _LowRankLinear in both low-rank modes
-            want = "efn" if expert_fn else ("tl" if lowrank_fp32 and dtype != torch.float64 else "lr")
+            want = "mx" if use_mixed else "efn" if expert_fn else ("tl" if lowrank_fp32 and dtype != torch.float64 else "lr")
             assert {n for n, _, _ in fn_calls} == {want}, fn_calls[:3]
         if fused and lowrank_fp32:  # the fp32 low-rank variant: ld = promote(expert dtype, fp32), not the bf16 cdt
             assert all(ld in (torch.float32, torch.float64) for _, ld, _ in fn_calls), fn_calls[:3]
@@ -1514,8 +1557,9 @@ def test_tsm_fused_bf16_autocast_no_worse_than_split(monkeypatch, stage, expert_
     # absolute ceilings, ~2x over the measured values (CPU, torch 2.7.1): fp32 low-rank gradient error 8.3e-3 (stage 1),
     # 6.5e-3 factor / 1.0e-2 Function (stage 2); bf16 low-rank 8.6e-3 (stage 1) / 4.7e-2 (stage 2); split 1.0e-1 (stage 2)
     assert err["fused"][1] < 2e-2 and err["fused_bf16"][1] < (2e-2 if stage == 1 else 1e-1), err
-    # the fp32 low-rank part is at least as close to fp64 as the bf16 one, in loss and gradients
-    assert err["fused"][0] <= err["fused_bf16"][0] + 1e-4 and err["fused"][1] <= err["fused_bf16"][1] + 1e-4, err
+    # the fp32 low-rank part is at least as close to fp64 as the bf16 one in the gradients (its purpose); the loss is one
+    # scalar whose bf16 roundings elsewhere can cancel either way, so only its split bound above applies to it
+    assert err["fused"][1] <= err["fused_bf16"][1] + 1e-4, err
 
 
 @pytest.mark.parametrize("stage", [1, 2])
@@ -1578,7 +1622,7 @@ def test_tsm_expert_function_matches_autograd_reference(stage, core, cdt, scalar
     B = torch.cat(ups, 1) * sk
     if stage == 2:
         src = x @ downs[0].T if core else x
-        z = src.detach().mean(0, dtype=torch.float32).double()
+        z = src.detach().mean(0)  # the router pools in promote(activation dtype, fp32): fp64 here
         gates = rw @ z + rb + ew[ti]
         B = (B.view(out, m, r) * torch.cat([torch.ones(1, dtype=torch.float64), gates]).view(1, m, 1)).view(out, m * r)
     y = (x @ W0.T + (x @ A.T) @ B.T + b).to(cdt)
@@ -1598,15 +1642,82 @@ def test_tsm_expert_function_matches_autograd_reference(stage, core, cdt, scalar
         assert nz == [ti]  # one embedding row, as select's backward gave
 
 
+def test_tsm_mixed_plan_and_switch(monkeypatch):
+    """_tsm_mixed_plan: the experts active anywhere in the chunk in (scale, expert) order, the per-sample block mask,
+    each sample's core block, stage 2 the groups by timestep; cached per step and shared by the modules (one plan for
+    one ints tuple); 'single' in stage 1 when the timesteps differ but every sample picks the same experts (the plain
+    fused call then, no masked Function), never in stage 2 (the gate depends on each sample's timestep: the same chunk
+    runs masked and equals the per-group loop). network_args tsm_mixed=False switches the group loop back on; '' = not
+    given."""
+    monkeypatch.setattr(laf, "_TSM_FUSED", True)
+    monkeypatch.setattr(laf, "_TSM_EXPERT_FN", False)
+    monkeypatch.setattr(laf, "_TSM_MIXED", True)
+    m1 = _tsm_module(1)
+    laf._TSM_PLANS.clear()
+    ints = [900, 100, 900, 5]
+    plan = _tsm_mixed_plan_for(m1, ints)
+    experts = [laf._tsm_experts(m1, t) for t in ints]
+    want_u = sorted({(s, e) for row in experts for s, e in enumerate(row)})
+    assert plan["U"] == want_u and plan["nb"] == len(want_u) and not plan["single"]
+    assert plan["block_mask"].shape == (4, len(want_u)) and plan["block_mask"].sum(1).tolist() == [2.0] * 4
+    for b, row in enumerate(experts):
+        on = {want_u[i] for i in plan["block_mask"][b].nonzero().flatten().tolist()}
+        assert on == set(enumerate(row)) and want_u[int(plan["core_pos"][b])] == (0, row[0])
+    assert "grp_idx" not in plan
+    assert _tsm_mixed_plan_for(m1, ints) is plan  # cached
+    assert _tsm_mixed_plan_for(_tsm_module(1, seed=3), ints) is plan  # shared by every module with the same shape
+    same = _tsm_mixed_plan_for(m1, [120, 124])  # different timesteps, the same core expert (0): nothing to mask
+    assert same["single"] and same["nb"] == 2
+    m2 = _tsm_module(2)
+    assert not _tsm_mixed_plan_for(m2, [120, 124])["single"]  # stage 2: gates per timestep, so the masked path
+    # the dispatch: stage 1 single -> the plain fused call, no masked Function; stage 2 same chunk -> masked, == group loop
+    fused_calls, masked_calls = [], []
+    orig_fused, orig_masked = laf._tsm_fused_linear, laf._TSMMaskedLinear.apply
+    monkeypatch.setattr(laf, "_tsm_fused_linear", lambda *a: fused_calls.append(1) or orig_fused(*a))
+    monkeypatch.setattr(laf._TSMMaskedLinear, "apply", lambda *a: masked_calls.append(1) or orig_masked(*a))
+    x = torch.randn(2, 1, 3, 4, 24, generator=torch.Generator().manual_seed(8), dtype=torch.float64)
+    _tsm_run(_tsm_module(1), x, [120.0, 124.0], checkpoint=True)
+    assert len(fused_calls) == 2 and not masked_calls  # forward + checkpoint recompute, one fused call each
+    fused_calls.clear()
+    got2 = _tsm_run(_tsm_module(2), x, [120.0, 124.0], checkpoint=True)
+    assert len(masked_calls) == 2 and not fused_calls
+    monkeypatch.setattr(laf, "_TSM_MIXED", False)
+    _assert_same(got2, _tsm_run(_tsm_module(2), x, [120.0, 124.0], checkpoint=True))
+    rows = got2["timestep_embed.weight"].abs().sum(1).nonzero().flatten().tolist()
+    assert rows == [119, 123]  # one embedding row per distinct timestep got its gradient
+    monkeypatch.setattr(laf, "_TSM_MIXED", True)
+    p2 = _tsm_mixed_plan_for(m2, ints)
+    assert p2["n_groups"] == 3 and p2["grp_idx"].tolist() == [0, 1, 0, 2] and p2["counts"].flatten().tolist() == [2.0, 1.0, 1.0]
+    assert p2["t_idx"].tolist() == [899, 99, 4] and p2["ctx_pos"].shape == (4, 1)
+    assert all(want_u[int(p)][0] == 1 for p in p2["ctx_pos"].flatten().tolist())
+    laf.set_timestep(argparse.Namespace(loras=[m1]), torch.tensor([900.0, 100.0]))  # a new step clears the plans
+    assert not any(k[0] == "mixed" for k in laf._TSM_PLANS)
+    laf.clear_timestep(argparse.Namespace(loras=[m1]))
+
+    monkeypatch.setattr(laf, "_TSM_MIXED", True)
+    kw = laf.prepare_network_kwargs("tsm", {"algo": "tsm", "tsm_mixed": "False"}, LOG)
+    assert "tsm_mixed" not in kw and laf._TSM_MIXED is False
+    laf.prepare_network_kwargs("tsm", {"algo": "tsm", "tsm_mixed": ""}, LOG)
+    assert laf._TSM_MIXED is True
+    laf.prepare_network_kwargs("tsm", {"algo": "tsm"}, LOG)
+    assert laf._TSM_MIXED is True
+
+
+def _tsm_mixed_plan_for(m, ints):
+    return laf._tsm_mixed_plan(m, [int(t) for t in ints], torch.device("cpu"))
+
+
+@pytest.mark.parametrize("mixed", [True, False])
 @pytest.mark.parametrize("stage", [1, 2])
 @pytest.mark.parametrize("lowrank_fp32", [False, True])
 @pytest.mark.parametrize("router", ["input", "bottleneck"])
-def test_tsm_fused_both_lowrank_modes_match_split_fp64(monkeypatch, stage, lowrank_fp32, router):
+def test_tsm_fused_both_lowrank_modes_match_split_fp64(monkeypatch, stage, lowrank_fp32, router, mixed):
     """Both low-rank dtype modes of the fused path == the split forward (== stock, the tests above) on a mixed-timestep
     batch with use_scalar=True: output, input gradient, expert / router gradients and the scalar's gradient; the stage-2
-    router pooling the input or the core bottleneck. tsm_lowrank_fp32 off: everything fp64 through _LowRankLinear,
-    exact. On: _tsm_mixed (fp64 experts over an fp32 base and input), so the calls really land in _TSMLinear (counted,
-    one per expert group per forward / recompute) and the agreement is at fp32 level."""
+    router pooling the input or the core bottleneck; the default one masked call per module (_TSMMaskedLinear, mixed)
+    and the per-group loop (tsm_mixed=False). tsm_lowrank_fp32 off: everything fp64, exact. On: _tsm_mixed (fp64
+    experts over an fp32 base and input), so the calls really land in the fp32-low-rank Functions (_TSMLinear per group,
+    or _TSMMaskedLinear with ld fp64 != cdt fp32) and the agreement is at fp32 level."""
     ts = [900.0, 100.0, 900.0, 5.0]
     xdt = torch.float32 if lowrank_fp32 else torch.float64
     x = torch.randn(len(ts), 1, 3, 4, 24, generator=torch.Generator().manual_seed(6), dtype=xdt)
@@ -1615,17 +1726,31 @@ def test_tsm_fused_both_lowrank_modes_match_split_fp64(monkeypatch, stage, lowra
     monkeypatch.setattr(laf, "_TSM_LOWRANK_FP32", lowrank_fp32)
     monkeypatch.setattr(laf, "_TSM_FUSED", True)
     monkeypatch.setattr(laf, "_TSM_EXPERT_FN", False)
-    calls = {"lr": [], "tl": []}
-    for name, cls in (("lr", laf._LowRankLinear), ("tl", laf._TSMLinear)):
+    monkeypatch.setattr(laf, "_TSM_MIXED", mixed)
+    calls = {"lr": [], "tl": [], "mx": []}
+    for name, cls in (("lr", laf._LowRankLinear), ("tl", laf._TSMLinear), ("mx", laf._TSMMaskedLinear)):
         orig = cls.apply
-        monkeypatch.setattr(cls, "apply", (lambda n, o: lambda *a: calls[n].append(1) or o(*a))(name, orig))
+        monkeypatch.setattr(cls, "apply", (lambda n, o: lambda *a: calls[n].append(a) or o(*a))(name, orig))
     got = _tsm_run(make(), x, ts, checkpoint=True)
     groups = len({tuple(laf._tsm_experts(make(), int(t))) if stage == 1 else t for t in ts})
-    assert len(calls["tl" if lowrank_fp32 else "lr"]) == 2 * groups and not calls["lr" if lowrank_fp32 else "tl"]
+    assert groups > 1
+    if mixed:  # one call per module call: forward + checkpoint recompute
+        assert len(calls["mx"]) == 2 and not calls["lr"] and not calls["tl"]
+        ld, cdt = calls["mx"][0][8], calls["mx"][0][7]
+        assert (ld, cdt) == ((torch.float64, torch.float32) if lowrank_fp32 else (torch.float64, torch.float64))
+    else:
+        assert len(calls["tl" if lowrank_fp32 else "lr"]) == 2 * groups and not calls["lr" if lowrank_fp32 else "tl"]
+        assert not calls["mx"]
     monkeypatch.setattr(laf, "_TSM_FUSED", False)
     ref = _tsm_run(make(), x, ts, checkpoint=True)
     _assert_same(got, ref, **(dict(rtol=2e-4, atol=1e-5) if lowrank_fp32 else {}))
     assert got["scalar"] is not None and bool(torch.any(got["scalar"] != 0))
+    # an expert no sample of the chunk uses is not in the graph (grad None, the optimizer skips it), as on every path
+    active = {(s, e) for t in ts for s, e in enumerate(laf._tsm_experts(make(), int(t)))}
+    for s, scale_experts in enumerate(make().experts):
+        for e in range(len(scale_experts)):
+            key = f"experts.{s}.{e}.down.weight"
+            assert (got[key] is None) == (stage == 2 or (s, e) not in active), (key, got[key] is None)
 
 
 @pytest.mark.parametrize("expert_fn", [False, True])

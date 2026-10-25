@@ -55,6 +55,12 @@ The module header of `library/lycoris_algo_fixes.py` lists, per algo, what stock
   GEMM and the input gradient stay bf16, the delta is rounded once into the base GEMM. `tsm_expert_fn=True` (opt-in,
   default off) uses one autograd Function per call that takes the expert weights directly (`_TSMExpertLinear`); on the
   GPU it held ~1.3 GiB more at the 2048-tier peak and was not faster, so the default stays the factor path.
+  A chunk whose samples have different timesteps (batch > 1 with per-sample timesteps) runs as ONE masked call per
+  module (`_TSMMaskedLinear`): A / B hold every expert active anywhere in the chunk and a per-sample mask over their
+  blocks (the router gate on the context block in stage 2) zeroes the other experts' columns of the bottleneck, so the
+  per-module cost no longer grows with the number of distinct timesteps in the chunk (the previous per-group loop made
+  a 4-row chunk cost 4 calls per module, which is why micro-batching bought TSM nothing). Same math, same gradients, an
+  expert no sample uses stays out of the graph (grad None); `tsm_mixed=False` restores the per-group loop.
 
 Known limitation: GoRA / RaLoRA / LoRA² with DoRA on the factored path (`_LowRankDoRA`, RaLoRA blocks): a `dora_scale`
 entry that is exactly 0 on a nonzero base row (LyCORIS never initialises one, it starts at `||W0_i||`; only a file

@@ -44,9 +44,10 @@
 #             (tsm.py:538-545), gate pooling breaks on >3-D inputs (tsm.py:362-371); no Forge adapter. Speed: rebuild
 #             mode builds a dense delta weight per module per call, bypass runs one matmul pair per expert; the flag
 #             runs the base GEMM with the concatenated active experts' delta as its C input and a hand-written backward
-#             (_LowRankLinear / _TSMLinear on the concatenated factors; network_args tsm_fused=False keeps org_forward +
-#             a separate delta, tsm_lowrank_fp32 picks fp32 expert projections - default stage 2 only, tsm_expert_fn=True
-#             the experimental one-Function path _TSMExpertLinear).
+#             (_LowRankLinear / _TSMLinear on the concatenated factors; a mixed-timestep chunk as ONE masked call per
+#             module, _TSMMaskedLinear, instead of one per expert group; network_args tsm_fused=False keeps org_forward +
+#             a separate delta, tsm_mixed=False the per-group loop, tsm_lowrank_fp32 picks fp32 expert projections -
+#             default stage 2 only, tsm_expert_fn=True the experimental one-Function path _TSMExpertLinear).
 #   lora, locon   PiSSA (init_weights=pissa): saved at half strength (alpha kept for the doubled rank, locon.py:922-941),
 #             with a pissa_converted key Forge does not read; --resume / --network_weights failed (locon.py:898-962);
 #             with alpha != dim the base model changed at step 0 (locon.py:404-407). Speed: see "factored training
@@ -1354,8 +1355,9 @@ def _tsm_compute_gates(self, bottleneck, input_features, timestep):
         if isinstance(src, torch.Tensor) and src.dim() >= 2 and src.shape[-1] == width:
             # Pool every leading axis (batch, frames, H, W, tokens) to (width,): tsm.py:362-371 kept axis 1 for >2-D
             # inputs, which on Anima's 5-D activations is the frame axis (crash "1x1 and 256x1" at :379).
-            # fp32 accumulation without an fp32 copy of the activations.
-            z = src.detach().mean(dim=tuple(range(src.dim() - 1)), dtype=torch.float32)
+            # fp32 accumulation without an fp32 copy of the activations (fp64 activations keep fp64, so the fp64 tests
+            # compare paths exactly; the GPU's bf16 / fp32 activations pool in fp32 as before).
+            z = src.detach().mean(dim=tuple(range(src.dim() - 1)), dtype=torch.promote_types(src.dtype, torch.float32))
             device = z.device
             fc_w = self.router_fc.weight.to(device)
             fc_b = self.router_fc.bias.to(device)
@@ -1578,7 +1580,8 @@ class _TSMExpertLinear(torch.autograd.Function):
                 Bs = Bf if k is None and sk == 1.0 else Bf * sk
             else:
                 src = mid.narrow(1, 0, r) if core else x
-                z = src.mean(0, dtype=torch.float32).to(rw.dtype)  # fp32 pooling over the tokens (tsm.py:362)
+                # pooling over the tokens (tsm.py:362) in promote(dtype, fp32), as _tsm_compute_gates
+                z = src.mean(0, dtype=torch.promote_types(src.dtype, torch.float32)).to(rw.dtype)
                 gates = torch.addmv(rb, rw, z) + ew[ti]  # (m - 1,): FC(z) + the embedding row (tsm.py:380-389)
                 gv = torch.cat((_tsm_ones1(gates), gates))  # (m,): 1 for the core expert, the gate per context expert
                 Bs = Bf * (gv * sk)[_tsm_colidx(m, r, gates.device)]
@@ -1785,6 +1788,150 @@ def _tsm_fused_linear(self, x2: torch.Tensor, t, W0, bias, s, k, cdt: torch.dtyp
                                   self.tsm_router_input == "bottleneck", cdt, ld, *weights)
 
 
+# Mixed-timestep chunks (2026-10-25, third round): with per-sample timesteps a chunk of n samples has up to n distinct
+# active expert sets, and the group loop below ran one fused call per group - on the GPU the step of the small tiers is
+# bound by the Python per module call, so batching several samples into one forward bought nothing for TSM (a 4-row
+# 1024 chunk cost 4 calls per module, like 4 single-row forwards; measured 1.44 s per image either way). The mixed
+# path runs ONE call per module: A / B hold every expert active anywhere in the chunk (their union U, R = |U| x r
+# columns), and a per-sample mask over the blocks (1 for the sample's own experts, 0 otherwise; in stage 2 the router
+# gate of the sample's timestep on its context block) zeroes the other experts' columns of the bottleneck before the up
+# GEMM. Same math as the group loop: sum_j M_bj B_j A_j x_b; an expert outside U is not in the graph (grad None, the
+# optimizer skips it as before), one inside U gets exactly the gradient of the rows it is active for (the mask zeroes
+# the others). Low-rank GEMMs run over R instead of each group's m r columns (R <= (groups + 1) r: 8% of the base
+# GEMM at R = 160, in = 2048). network_args tsm_mixed=False restores the group loop.
+_TSM_MIXED = True
+
+
+class _TSMMaskedLinear(torch.autograd.Function):
+    """x (t, in) -> x W0^T + ((x A^T) * M) B^T + bias for a chunk of n samples of tok tokens each (t = n tok): A (R, in)
+    and B (out, R) are the concatenated experts active anywhere in the chunk, mask (n, R) picks each sample's own blocks
+    (1 / 0, or the router gate in stage 2) and is expanded over the sample's tokens. ld: the low-rank dtype (cdt, or
+    fp32 with tsm_lowrank_fp32, as _TSMLinear). Saved: x in ld, W0 in cdt, A, B, the unmasked bottleneck (t, R) and the
+    mask. Backward: gb = g^T (mid * M); gmid = (g B) * M; ga = gmid^T x; gx = (gmid A -> cdt) + g W0 as one addmm;
+    gmask = sum over the sample's tokens of (g B) * mid (the gates' gradient in stage 2)."""
+
+    @staticmethod
+    def forward(ctx, x, W0, bias, A, B, mask, tok, cdt, ld):
+        n, R = mask.shape
+        with torch.autocast(x.device.type, enabled=False):
+            xl, Al, Bl, ml = x.to(ld), A.to(ld), B.to(ld), mask.to(ld)
+            W0c = W0.to(cdt)
+            mid = torch.mm(xl, Al.t())  # (t, R), every expert of U for every token
+            midm = (mid.view(n, tok, R) * ml.unsqueeze(1)).view(-1, R)
+            Cl = torch.mm(midm, Bl.t()) if bias is None else torch.addmm(bias.to(ld), midm, Bl.t())
+            y = torch.addmm(Cl.to(cdt), x.to(cdt), W0c.t())
+        ctx.save_for_backward(xl, W0c, Al, Bl, mid, ml)
+        ctx.meta = (x.dtype, A.dtype, B.dtype, mask.dtype, cdt, n, tok)
+        return y
+
+    @staticmethod
+    def backward(ctx, g):
+        with torch.autocast(g.device.type, enabled=False):
+            xl, W0c, Al, Bl, mid, ml = ctx.saved_tensors
+            xdt, adt, bdt, mdt, cdt, n, tok = ctx.meta
+            need_x, _, _, need_a, need_b, need_m = ctx.needs_input_grad[:6]
+            R = mid.shape[1]
+            gl = g.to(xl.dtype)
+            gx = ga = gb = gm = None
+            if need_b:
+                midm = (mid.view(n, tok, R) * ml.unsqueeze(1)).view(-1, R)
+                gb = torch.mm(gl.t(), midm).to(bdt)
+            if need_x or need_a or need_m:
+                gmid_raw = torch.mm(gl, Bl)  # (t, R) in ld
+                if need_m:
+                    gm = (gmid_raw * mid).view(n, tok, R).sum(1).to(mdt)  # (n, R)
+                gmid = (gmid_raw.view(n, tok, R) * ml.unsqueeze(1)).view(-1, R)
+                if need_a:
+                    ga = torch.mm(gmid.t(), xl).to(adt)
+                if need_x:
+                    gx = torch.addmm(torch.mm(gmid, Al).to(cdt), g.to(cdt), W0c).to(xdt)
+        return gx, None, None, ga, gb, gm, None, None, None
+
+
+def _tsm_mixed_plan(self, ints: List[int], device) -> dict:
+    """What _tsm_mixed_linear needs for a chunk with these per-sample timesteps, built once per step and shared by every
+    module (cached with the group plans, cleared by set_timestep; torch.tensor(..., device=cuda) is a blocking copy):
+    the experts active anywhere in the chunk in a fixed order (U), the (n, |U|) 0/1 block mask, each sample's core block;
+    stage 2: the distinct timesteps with each sample's group, the group sizes, the embedding rows and each sample's
+    context block positions."""
+    key = ("mixed", tuple(ints), self.tsm_stage, self.tsm_num_timesteps, tuple(self.tsm_n_scales), device)
+    plan = _TSM_PLANS.get(key)
+    if plan is not None:
+        return plan
+    n = len(ints)
+    per_row = [_tsm_experts(self, t) for t in ints]
+    U = sorted({(s, e) for row in per_row for s, e in enumerate(row)})
+    pos = {se: i for i, se in enumerate(U)}
+    block = [[0.0] * len(U) for _ in range(n)]
+    core, ctx = [], []
+    for b, row in enumerate(per_row):
+        for s, e in enumerate(row):
+            block[b][pos[(s, e)]] = 1.0
+        core.append(pos[(0, row[0])])
+        ctx.append([pos[(s, e)] for s, e in enumerate(row) if s > 0])
+    # single: every sample picks the same experts, so the plain fused call at ints[0] is exact - stage 1 only: in stage
+    # 2 the gate depends on each sample's timestep (its embedding row, the pooling over its own group's tokens)
+    plan = {"U": U, "nb": len(U), "single": self.tsm_stage != 2 and len(U) == len(self.tsm_n_scales),
+            "block_mask": torch.tensor(block, dtype=torch.float32).to(device),
+            "core_pos": torch.tensor(core, dtype=torch.long).to(device), "arange": torch.arange(n).to(device)}
+    if self.tsm_stage == 2:
+        distinct = list(OrderedDict.fromkeys(ints))
+        gi = {t: i for i, t in enumerate(distinct)}
+        T = self.tsm_num_timesteps
+        plan["n_groups"] = len(distinct)
+        plan["grp_idx"] = torch.tensor([gi[t] for t in ints], dtype=torch.long).to(device)
+        plan["counts"] = torch.tensor([[float(ints.count(t))] for t in distinct], dtype=torch.float32).to(device)
+        plan["t_idx"] = torch.tensor([min(max(int(t) - 1, 0), T - 1) for t in distinct], dtype=torch.long).to(device)
+        plan["ctx_pos"] = torch.tensor(ctx, dtype=torch.long).to(device)  # (n, n_context)
+    if len(_TSM_PLANS) > 64:
+        _TSM_PLANS.clear()
+    _TSM_PLANS[key] = plan
+    return plan
+
+
+def _tsm_mixed_gates(self, x2: torch.Tensor, A: torch.Tensor, plan: dict, cdt: torch.dtype, n: int, tok: int,
+                     r: int) -> torch.Tensor:
+    """Stage 2: the router gates per distinct timestep of the chunk, (groups, n_context) fp32 - _tsm_compute_gates'
+    pooling (tsm.py:362-389) over each group's tokens, vectorised: the input rows, or the core bottleneck (one no-grad
+    thin GEMM over the union A, each sample's core block picked); then FC(z) + the timestep embedding row."""
+    pdt = torch.promote_types(cdt, torch.float32)  # the pooling dtype of _tsm_compute_gates
+    with torch.no_grad():
+        if self.tsm_router_input == "bottleneck":
+            midc = F.linear(x2.to(cdt), A.to(cdt))  # (t, R)
+            pooled = midc.view(n, tok, -1).mean(1, dtype=pdt)  # (n, R)
+            z_rows = pooled.view(n, plan["nb"], r)[plan["arange"], plan["core_pos"]]  # (n, r)
+        else:
+            z_rows = x2.view(n, tok, -1).mean(1, dtype=pdt)  # (n, in)
+        Z = torch.zeros(plan["n_groups"], z_rows.shape[1], dtype=pdt, device=x2.device)
+        Z = Z.index_add_(0, plan["grp_idx"], z_rows) / plan["counts"].to(pdt)
+    fc_w, fc_b, embed_w = self.router_fc.weight, self.router_fc.bias, self.timestep_embed.weight
+    return F.linear(Z.to(fc_w.dtype), fc_w, fc_b) + embed_w[plan["t_idx"]]
+
+
+def _tsm_mixed_linear(self, x2: torch.Tensor, ints: List[int], W0, bias, s, k, cdt: torch.dtype, tok: int) -> torch.Tensor:
+    """One _TSMMaskedLinear call for a chunk whose samples have different timesteps (x2: (n tok, in))."""
+    plan = _tsm_mixed_plan(self, ints, x2.device)
+    if plan["single"]:  # stage 1, the timesteps differ but every sample picks the same experts: the plain fused call
+        return _tsm_fused_linear(self, x2, ints[0], W0, bias, s, k, cdt)
+    scales = self.experts._modules
+    downs, ups = [], []
+    for sc, e in plan["U"]:
+        ex = scales[str(sc)]._modules[str(e)]._modules
+        downs.append(ex["down"]._parameters["weight"])
+        ups.append(ex["up"]._parameters["weight"])
+    ld = torch.promote_types(downs[0].dtype, torch.float32) if _tsm_lowrank_fp32(self) else cdt
+    A = torch.cat(downs, 0)  # (R, in)
+    B = torch.cat(ups, 1) * (s * k if k is not None else s)  # (out, R)
+    r = downs[0].shape[0]
+    blocks = plan["block_mask"]  # (n, nb) 0 / 1, fp32
+    if self.tsm_stage == 2:
+        gates = _tsm_mixed_gates(self, x2, A, plan, cdt, len(ints), tok, r)  # (groups, n_context), the router's dtype
+        blocks = blocks.to(gates.dtype)
+        blocks = blocks * torch.ones_like(blocks).scatter(1, plan["ctx_pos"], gates[plan["grp_idx"]])
+    mask = blocks.repeat_interleave(r, dim=1)  # (n, R)
+    return _TSMMaskedLinear.apply(x2, W0, bias, A, B, mask, tok, cdt, ld)
+
+
 def _tsm_forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
     if self.module_dropout and self.training:
         if torch.rand(1) < self.module_dropout:
@@ -1797,6 +1944,9 @@ def _tsm_forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
     shape = x.shape
     ints = _TSM_SAMPLE_T.get(self.mask_group_id)
     if ints is not None and len(ints) > 1 and shape[0] == len(ints) and len(set(ints)) > 1:
+        if _TSM_MIXED and not _TSM_EXPERT_FN:
+            y = _tsm_mixed_linear(self, x.reshape(-1, shape[-1]), ints, W0, bias, s, k, cdt, x[0].numel() // shape[-1])
+            return y.view(*shape[:-1], y.shape[-1])
         entries, inverse = _tsm_group_plan(self, ints, x.device)
         parts = []
         for t, rows in entries:
@@ -3325,6 +3475,12 @@ def prepare_network_kwargs(algo: str, net_kwargs: dict, logger=logger) -> dict:
         if not _TSM_FUSED:
             logger.warning("tsm: tsm_fused=False - org_forward + a separate expert delta per call (the slower split path)")
         global _TSM_EXPERT_FN
+        global _TSM_MIXED
+        mixed = kw.pop("tsm_mixed", None)  # not a TSMModule argument
+        _TSM_MIXED = True if mixed in (None, "") else _str_bool(mixed)
+        if not _TSM_MIXED:
+            logger.warning("tsm: tsm_mixed=False - a mixed-timestep chunk runs one fused call per expert group (the slower"
+                           " group loop)")
         efn = kw.pop("tsm_expert_fn", None)  # not a TSMModule argument
         _TSM_EXPERT_FN = False if efn in (None, "") else _str_bool(efn)
         if _TSM_EXPERT_FN:
