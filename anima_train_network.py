@@ -18,6 +18,7 @@ from library import (
     anima_train_utils,
     anima_utils,
     flux_train_utils,
+    micro_batch,
     qwen_image_autoencoder_kl,
     sd3_train_utils,
     strategy_anima,
@@ -47,8 +48,21 @@ def anima_patch_spatial(anima) -> int:
 
 def tokens_of_latents(latents: torch.Tensor, patch: int) -> int:
     """DiT tokens of one sample of this micro-step: ceil(H/p) * ceil(W/p) over the latent grid (one frame)."""
-    h, w = int(latents.shape[-2]), int(latents.shape[-1])
+    return tokens_of_grid(int(latents.shape[-2]), int(latents.shape[-1]), patch)
+
+
+def tokens_of_grid(h: int, w: int, patch: int) -> int:
+    """DiT tokens of an h x w latent grid: the patches of `patch` x `patch` latent pixels, partial ones rounded up."""
     return -(-h // patch) * -(-w // patch)
+
+
+VAE_SPATIAL_DOWNSCALE = 8  # the Qwen-Image VAE: pixels -> latents (library/qwen_image_autoencoder_kl.py, bucket_reso_steps 16)
+
+
+def micro_step_tokens(latents: torch.Tensor, patch: int) -> int:
+    """DiT tokens of one forward over these latents: rows x tokens per sample (the activation memory of a micro-step
+    scales with this, so --anima_no_checkpoint_max_tokens / --anima_half_checkpoint_max_tokens compare against it)."""
+    return int(latents.shape[0]) * tokens_of_latents(latents, patch)
 
 
 # Per-micro-step gradient checkpointing modes of the DiT Blocks (apply_checkpointing_for_tokens).
@@ -75,6 +89,40 @@ def validate_checkpoint_token_limits(args) -> None:
         )
 
 
+# Options that couple the rows of one forward: under --anima_micro_batch_max_tokens a chunk is not the batch. Refused:
+# the objective itself changes with the chunking. Warned: still unbiased, but the pairing / strata / OT matching form
+# within each chunk (none in a 1-row chunk). See library/micro_batch.py.
+_MICRO_BATCH_REFUSED = (
+    ("contrastive_flow_matching", "contrastive flow matching rolls its negatives within the forward (a 1-row chunk has none)"),
+    ("adaptive_timestep_sampling", "the adaptive sampler's Algorithm 2 / REINFORCE update would see the last chunk only"),
+    ("anchor_snr_weighting", "the anchor SNR gate is normalised to batch-mean 1 over the forward"),
+    ("adv_snr_weighting", "the adv SNR gate is normalised to batch-mean 1 over the forward"),
+)
+_MICRO_BATCH_WARNED = ("antithetic_timestep_sampling", "antithetic_noise_pairing", "stratified_timestep_sampling",
+                       "qmc_timestep_sampling", "flow_use_ot")
+
+
+def validate_micro_batch_args(args) -> list[str]:
+    """--anima_micro_batch_max_tokens: >= 0, and when > 0 the row-coupling options above: ValueError for the refused ones,
+    a message (returned; assert_extra_args logs it) for the warned ones. 0 accepts anything."""
+    budget = int(getattr(args, "anima_micro_batch_max_tokens", 0) or 0)
+    if budget < 0:
+        raise ValueError(f"--anima_micro_batch_max_tokens must be >= 0 (0 = off), got {budget}")
+    if budget == 0:
+        return []
+    for name, why in _MICRO_BATCH_REFUSED:
+        if getattr(args, name, False):
+            raise ValueError(f"--{name} cannot be combined with --anima_micro_batch_max_tokens {budget}: {why}."
+                             f" Set the budget to 0 (one forward per batch) or drop the option")
+    dyn = str(getattr(args, "patch_topology_dynamic_weighting", "none") or "none").lower()
+    if getattr(args, "patch_topology_loss", False) and dyn != "none":
+        raise ValueError(f"--patch_topology_dynamic_weighting {dyn} cannot be combined with --anima_micro_batch_max_tokens"
+                         f" {budget}: the weight would be updated per chunk, not per batch. Use 'none' or the budget 0")
+    return [f"--{name} with --anima_micro_batch_max_tokens {budget}: the pairing / strata / matching are formed within each"
+            f" chunk (none in a 1-row chunk); the marginal timestep / noise distribution is unchanged"
+            for name in _MICRO_BATCH_WARNED if getattr(args, name, None)]
+
+
 def checkpoint_mode_for_tokens(args, tokens: int, swapping: bool) -> str:
     """The Block checkpointing mode of a micro-step of `tokens` DiT tokens: CKPT_NONE for tokens <= N1, CKPT_HALF for
     N1 < tokens <= N2, CKPT_ALL above (and always with --blocks_to_swap); CKPT_NONE without --gradient_checkpointing."""
@@ -91,11 +139,12 @@ def checkpoint_mode_for_tokens(args, tokens: int, swapping: bool) -> str:
 
 
 def apply_checkpointing_for_tokens(anima, args, tokens: int, unsloth: bool, swapping: bool) -> str:
-    """--anima_no_checkpoint_max_tokens N1 (2026-10-25): a micro-step whose samples have <= N1 DiT tokens runs the blocks
-    without gradient checkpointing (no recompute: the small tiers of a multi-resolution dataset are host-bound, so the
-    recompute is a third of their module calls, and their activations are small). --anima_half_checkpoint_max_tokens N2:
-    for N1 < tokens <= N2 only the even-indexed blocks are checkpointed and the odd ones keep their activations (half the
-    recompute for a tier whose full activations would not fit, e.g. the 1024 tier of Anima-2.9B). Above N2, and with
+    """--anima_no_checkpoint_max_tokens N1 (2026-10-25): a micro-step of at most N1 DiT tokens (one forward: batch rows x
+    tokens per sample, see micro_step_tokens) runs the blocks without gradient checkpointing (no recompute: the small
+    tiers of a multi-resolution dataset are host-bound, so the recompute is a third of their module calls, and their
+    activations are small). --anima_half_checkpoint_max_tokens N2: for N1 < tokens <= N2 only the even-indexed blocks are
+    checkpointed and the odd ones keep their activations (half the recompute for a micro-step whose full activations
+    would not fit, e.g. a 1-row 1024^2 micro-step of Anima-2.9B). Above N2, and with
     --blocks_to_swap, every block runs with the configured checkpointing (unsloth / cpu offload as the trainer set it).
     The block flags are plain attributes, so this is switched per micro-step; the current mode is kept on the model and
     the flags are touched only when it changes (640-module micro-steps are host-bound: this must stay cheap). Returns
@@ -139,6 +188,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         self.addift_pair_settings = None
         self._tsm_grouped_supported = True  # TSM-LoKr tsm_grouped_accumulation: see get_noise_pred_and_target
         self._ckpt_modes_logged = set()  # per-token-count checkpointing modes announced once (get_noise_pred_and_target)
+        self._micro_batch_logged = set()  # per-sample token counts whose chunking was announced (split_batch_for_backward)
         # Cache of zero padding masks keyed by (batch, height, width, dtype, device).
         # The Anima DiT consumes padding_mask read-only (resize/expand/concat, never
         # mutated in place), so a single reusable buffer per key avoids a fresh CUDA
@@ -363,6 +413,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         ) or not args.cpu_offload_checkpointing, "blocks_to_swap is not supported with cpu_offload_checkpointing"
 
         validate_checkpoint_token_limits(args)  # --anima_half_checkpoint_max_tokens >= --anima_no_checkpoint_max_tokens
+        for message in validate_micro_batch_args(args):  # --anima_micro_batch_max_tokens >= 0; row-coupling options
+            logger.warning(message)
 
         if args.unsloth_offload_checkpointing:
             if not args.gradient_checkpointing:
@@ -1137,6 +1189,37 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         """Extra keyword arguments for the DiT call in get_noise_pred_and_target (Anima-3.8B: Qwen3.5 features)."""
         return {}
 
+    def split_batch_for_backward(self, args, accelerator, batch, unet) -> list:
+        """--anima_micro_batch_max_tokens (library/micro_batch.py): a batch whose rows x DiT tokens per sample exceed the
+        budget runs as even chunks of rows that fit, each its own forward + backward weighted by rows / batch rows: the
+        gradient of the batch mean for the per-sample loss (options that couple the rows of one forward are refused or
+        warned about by validate_micro_batch_args). The token count comes from the cached latents or, without them,
+        from the pixel size. Announced once per distinct per-sample token count. 0 = off."""
+        budget = int(getattr(args, "anima_micro_batch_max_tokens", 0) or 0)
+        if budget <= 0 or not isinstance(batch, dict):
+            return [(batch, 1.0)]
+        latents, images = batch.get("latents"), batch.get("images")
+        src = latents if isinstance(latents, torch.Tensor) else images  # latents not cached: the pixels (VAE in process_batch)
+        if not isinstance(src, torch.Tensor) or src.ndim < 3 or int(src.shape[0]) <= 1:
+            return [(batch, 1.0)]
+        n = int(src.shape[0])
+        patch = anima_patch_spatial(accelerator.unwrap_model(unet))
+        if src is latents:
+            per_sample = tokens_of_latents(latents, patch)
+        else:
+            per_sample = tokens_of_grid(int(src.shape[-2]) // VAE_SPATIAL_DOWNSCALE, int(src.shape[-1]) // VAE_SPATIAL_DOWNSCALE, patch)
+        sizes = micro_batch.chunk_sizes(n, max(1, budget // max(1, per_sample)))
+        if len(sizes) == 1:
+            return [(batch, 1.0)]
+        if not self._micro_batch_logged:  # one INFO line for the first chunked batch; every bucket has its own token
+            logger.info(f"micro-batching on: a batch of {n} x {per_sample} DiT tokens exceeds --anima_micro_batch_max_tokens"
+                        f" {budget} -> {len(sizes)} chunks of {sizes} rows, each its own forward + backward (same gradient)."
+                        f" Further batches are chunked the same way by their rows x tokens per sample (DEBUG log only)")
+        elif per_sample not in self._micro_batch_logged:  # count, so a line per bucket would break the progress bar
+            logger.debug(f"micro-batching: {n} x {per_sample} DiT tokens -> {len(sizes)} chunks of {sizes} rows")
+        self._micro_batch_logged.add(per_sample)
+        return [(sub, s / n) for sub, s in zip(micro_batch.split_batch(batch, sizes), sizes)]
+
     def get_noise_pred_and_target(
         self,
         args,
@@ -1156,18 +1239,19 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         anima: anima_models.Anima = unet
         if is_train and args.gradient_checkpointing and any(checkpoint_token_limits(args)):
             m = accelerator.unwrap_model(anima)
-            tokens = tokens_of_latents(latents, anima_patch_spatial(m))
+            tokens = micro_step_tokens(latents, anima_patch_spatial(m))  # rows x tokens per sample: what the memory scales with
             mode = apply_checkpointing_for_tokens(m, args, tokens, self._use_unsloth_offload_checkpointing,
                                                   self.is_swapping_blocks)
             if mode != CKPT_ALL and mode not in self._ckpt_modes_logged:  # each reduced mode once, with its token count
                 self._ckpt_modes_logged.add(mode)
                 n1, n2 = checkpoint_token_limits(args)
+                this = f"this one: {int(latents.shape[0])} x {tokens // int(latents.shape[0])} = {tokens}"
                 if mode == CKPT_NONE:
-                    logger.info(f"gradient checkpointing off for micro-steps of <= {n1} DiT tokens (this one: {tokens});"
+                    logger.info(f"gradient checkpointing off for micro-steps of <= {n1} DiT tokens ({this});"
                                 f" {'every other Block' if n2 else 'on'} above")
                 else:
                     logger.info(f"gradient checkpointing on every other Block (even-indexed) for micro-steps of"
-                                f" {n1} < tokens <= {n2} DiT tokens (this one: {tokens}); all Blocks above")
+                                f" {n1} < tokens <= {n2} DiT tokens ({this}); all Blocks above")
 
         if args.ileco:
             return self.get_ileco_noise_pred_and_target(
@@ -1561,8 +1645,9 @@ def setup_parser() -> argparse.ArgumentParser:
         "Cannot be used with --cpu_offload_checkpointing or --blocks_to_swap.",
     )
     parser.add_argument("--anima_no_checkpoint_max_tokens", type=int, default=0,
-                        help="run the micro-steps whose samples have at most this many DiT tokens (latent H/2 x W/2; a 512^2"
-                             " image = 1024) without gradient checkpointing - no recompute, the activations stay in VRAM -"
+                        help="run the micro-steps of at most this many DiT tokens (one forward: batch rows x tokens per sample,"
+                             " latent H/2 x W/2; a 512^2 image = 1024 tokens) without gradient checkpointing - no recompute,"
+                             " the activations stay in VRAM -"
                              " and the larger ones with the configured checkpointing (or half-checkpointed up to"
                              " --anima_half_checkpoint_max_tokens when that is set). Ignored with --blocks_to_swap."
                              " 0 = off (no un-checkpointed regime)")
@@ -1573,6 +1658,18 @@ def setup_parser() -> argparse.ArgumentParser:
                              " of no checkpointing; a 1024^2 image = 4096 tokens), larger ones with every Block"
                              " checkpointed. Must be >= --anima_no_checkpoint_max_tokens when both are set; ignored with"
                              " --blocks_to_swap. 0 = off")
+    parser.add_argument("--anima_micro_batch_max_tokens", type=int, default=0,
+                        help="run a dataset batch whose DiT tokens (rows x tokens per sample; a 512^2 image = 1024, 1024^2 ="
+                             " 4096, 2048^2 = 16384) exceed this many as even chunks of rows that fit, each with its own"
+                             " forward + backward weighted by rows / batch rows. For the per-sample loss and its per-sample"
+                             " weightings the gradient and the logged loss are the batch mean's, as one forward of the whole"
+                             " batch, with the peak VRAM of one chunk; options that couple the rows of one forward are"
+                             " refused (contrastive_flow_matching, adaptive_timestep_sampling, anchor/adv SNR gates, dynamic"
+                             " patch-topology weighting) or warned about (antithetic / stratified / QMC sampling, antithetic"
+                             " noise pairing, flow_use_ot: formed within each chunk). Lets a multi-resolution dataset use"
+                             " one batch_size for every tier (e.g. 8 with 20000: a full-area bucket of the 2048 tier runs"
+                             " 1 row per chunk, 1536 2, 1024 4, 512 all 8; smaller buckets of a tier more rows). The token"
+                             " count comes from the cached latents or the pixel size. 0 = off (library/micro_batch.py)")
     parser.add_argument("--anima_adaln_hoist", action="store_true",
                         help="compute each checkpointed Block's adaLN modulations once per micro-step outside its gradient"
                              " checkpoint instead of inside it (forward, recompute and backward of the 6 modulation Linears"

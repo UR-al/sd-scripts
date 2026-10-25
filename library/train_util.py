@@ -5885,6 +5885,18 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         + "/ VRAMが少ない環境向け最適化を無効にする。たとえば各latentのキャッシュ後のCUDAキャッシュクリアを行わない等（VRAMが多い環境向け）",
     )
     parser.add_argument(
+        "--batch_loss_norm_rows",
+        type=int,
+        default=0,
+        help="scale each micro-step's mean loss by its rows x gradient_accumulation_steps / N before backward (accelerate"
+        " divides every backward by gradient_accumulation_steps), so every sample weighs exactly 1/N in the optimizer step"
+        " however full the bucket batch is (bucket_no_upscale leaves many buckets below batch_size; with plain means the"
+        " samples of a 2-row batch would weigh 4x a full 8-row batch's). N = the samples one optimizer step stands for"
+        " (batch_size x gradient_accumulation_steps when batches are full; 8 reproduces batch 1 x accumulation 8). The"
+        " logged losses stay plain means; step_func optimizers get the scaled value. 0 = off (applied by the network"
+        " trainers, train_network.py and *_train_network.py)",
+    )
+    parser.add_argument(
         "--cuda_memory_fraction",
         type=float,
         default=None,

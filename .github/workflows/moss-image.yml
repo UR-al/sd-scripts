@@ -63,6 +63,7 @@ jobs:
           tests/test_dora_lr.py
           tests/test_lycoris_algo_fixes.py
           tests/test_lycoris_stock_flag.py
+          tests/test_micro_batch.py
           tests/test_moss_models.py
           tests/test_moss_pipeline.py
           tests/test_precision_logging.py

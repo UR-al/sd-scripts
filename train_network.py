@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 from torch.types import Number
 from library.device_utils import init_ipex, clean_memory_on_device
-from library import cuda_memory
+from library import cuda_memory, micro_batch
 from library.edm2_loss_utils import prepare_edm2_loss_weighting, plot_edm2_loss_weighting_check, plot_edm2_loss_weighting
 from library.ramtorch_util import apply_ramtorch_to_module
 
@@ -439,6 +439,14 @@ class NetworkTrainer:
         for param in edm2_model.parameters():
             if param.grad is not None:
                 param.grad = accelerator.reduce(param.grad, reduction="mean")
+
+    def split_batch_for_backward(self, args, accelerator, batch, unet) -> list:
+        """[(sub-batch, weight)] the training loop runs forward + backward over, weight = the chunk's rows / the batch's
+        rows (library/micro_batch.py): the weighted sum of the chunks' mean losses is the batch's mean loss, so the
+        accumulated gradient is the one the whole batch would give in one forward. The default is the batch itself; a
+        trainer that knows its token count splits large batches into chunks that fit in VRAM (anima_train_network.py,
+        --anima_micro_batch_max_tokens)."""
+        return [(batch, 1.0)]
 
     def should_sync_ramtorch(self, args, accelerator) -> bool:
         """Whether a full CUDA synchronize is required after backward for RamTorch.
@@ -3986,62 +3994,82 @@ class NetworkTrainer:
                     # Update patch topology current step for warmup/start_step logic
                     self._patch_topology_current_step = global_step
 
-                    if self._lycoris_fix_on:
-                        self._lycoris_fix_defer_clear = True  # keep the T-LoRA mask / TSM timestep until backward
-                    loss, pre_scaling_loss, loss_scaled = self.process_batch(
-                        batch,
-                        text_encoders,
-                        unet,
-                        network,
-                        vae,
-                        noise_scheduler,
-                        vae_dtype,
-                        weight_dtype,
-                        accelerator,
-                        args,
-                        text_encoding_strategy,
-                        tokenize_strategy,
-                        is_train=True,
-                        train_text_encoder=train_text_encoder,
-                        train_unet=train_unet,
-                        edm2_model=edm2_model,
-                    )
+                    # Token-budget micro-batching (library/micro_batch.py): [(batch, 1.0)] unless the trainer splits the
+                    # batch into chunks, each run as forward + backward with its mean loss weighted by rows / batch rows -
+                    # the accumulated gradient is the batch mean's. The logged losses are the same weighted sums.
+                    chunks = self.split_batch_for_backward(args, accelerator, batch, unet)
+                    rows_norm = micro_batch.rows_norm(args, batch)  # --batch_loss_norm_rows: rows / N, else 1.0
+                    loss = pre_scaling_loss = loss_scaled = None
+                    for sub_batch, chunk_weight in chunks:
+                        if self._lycoris_fix_on:
+                            self._lycoris_fix_defer_clear = True  # keep the T-LoRA mask / TSM timestep until backward
+                        c_loss, c_pre_scaling_loss, c_loss_scaled = self.process_batch(
+                            sub_batch,
+                            text_encoders,
+                            unet,
+                            network,
+                            vae,
+                            noise_scheduler,
+                            vae_dtype,
+                            weight_dtype,
+                            accelerator,
+                            args,
+                            text_encoding_strategy,
+                            tokenize_strategy,
+                            is_train=True,
+                            train_text_encoder=train_text_encoder,
+                            train_unet=train_unet,
+                            edm2_model=edm2_model,
+                        )
 
-                    # Track FFL loss for logging
-                    if self.ffl_enabled and self.ffl_loss_value is not None:
-                        current_global_step_ffl = (current_global_step_ffl or 0.0) + self.ffl_loss_value
+                        # Track FFL loss for logging
+                        if self.ffl_enabled and self.ffl_loss_value is not None:
+                            current_global_step_ffl = (current_global_step_ffl or 0.0) + self.ffl_loss_value * chunk_weight
 
-                    # Track Patch Topology loss for logging
-                    if self.patch_topology_enabled and self.patch_topology_loss_value is not None:
-                        current_global_step_patch_topo = (current_global_step_patch_topo or 0.0) + self.patch_topology_loss_value
+                        # Track Patch Topology loss for logging
+                        if self.patch_topology_enabled and self.patch_topology_loss_value is not None:
+                            current_global_step_patch_topo = (
+                                (current_global_step_patch_topo or 0.0) + self.patch_topology_loss_value * chunk_weight
+                            )
 
-                    # Track wavelet mask ratio for logging
-                    if self.wavelet_masking_enabled:
-                        current_global_step_wav_mask = (current_global_step_wav_mask or 0.0) + self._wavelet_mask_ratio
+                        # Track wavelet mask ratio for logging
+                        if self.wavelet_masking_enabled:
+                            current_global_step_wav_mask = (current_global_step_wav_mask or 0.0) + self._wavelet_mask_ratio * chunk_weight
 
-                    # Track High-Frequency Token loss for logging (materialized at the
-                    # existing periodic sync — the hot path keeps a detached tensor)
-                    if self.hf_scale > 0.0 and self.hf_loss_value is not None:
-                        current_global_step_hf = (current_global_step_hf or 0.0) + self.hf_loss_value.item()
+                        # Track High-Frequency Token loss for logging (materialized at the
+                        # existing periodic sync — the hot path keeps a detached tensor)
+                        if self.hf_scale > 0.0 and self.hf_loss_value is not None:
+                            current_global_step_hf = (current_global_step_hf or 0.0) + self.hf_loss_value.item() * chunk_weight
 
-                    # Track multiscale anchor loss for logging (materialized at the
-                    # existing periodic sync — the hot path keeps a detached tensor)
-                    if self.anchor_scale > 0.0 and self.anchor_loss_value is not None:
-                        current_global_step_anchor = (current_global_step_anchor or 0.0) + self.anchor_loss_value.item()
+                        # Track multiscale anchor loss for logging (materialized at the
+                        # existing periodic sync — the hot path keeps a detached tensor)
+                        if self.anchor_scale > 0.0 and self.anchor_loss_value is not None:
+                            current_global_step_anchor = (current_global_step_anchor or 0.0) + self.anchor_loss_value.item() * chunk_weight
 
-                    if self.adv_scale > 0.0 and self.adv_loss_value is not None:
-                        current_global_step_adv = (current_global_step_adv or 0.0) + self.adv_loss_value.item()
+                        if self.adv_scale > 0.0 and self.adv_loss_value is not None:
+                            current_global_step_adv = (current_global_step_adv or 0.0) + self.adv_loss_value.item() * chunk_weight
 
-                    if loss.ndim != 0:
-                        loss = loss.mean()
+                        if c_loss.ndim != 0:
+                            c_loss = c_loss.mean()
 
-                    self.precision_reporter.log_tensors("loss passed to backward", loss=loss)
-                    accelerator.backward(loss)
-                    if self._lycoris_fix_on:
-                        self._lycoris_fix_after_backward(accelerator.unwrap_model(network))
+                        self.precision_reporter.log_tensors("loss passed to backward", loss=c_loss)
+                        # chunk_weight (rows_c / rows): the chunks sum to the batch mean; rows_norm (rows x accumulation
+                        # steps / N, --batch_loss_norm_rows): every sample weighs 1 / N in the optimizer step whatever
+                        # the bucket batch's fill (accelerator.backward divides by the accumulation steps; the logged
+                        # losses stay the plain means)
+                        backward_scale = chunk_weight * rows_norm
+                        accelerator.backward(c_loss if backward_scale == 1.0 else c_loss * backward_scale)
+                        if self._lycoris_fix_on:
+                            self._lycoris_fix_after_backward(accelerator.unwrap_model(network))
 
-                    if self.should_sync_ramtorch(args, accelerator):
-                        torch.cuda.synchronize()
+                        if self.should_sync_ramtorch(args, accelerator):
+                            torch.cuda.synchronize()
+
+                        loss = micro_batch.weighted_sum(loss, c_loss.detach(), chunk_weight)
+                        pre_scaling_loss = micro_batch.weighted_sum(pre_scaling_loss, c_pre_scaling_loss.detach(), chunk_weight)
+                        loss_scaled = micro_batch.weighted_sum(
+                            loss_scaled, None if c_loss_scaled is None else c_loss_scaled.detach(), chunk_weight
+                        )
 
                     edm2_loss = loss
                     loss = pre_scaling_loss
@@ -4052,7 +4080,9 @@ class NetworkTrainer:
                         self.compute_adaptive_delta_before_step(unet, noise_scheduler, weight_dtype, accelerator, global_step)
 
                     if _use_step_func:
-                        _step_func_loss_accum += loss.detach().item()
+                        # the function value at the scale the gradient got (--batch_loss_norm_rows): a Polyak step
+                        # (f - f*) / |g|^2 needs f and g on the same scale; 1.0 when the flag is off
+                        _step_func_loss_accum += loss.detach().item() * rows_norm
 
                     if accelerator.sync_gradients:
                         self.all_reduce_network(accelerator, network)  # sync DDP grad manually

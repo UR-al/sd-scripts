@@ -271,7 +271,7 @@ def test_half_checkpoint_three_regimes_and_boundaries():
                 assert m.flags() == [off] * 6
             else:
                 assert m.flags() == [on, off] * 3, (tokens, m.flags())
-    # the 1024 tier of the user's run: 4096 tokens -> half, 1024 -> none, 9216 / 16384 -> all
+    # a 1-row micro-step per tier (rows x tokens per sample): 4096 tokens -> half, 1024 -> none, 9216 / 16384 -> all
     assert tokens_of_latents_tiers() == {512: 1024, 1024: 4096, 1536: 9216, 2048: 16384}
 
 
