@@ -91,6 +91,15 @@ logging.getLogger("torch.distributed.elastic.multiprocessing.redirects").setLeve
 logger = logging.getLogger(__name__)
 
 
+def tlora_mask_alpha_from_args(net_kwargs) -> float:
+    """T-LoRA mask exponent from network_args. Both spellings work on both T-LoRA paths: algo=tlora used to read only
+    tlora_mask_alpha and the LoCon flag path only tlora_alpha, so the other spelling was silently ignored."""
+    given = {key: float(net_kwargs[key]) for key in ("tlora_mask_alpha", "tlora_alpha") if net_kwargs.get(key) is not None}
+    if len(set(given.values())) > 1:
+        raise ValueError(f"tlora_mask_alpha and tlora_alpha are the same setting but differ: {given}")
+    return next(iter(given.values()), 1.0)
+
+
 class NetworkTrainer:
     def __init__(self):
         self.precision_reporter = None
@@ -1221,8 +1230,7 @@ class NetworkTrainer:
         2. ``algo="locon"/"lora"`` + ``use_timestep_mask=True`` — lightweight
            mask flag on LoConModule, saves as standard lora_up/lora_down.
 
-        Reads tlora_min_rank / tlora_mask_alpha (path 1) or
-        tlora_min_rank / tlora_alpha (path 2) from network_args.
+        Reads tlora_min_rank and tlora_mask_alpha (alias tlora_alpha, both paths) from network_args.
         Must be called after the network is created.
         """
         algo = (net_kwargs.get("algo", "lora") or "lora").lower()
@@ -1238,7 +1246,7 @@ class NetworkTrainer:
             else:
                 self.tlora_min_rank = int(tlora_min_rank)
             self.tlora_min_rank = max(0, min(self.tlora_min_rank, self.tlora_max_rank))
-            self.tlora_mask_alpha = float(net_kwargs.get("tlora_alpha", 1.0))
+            self.tlora_mask_alpha = tlora_mask_alpha_from_args(net_kwargs)
             self.tlora_max_timestep = noise_scheduler.config.num_train_timesteps
             logger.info(
                 f"T-LoRA masking enabled (LoCon flag): max_rank={self.tlora_max_rank}, "
@@ -1263,7 +1271,7 @@ class NetworkTrainer:
         else:
             self.tlora_min_rank = int(tlora_min_rank)
         self.tlora_min_rank = max(0, min(self.tlora_min_rank, self.tlora_max_rank))
-        self.tlora_mask_alpha = float(net_kwargs.get("tlora_mask_alpha", 1.0))
+        self.tlora_mask_alpha = tlora_mask_alpha_from_args(net_kwargs)
         self.tlora_max_timestep = noise_scheduler.config.num_train_timesteps
         logger.info(
             f"T-LoRA masking enabled (TLoraModule): max_rank={self.tlora_max_rank}, "
