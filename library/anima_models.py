@@ -553,15 +553,23 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
         w_theta = 10000.0 * w_ntk_factor
         t_theta = 10000.0 * t_ntk_factor
 
-        h_spatial_freqs = 1.0 / (h_theta**self.dim_spatial_range)
-        w_spatial_freqs = 1.0 / (w_theta**self.dim_spatial_range)
-        temporal_freqs = 1.0 / (t_theta**self.dim_temporal_range)
+        # Rebuilt in fp32 from integers instead of read from the buffers: checkpoints store seq / dim_*_range in bf16
+        # (1/21 -> 0.047607) and load_state_dict(assign=True) or .to(bf16) leaves them bf16, which put the angles up to
+        # ~0.18 rad off at 1536 px. diffusion-pipe (the model's trainer) and ComfyUI use fp32 values.
+        device = self.dim_spatial_range.device
+        seq = torch.arange(max(self.max_h, self.max_w, self.max_t), device=device, dtype=torch.float32)
+        dim_spatial_range = torch.arange(0, self._dim_h, 2, device=device)[: (self._dim_h // 2)].float() / self._dim_h
+        dim_temporal_range = torch.arange(0, self._dim_t, 2, device=device)[: (self._dim_t // 2)].float() / self._dim_t
+
+        h_spatial_freqs = 1.0 / (h_theta**dim_spatial_range)
+        w_spatial_freqs = 1.0 / (w_theta**dim_spatial_range)
+        temporal_freqs = 1.0 / (t_theta**dim_temporal_range)
 
         assert H <= self.max_h and W <= self.max_w, (
             f"Input dimensions (H={H}, W={W}) exceed the maximum dimensions (max_h={self.max_h}, max_w={self.max_w})"
         )
-        half_emb_h = torch.outer(self.seq[:H], h_spatial_freqs)
-        half_emb_w = torch.outer(self.seq[:W], w_spatial_freqs)
+        half_emb_h = torch.outer(seq[:H], h_spatial_freqs)
+        half_emb_w = torch.outer(seq[:W], w_spatial_freqs)
 
         if self.enable_fps_modulation:
             uniform_fps = (fps is None) or (fps.min() == fps.max())
@@ -571,11 +579,11 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
 
             if fps is None:
                 assert T == 1, "T should be 1 for image batch."
-                half_emb_t = torch.outer(self.seq[:T], temporal_freqs)
+                half_emb_t = torch.outer(seq[:T], temporal_freqs)
             else:
-                half_emb_t = torch.outer(self.seq[:T] / fps[:1] * self.base_fps, temporal_freqs)
+                half_emb_t = torch.outer(seq[:T] / fps[:1].float() * self.base_fps, temporal_freqs)
         else:
-            half_emb_t = torch.outer(self.seq[:T], temporal_freqs)
+            half_emb_t = torch.outer(seq[:T], temporal_freqs)
 
         em_T_H_W_D = torch.cat(
             [
