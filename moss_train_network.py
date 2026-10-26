@@ -56,6 +56,25 @@ def load_moss_dit(path: str, attn_mode: str, split_attn: bool, device, dtype) ->
     return model
 
 
+def apply_ramtorch_to_moss_blocks(model: MossTransformer, args, device, dtype, apply=None) -> list:
+    """--use_ramtorch: stream the joint blocks' Linears (8.9 GB, the LoRA targets) from pinned CPU RAM; LyCORIS streams them
+    into its rebuild, so training is unchanged. Blocks left out of the LoRA (--moss_lora_exclude_blocks) and the small
+    layers stay ordinary GPU modules: RamTorch's own backward would compute (and stochastically round, using the RNG)
+    grads for their frozen weights. Returns the indices of the streamed blocks."""
+    apply = apply or apply_ramtorch_to_module
+    excluded = set(moss_train_utils.parse_moss_exclude_blocks(getattr(args, "moss_lora_exclude_blocks", "")))
+    streamed = []
+    for index in range(len(model.layers)):
+        if index in excluded:
+            continue
+        model.layers[index] = apply(model.layers[index], f"MOSS joint block {index}", device, dtype)
+        streamed.append(index)
+    kept = sorted(excluded)
+    logger.info(f"RamTorch applied to the Linears of {len(streamed)} MOSS joint blocks"
+                + (f"; blocks {kept} (no LoRA) stay on the GPU" if kept else ""))
+    return streamed
+
+
 class MossNetworkTrainer(train_network.NetworkTrainer):
     def __init__(self):
         super().__init__()
@@ -102,10 +121,7 @@ class MossNetworkTrainer(train_network.NetworkTrainer):
         model = load_moss_dit(args.pretrained_model_name_or_path, attn_mode, args.split_attn, loading_device, weight_dtype)
         self._use_unsloth_offload_checkpointing = args.unsloth_offload_checkpointing
         if args.use_ramtorch:
-            # Only the joint blocks' Linears (8.9 GB, the LoRA targets) stay in pinned CPU RAM: LyCORIS streams them into its
-            # rebuild, so training is unchanged. The small layers stay on the GPU: RamTorch's own backward would compute
-            # (and stochastically round, using the RNG) grads for their frozen weights.
-            model.layers = apply_ramtorch_to_module(model.layers, "MOSS joint blocks", accelerator.device, model.dtype)
+            apply_ramtorch_to_moss_blocks(model, args, accelerator.device, model.dtype)
         if self.is_swapping_blocks:
             model.enable_block_swap(args.blocks_to_swap, accelerator.device)
         return model, text_encoders

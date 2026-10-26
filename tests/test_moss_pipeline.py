@@ -931,6 +931,29 @@ def test_adv_term_is_live_on_moss():
     assert float(trainer._apply_adv_term(base, pred, latents, sigmas, weighting, sched, args, {})) == 0.5
 
 
+def test_ramtorch_skips_blocks_left_out_of_the_lora():
+    """--use_ramtorch streams only blocks that carry the LoRA: a block in --moss_lora_exclude_blocks keeps ordinary GPU
+    Linears (before 10-27 RamTorch wrapped all of model.layers, so block 22's frozen weights went through RamTorch's own
+    backward, which computes, stochastically rounds with the RNG and accumulates grads for them). RamTorch itself needs CUDA,
+    so the wrapper is replaced by a recorder here; the selection is the point."""
+    import moss_train_network
+
+    for exclude, want in (("1", [0, 2]), ("", [0, 1, 2]), ("0, 2", [1])):
+        model = _tiny_dit()
+        before = list(model.layers)
+        seen = []
+
+        def record(module, name, device, dtype):
+            seen.append(name)
+            return module
+
+        args = argparse.Namespace(moss_lora_exclude_blocks=exclude)
+        got = moss_train_network.apply_ramtorch_to_moss_blocks(model, args, "cpu", torch.float32, apply=record)
+        assert got == want, (exclude, got)
+        assert seen == [f"MOSS joint block {i}" for i in want], (exclude, seen)
+        assert all(a is b for a, b in zip(model.layers, before)), exclude  # the recorder hands every block back
+
+
 def test_default_training_step_is_the_previous_one_bit_for_bit():
     """OT, adv, grouped accumulation and tier timing off (the defaults): get_noise_pred_and_target replays the previous
     step exactly (moss-image 09383988): the same RNG use, noise, timesteps, prediction, target and weighting."""
