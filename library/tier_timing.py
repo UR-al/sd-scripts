@@ -13,6 +13,11 @@
 # * reports: every --anima_tier_timing_every optimizer steps the window's per-tier count / mean / median go to the tracker
 #   (tier_time/<tier>/count|mean_ms|median_ms, tier_time/pending); at the end of every epoch one INFO line with the
 #   epoch's per-tier numbers.
+# * --moss_tier_timing (moss_train_network.py) uses the same timer: MOSS latents are already 2x2-packed, so one latent
+#   pixel is one DiT token (patch 1, VAE stride 16) and the tiers keep their meaning (1024^2 px = 64^2 = 4096 tokens).
+#   Its single-stream sequence also carries the caption's text tokens; stop(text_tokens=...) records them per span and
+#   the reports add their per-tier mean (tier_time/<tier>/text_tokens, "text N tok") next to the image-token tier.
+#   A span stopped without text_tokens (Anima) adds nothing: the Anima output is unchanged.
 
 from __future__ import annotations
 
@@ -51,10 +56,10 @@ def _ceil_div(a: int, b: int) -> int:
     return -(-int(a) // int(b))
 
 
-def sample_tokens(batch: Any, patch: int = 2) -> int:
+def sample_tokens(batch: Any, patch: int = 2, vae_downscale: int = VAE_SPATIAL_DOWNSCALE) -> int:
     """DiT tokens per sample of a collate batch (or chunk): from the cached latents (B, C, H, W) / (B, C, T, H, W) as
-    ceil(H / patch) * ceil(W / patch), else from the pixels (B, C, Hpx, Wpx) through the VAE downscale; 0 when the batch
-    carries neither."""
+    ceil(H / patch) * ceil(W / patch), else from the pixels (B, C, Hpx, Wpx) through the VAE downscale `vae_downscale`
+    (MOSS: 16, its latents are already packed); 0 when the batch carries neither."""
     if not isinstance(batch, dict):
         return 0
     latents = batch.get("latents")
@@ -62,8 +67,8 @@ def sample_tokens(batch: Any, patch: int = 2) -> int:
         return _ceil_div(latents.shape[-2], patch) * _ceil_div(latents.shape[-1], patch)
     images = batch.get("images")
     if isinstance(images, torch.Tensor) and images.ndim >= 3:
-        h = int(images.shape[-2]) // VAE_SPATIAL_DOWNSCALE
-        w = int(images.shape[-1]) // VAE_SPATIAL_DOWNSCALE
+        h = int(images.shape[-2]) // vae_downscale
+        w = int(images.shape[-1]) // vae_downscale
         return _ceil_div(h, patch) * _ceil_div(w, patch)
     return 0
 
@@ -75,7 +80,8 @@ def _cuda_event():
 class TierTimer:
     """Collects the forward + backward spans of micro-steps by tier. start(tokens) before the forward, stop() after the
     backward (both on the training thread, in order). report() harvests the finished spans of the window and returns the
-    per-tier statistics; epoch_report() the same over everything harvested since the last epoch report.
+    per-tier statistics; epoch_report() the same over everything harvested since the last epoch report. stop(text_tokens)
+    also records the span's text tokens (MOSS); the statistics of a tier then carry their mean as "text_tokens".
 
     device_type "cuda" (with CUDA available) records event pairs on the current stream; anything else uses `clock`
     (time.perf_counter by default). `event_factory` exists for tests (an object with record() / query() / elapsed_time())."""
@@ -86,9 +92,11 @@ class TierTimer:
         self._event = event_factory or _cuda_event
         self._clock = clock or time.perf_counter
         self._open: Optional[Tuple[str, Any]] = None
-        self._pending: List[Tuple[str, Any, Any]] = []
+        self._pending: List[Tuple[str, Any, Any, Optional[int]]] = []
         self._window: Dict[str, List[float]] = {}
         self._epoch: Dict[str, List[float]] = {}
+        self._window_text: Dict[str, List[int]] = {}  # text tokens of the spans stopped with text_tokens (MOSS)
+        self._epoch_text: Dict[str, List[int]] = {}
         self.dropped = 0  # start() called while a span was open (the previous span is dropped, not mis-measured)
 
     # ------------------------------------------------------------------------------------------------- recording
@@ -103,34 +111,40 @@ class TierTimer:
         else:
             self._open = (tier, self._clock())
 
-    def stop(self) -> None:
+    def stop(self, text_tokens: Optional[int] = None) -> None:
+        """End the open span. text_tokens: the text tokens per sample of the micro-step's joint sequence (MOSS, a host
+        int the forward already had), reported next to the tier; None (Anima) records none."""
         if self._open is None:
             return
         tier, start = self._open
         self._open = None
+        text = None if text_tokens is None else int(text_tokens)
         if self.cuda:
             end = self._event()
             end.record()
-            self._pending.append((tier, start, end))
+            self._pending.append((tier, start, end, text))
         else:
-            self._pending.append((tier, start, self._clock()))
+            self._pending.append((tier, start, self._clock(), text))
 
     # ------------------------------------------------------------------------------------------------- harvesting
     def harvest(self) -> int:
         """Move every finished pending span into the window (CUDA: only pairs whose end event completed - no sync); returns
         how many were moved."""
-        keep: List[Tuple[str, Any, Any]] = []
+        keep: List[Tuple[str, Any, Any, Optional[int]]] = []
         moved = 0
-        for tier, start, end in self._pending:
+        for tier, start, end, text in self._pending:
             if self.cuda:
                 if not end.query():
-                    keep.append((tier, start, end))
+                    keep.append((tier, start, end, text))
                     continue
                 ms = float(start.elapsed_time(end))
             else:
                 ms = (end - start) * 1000.0
             self._window.setdefault(tier, []).append(ms)
             self._epoch.setdefault(tier, []).append(ms)
+            if text is not None:
+                self._window_text.setdefault(tier, []).append(text)
+                self._epoch_text.setdefault(tier, []).append(text)
             moved += 1
         self._pending = keep
         return moved
@@ -140,26 +154,32 @@ class TierTimer:
         return len(self._pending)
 
     @staticmethod
-    def _stats(samples: Dict[str, List[float]]) -> Dict[str, Dict[str, float]]:
+    def _stats(samples: Dict[str, List[float]],
+               text: Optional[Dict[str, List[int]]] = None) -> Dict[str, Dict[str, float]]:
         out: Dict[str, Dict[str, float]] = {}
         for tier, ms in samples.items():
             if ms:
                 out[tier] = {"count": float(len(ms)), "mean_ms": statistics.fmean(ms), "median_ms": statistics.median(ms)}
+                tokens = (text or {}).get(tier)
+                if tokens:
+                    out[tier]["text_tokens"] = statistics.fmean(tokens)
         return out
 
     def report(self) -> Dict[str, Dict[str, float]]:
         """Harvest, then the per-tier count / mean / median of the window since the previous report (the window is
         cleared)."""
         self.harvest()
-        stats = self._stats(self._window)
+        stats = self._stats(self._window, self._window_text)
         self._window = {}
+        self._window_text = {}
         return stats
 
     def epoch_report(self) -> Dict[str, Dict[str, float]]:
         """Harvest, then the per-tier statistics over everything harvested since the previous epoch report."""
         self.harvest()
-        stats = self._stats(self._epoch)
+        stats = self._stats(self._epoch, self._epoch_text)
         self._epoch = {}
+        self._epoch_text = {}
         return stats
 
     # ------------------------------------------------------------------------------------------------- formatting
@@ -169,7 +189,7 @@ class TierTimer:
         return [t for t in order if t in stats] + sorted(t for t in stats if t not in order)
 
     def scalars(self, stats: Dict[str, Dict[str, float]], prefix: str = "tier_time") -> Dict[str, float]:
-        """Tracker scalars: <prefix>/<tier>/count|mean_ms|median_ms and <prefix>/pending."""
+        """Tracker scalars: <prefix>/<tier>/count|mean_ms|median_ms (|text_tokens with MOSS) and <prefix>/pending."""
         out: Dict[str, float] = {}
         for tier in self.tier_order(stats):
             for k, v in stats[tier].items():
@@ -179,6 +199,7 @@ class TierTimer:
 
     def format_line(self, stats: Dict[str, Dict[str, float]], what: str = "epoch") -> str:
         parts = [f"{tier} n={int(s['count'])} mean {s['mean_ms']:.0f} ms median {s['median_ms']:.0f} ms"
+                 + (f" text {s['text_tokens']:.0f} tok" if "text_tokens" in s else "")
                  for tier, s in ((t, stats[t]) for t in self.tier_order(stats))]
         body = " | ".join(parts) if parts else "no finished micro-steps"
         tail = f" | pending {self.pending}" if self.pending else ""

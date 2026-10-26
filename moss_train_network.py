@@ -19,7 +19,7 @@ from library.device_utils import clean_memory_on_device, init_ipex
 init_ipex()
 
 import train_network
-from library import anima_train_utils, attention, sd3_train_utils, strategy_base, timestep_presets, train_util
+from library import anima_train_utils, attention, sd3_train_utils, strategy_base, tier_timing, timestep_presets, train_util
 from library.custom_train_functions import apply_snr_weight_for_flow_matching, maybe_apply_antithetic_noise_pairing
 from library.moss import captions, flow, strategy
 from library.moss import train_utils as moss_train_utils
@@ -68,6 +68,11 @@ class MossNetworkTrainer(train_network.NetworkTrainer):
         self._use_unsloth_offload_checkpointing = False
         self._sigma_sampler: Optional[flow.MossSigmaSampler] = None
         self._te_provider: Optional[strategy.MossTextEncoderProvider] = None
+        self.latent_stride = strategy.MossLatentsCachingStrategy.STRIDE  # adv reference keys of disk-cached latents
+        self._ot_logged = False  # --flow_use_ot: the first batch's assignment is logged once
+        self._tsm_grouped_supported = True  # TSM-LoKr tsm_grouped_accumulation: see get_noise_pred_and_target
+        self._tier_timer = None  # --moss_tier_timing: library/tier_timing.TierTimer, made at the first micro-step
+        self._tier_dit = None  # the unwrapped DiT of the timed micro-step (its forward records the text length)
 
     def get_adaptive_model_type(self, args) -> str:
         return "flow_matching"
@@ -202,10 +207,21 @@ class MossNetworkTrainer(train_network.NetworkTrainer):
                                   text_encoder_masks, unet, network, weight_dtype, train_unet, fixed_timesteps=None,
                                   is_train=True):
         noise = torch.randn_like(latents, dtype=torch.float32)
+        if getattr(args, "flow_use_ot", False) and latents.size(0) > 1:
+            noise = self._ot_reorder_noise(latents, noise)  # before antithetic pairing, as Anima / train_util do
         noise = maybe_apply_antithetic_noise_pairing(args, noise, is_train=is_train)
-        noisy, timesteps, sigmas = flow.get_noisy_model_input_and_timesteps(
-            args, noise_scheduler, latents, noise, accelerator.device, weight_dtype, self._sigma_sampler,
-            fixed_timesteps=fixed_timesteps, is_train=is_train)
+
+        def draw():
+            return flow.get_noisy_model_input_and_timesteps(
+                args, noise_scheduler, latents, noise, accelerator.device, weight_dtype, self._sigma_sampler,
+                fixed_timesteps=fixed_timesteps, is_train=is_train)
+
+        tsm_plan = getattr(self, "_tsm_offload", None)
+        if is_train and fixed_timesteps is None and tsm_plan is not None and tsm_plan.grouped:
+            # TSM-LoKr tsm_grouped_accumulation: every sample of this optimizer step in one core interval (redraws)
+            noisy, timesteps, sigmas = tsm_plan.grouped_draw(draw)
+        else:
+            noisy, timesteps, sigmas = draw()
         if is_train:
             if getattr(self, "wavelet_masking_enabled", False):
                 self._noisy_latents = noisy.detach()
@@ -213,6 +229,8 @@ class MossNetworkTrainer(train_network.NetworkTrainer):
                 self._hf_noisy_latents = noisy.detach()
             if getattr(self, "anchor_scale", 0.0) > 0.0:
                 self._anchor_noisy_latents = noisy.detach()
+            if getattr(self, "adv_scale", 0.0) > 0.0:
+                self._adv_noisy_latents = noisy.detach()  # the stationary RFF-MMD loss (train_network._apply_adv_term)
         self.apply_tlora_mask(timesteps)
         if args.gradient_checkpointing:
             noisy.requires_grad_(True)  # unsloth offload only returns grad-carrying outputs for grad-carrying inputs
@@ -229,6 +247,19 @@ class MossNetworkTrainer(train_network.NetworkTrainer):
         target = noise.to(torch.float64) - latents.to(torch.float64)  # velocity: eps - x0
         weighting = anima_train_utils.compute_loss_weighting_for_anima(args.weighting_scheme, sigmas)
         return model_pred, target, sigmas.flatten(), weighting, noise.to(torch.float64)
+
+    def _ot_reorder_noise(self, latents: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+        """--flow_use_ot (anima_train_network.get_noise_pred_and_target): the batch's noise rows reassigned to the
+        latents by cosine optimal transport. The cost is taken in fp32 (the noise is fp32; cached latents may be bf16)."""
+        with torch.no_grad():
+            b = latents.size(0)
+            _, (_, col_indices) = train_util.cosine_optimal_transport(latents.reshape(b, -1).float(), noise.reshape(b, -1))
+            noise = noise[col_indices.squeeze(0)]
+        if not self._ot_logged:
+            logger.info(f"[MOSS OT] First batch: noise reordered by cosine OT. New noise assignment indices:"
+                        f" {col_indices.squeeze(0).tolist()}")
+            self._ot_logged = True
+        return noise
 
     def process_batch(self, batch, text_encoders, unet, network, vae, noise_scheduler, vae_dtype, weight_dtype,
                       accelerator, args, text_encoding_strategy, tokenize_strategy, is_train=True,
@@ -261,7 +292,43 @@ class MossNetworkTrainer(train_network.NetworkTrainer):
         if self.is_swapping_blocks:
             accelerator.unwrap_model(unet).prepare_block_swap_before_forward()
 
+    # ---- --moss_tier_timing (library/tier_timing.py): one span per micro-step, keyed by its image tokens per sample ----
+    # MOSS latents are already 2x2-packed (one latent pixel = one DiT token: patch 1, pixels / 16); the text tokens of
+    # the joint sequence are reported next to each tier (the padded text length the forward ran with,
+    # MossTransformer.last_text_tokens - a host int, no device read). Off: one attribute check per micro-step.
+    def on_micro_step_start(self, args, accelerator, sub_batch, unet):
+        if not getattr(args, "moss_tier_timing", False):
+            return
+        if self._tier_timer is None:
+            self._tier_timer = tier_timing.TierTimer(getattr(accelerator.device, "type", "cpu"))
+        self._tier_dit = accelerator.unwrap_model(unet)
+        self._tier_timer.start(tier_timing.sample_tokens(sub_batch, patch=1,
+                                                         vae_downscale=strategy.MossLatentsCachingStrategy.STRIDE))
+
+    def on_micro_step_end(self, args, accelerator):
+        if self._tier_timer is not None:
+            self._tier_timer.stop(text_tokens=getattr(self._tier_dit, "last_text_tokens", None))
+
+    def on_optimizer_step_end(self, args, accelerator, global_step: int, is_tracking: bool):
+        timer = self._tier_timer
+        if timer is None or global_step % max(1, int(getattr(args, "moss_tier_timing_every", 50) or 50)):
+            return
+        stats = timer.report()  # the finished spans of the window (CUDA: event pairs already completed, no sync)
+        if is_tracking:
+            accelerator.log(timer.scalars(stats), step=global_step)
+        else:
+            logger.info(timer.format_line(stats, what=f"step {global_step}"))
+
+    def on_epoch_end(self, args, accelerator, epoch: int, global_step: int):
+        if self._tier_timer is not None:
+            logger.info(self._tier_timer.format_line(self._tier_timer.epoch_report(), what=f"epoch {epoch + 1}"))
+
     # ---- samples / metadata -----------------------------------------------------------------------------------
+    def _lycoris_fix_sampler_timestep_scale(self):
+        # LyCORIS fixed paths (TSM / TSM-LoKr / T-LoRA): the MOSS sampler calls dit(x, 1000 * sigma, ...), already the
+        # [0, max_timestep] scale the training masks and expert choices use (train_network._lycoris_fix_wrap_sampling)
+        return 1.0
+
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
         self.clear_tlora_mask_if_needed()  # a training mask may still be set (kept for checkpoint recomputation)
         moss_train_utils.sample_images(accelerator, args, epoch, global_step, unet, vae, self.sample_prompts_te_outputs)

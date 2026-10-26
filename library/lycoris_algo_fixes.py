@@ -4734,8 +4734,8 @@ def attach_tsm_offload(network, optimizer, args, device, batch_size: int = 1, gr
         raise ValueError(f"tsm-lokr: {en} / tsm-lokr: {ko}")
 
     if grouped and not grouped_supported:
-        refuse("tsm_grouped_accumulation=True is implemented for anima_train_network.py only",
-               "tsm_grouped_accumulation=True 는 아직 Anima 학습기에서만 됩니다")
+        refuse("tsm_grouped_accumulation=True is implemented for anima_train_network.py and moss_train_network.py only",
+               "tsm_grouped_accumulation=True 는 아직 Anima·MOSS 학습기에서만 됩니다")
     need = 1 if grouped else window
     if cfg.resident_cores < need and stage1:
         refuse(f"tsm_resident_cores={cfg.resident_cores} is below the core experts one optimizer step can touch"

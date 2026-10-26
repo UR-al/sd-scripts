@@ -287,6 +287,7 @@ class MossTransformer(nn.Module):
         self.num_blocks = num_layers
         self.blocks_to_swap = None
         self.offloader: Optional[custom_offloading_utils.ModelOffloader] = None
+        self.last_text_tokens: Optional[int] = None  # set by forward (a host int it computes anyway)
 
     # ---- properties / switches -----------------------------------------------------------------------------
     @property
@@ -353,14 +354,20 @@ class MossTransformer(nn.Module):
 
     @staticmethod
     def _right_align_text(text: torch.Tensor, mask: torch.Tensor):
-        """Move valid text rows to the front of each sample (the official forward drops padded rows anywhere)."""
+        """Move valid text rows to the front of each sample (the official forward drops padded rows anywhere). Returns
+        (text, mask, lengths as Python ints): the lengths and the already-aligned test reach the host in ONE transfer,
+        and every later decision of the forward (empty check, trim, RoPE rows, the attention trims of every block) reads
+        these ints - reading the device tensors was a GPU->CPU sync each, two per attention call in every block."""
         lengths = mask.sum(1)
         positions = torch.arange(mask.shape[1], device=mask.device)[None]
-        if torch.equal(mask, positions < lengths[:, None]):
-            return text, mask, lengths
+        aligned = torch.eq(mask, positions < lengths[:, None]).all()  # torch.equal of two same-shape bool tensors
+        host = torch.cat((lengths.to(torch.int64), aligned.reshape(1).to(torch.int64))).tolist()
+        lengths_host = host[:-1]
+        if host[-1]:
+            return text, mask, lengths_host
         order = torch.argsort((~mask).to(torch.int8), dim=1, stable=True)
         text = torch.gather(text, 1, order[..., None].expand_as(text))
-        return text, positions < lengths[:, None], lengths
+        return text, positions < lengths[:, None], lengths_host
 
     def forward(self, x: torch.Tensor, timesteps: torch.Tensor, text: torch.Tensor,
                 text_mask: Optional[torch.Tensor] = None, skip_layers: Optional[Iterable[int]] = None) -> torch.Tensor:
@@ -381,24 +388,28 @@ class MossTransformer(nn.Module):
         text_mask = text_mask.to(device=x.device).bool()
         if text_mask.shape != text.shape[:2]:
             raise ValueError("text_mask must be [B, S].")
-        text, text_mask, lengths = self._right_align_text(text.to(x.device), text_mask)
-        if bool((lengths == 0).any()):
+        text, text_mask, lengths = self._right_align_text(text.to(x.device), text_mask)  # lengths: Python ints
+        if min(lengths) == 0:
             raise ValueError("Each sample needs at least one valid text token (an empty caption still has 10).")
-        max_len = int(lengths.max())
+        max_len = max(lengths)
         text, text_mask = text[:, :max_len], text_mask[:, :max_len]
         img_len = height * width
+        self.last_text_tokens = max_len  # the text length this forward ran with (--moss_tier_timing reads it)
 
         mod, head = self.time_conditioning(timesteps, batch, x.device)
         video = x.flatten(2).transpose(1, 2)
         video = self.video_embedder(video.to(self.video_embedder.weight.dtype).contiguous())  # [B, HW, D]
         # fp32 phases, then the activation dtype (official: rope.to(video.dtype)).
-        rope = self.rope.batched(height, width, lengths.tolist(), max_len, x.device).to(video.dtype)
+        rope = self.rope.batched(height, width, lengths, max_len, x.device).to(video.dtype)
 
         # xformers' block-diagonal bias needs packed sequences; with padded batches use per-sample attention instead.
         split = self.split_attn or (self.attn_mode == "xformers" and batch > 1)
-        text_params = attention.AttentionParams.create_attention_params_from_mask(self.attn_mode, split, 0, text_mask)
+        # the host lengths go with the params: attention() decides its trim / per-sample split without a device read
+        text_params = attention.AttentionParams.create_attention_params_from_mask(self.attn_mode, split, 0, text_mask,
+                                                                                  text_lengths=lengths)
         hidden = torch.cat((video, self.text_embedder(text, rope[:, img_len:], text_params)), 1)
-        joint_params = attention.AttentionParams.create_attention_params_from_mask(self.attn_mode, split, img_len, text_mask)
+        joint_params = attention.AttentionParams.create_attention_params_from_mask(self.attn_mode, split, img_len, text_mask,
+                                                                                   text_lengths=lengths)
 
         for index, layer in enumerate(self.layers):
             if self.blocks_to_swap:

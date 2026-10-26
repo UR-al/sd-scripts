@@ -1,6 +1,7 @@
-"""CPU tests for --anima_tier_timing (library/tier_timing.py): the tier mapping, the token count of a batch, the timer
-(CPU clock and CUDA-style event pairs harvested only once finished), the tracker scalars / log line, and the trainer
-wiring (hooks around each micro-step, the periodic and epoch-end reports, the parser).
+"""CPU tests for --anima_tier_timing / --moss_tier_timing (library/tier_timing.py): the tier mapping, the token count of
+a batch, the timer (CPU clock and CUDA-style event pairs harvested only once finished), the tracker scalars / log line,
+and the trainer wiring (hooks around each micro-step, the periodic and epoch-end reports, the parser); MOSS adds the
+patch-1 / stride-16 token count and the text tokens per tier.
 
 Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe -B -m pytest tests/test_tier_timing.py
 """
@@ -228,3 +229,127 @@ def test_parser_and_validation():
     atn.validate_tier_timing_args(argparse.Namespace(anima_tier_timing=False, anima_tier_timing_every=0))
     with pytest.raises(ValueError, match="anima_tier_timing_every"):
         atn.validate_tier_timing_args(argparse.Namespace(anima_tier_timing=True, anima_tier_timing_every=0))
+
+
+# ------------------------------------------------------------------------------------------- --moss_tier_timing (MOSS)
+
+
+def test_text_tokens_are_reported_per_tier():
+    """stop(text_tokens=...) (MOSS: the text rows of the joint sequence) adds the per-tier mean text tokens to the
+    statistics, the tracker scalars and the log line; spans stopped without it (Anima) add nothing."""
+    clock = _Clock()
+    timer = tier_timing.TierTimer("cpu", clock=clock)
+    for tokens, text, ms in ((4096, 180, 900.0), (4096, 220, 1100.0), (1024, None, 300.0), (16384, 300, 4000.0)):
+        timer.start(tokens)
+        clock.t += ms / 1000.0
+        timer.stop(text_tokens=text)
+    stats = timer.report()
+    assert stats["1024"]["count"] == 2 and stats["1024"]["text_tokens"] == pytest.approx(200.0)
+    assert "text_tokens" not in stats["512"] and stats["2048"]["text_tokens"] == pytest.approx(300.0)
+    scal = timer.scalars(stats)
+    assert scal["tier_time/1024/text_tokens"] == pytest.approx(200.0) and "tier_time/512/text_tokens" not in scal
+    line = timer.format_line(stats, what="step 50")
+    assert "512 n=1 mean 300 ms median 300 ms | 1024 n=2 mean 1000 ms median 1000 ms text 200 tok" in line, line
+    assert timer.epoch_report()["2048"]["text_tokens"] == pytest.approx(300.0)
+    gpu = _GPU()  # event pairs keep the text tokens until they are harvested
+    ev = tier_timing.TierTimer("cuda", event_factory=gpu.event)
+    ev.start(4096)
+    gpu.now += 1.0
+    ev.stop(text_tokens=128)
+    assert ev.report() == {} and ev.pending == 1
+    gpu.done_until = gpu.now
+    assert ev.report()["1024"]["text_tokens"] == 128.0
+
+
+def test_sample_tokens_moss_patch_one_stride_sixteen():
+    """MOSS latents are already 2x2-packed: one latent pixel is one DiT token (patch 1); pixels go through stride 16.
+    The tiers keep their meaning: 1024^2 px = 64^2 latents = 4096 tokens, the '1024' tier."""
+    assert tier_timing.sample_tokens({"latents": torch.zeros(2, 128, 64, 64)}, patch=1) == 4096
+    assert tier_timing.sample_tokens({"latents": torch.zeros(1, 128, 32, 48)}, patch=1) == 32 * 48
+    assert tier_timing.sample_tokens({"images": torch.zeros(1, 3, 1024, 1024)}, patch=1, vae_downscale=16) == 4096
+    assert tier_timing.tier_of_tokens(4096) == "1024" and tier_timing.tier_of_tokens(32 * 32) == "512"
+
+
+class _Untouchable:
+    def __getattr__(self, name):
+        raise AssertionError(f".{name} read while --moss_tier_timing is off")
+
+    def __getitem__(self, key):
+        raise AssertionError(f"[{key!r}] read while --moss_tier_timing is off")
+
+
+def test_moss_trainer_times_micro_steps_with_text_tokens(caplog):
+    """MossNetworkTrainer with --moss_tier_timing: one span per micro-step keyed by the image tokens per sample of its
+    batch (patch 1), with the text tokens its forward ran with (MossTransformer.last_text_tokens) next to the tier; the
+    reports as --anima_tier_timing. Off, the hooks return after the one attribute check: the batch, the accelerator and
+    the model are never touched and no timer is made."""
+    import moss_train_network as mtn
+    from library.moss.models import MossTransformer
+
+    args = argparse.Namespace(moss_tier_timing=False, moss_tier_timing_every=2)
+    off = mtn.MossNetworkTrainer()
+    off.on_micro_step_start(args, _Untouchable(), _Untouchable(), _Untouchable())
+    off.on_micro_step_end(args, _Untouchable())
+    off.on_optimizer_step_end(args, _Untouchable(), 2, True)
+    off.on_epoch_end(args, _Untouchable(), 0, 2)
+    assert off._tier_timer is None
+
+    args.moss_tier_timing = True
+    tr = mtn.MossNetworkTrainer()
+    accel = _Accel()
+    torch.manual_seed(0)
+    dit = MossTransformer(dim=64, ffn_dim=96, num_heads=4, num_layers=2, text_dim=48, freq_dim=16, latent_channels=128,
+                          rope_base=10000.0)
+
+    def micro_step(batch, text_len, step):
+        tr.on_micro_step_start(args, accel, batch, dit)
+        text = torch.randn(1, text_len + 3, 48)
+        mask = torch.zeros(1, text_len + 3, dtype=torch.bool)
+        mask[0, :text_len] = True
+        with torch.no_grad():
+            dit(torch.randn(1, 128, 2, 2), torch.tensor([500.0]), text, mask)  # a small forward records the text length
+        tr.on_micro_step_end(args, accel)
+        tr.on_optimizer_step_end(args, accel, step, True)
+
+    micro_step({"latents": torch.zeros(1, 128, 64, 64)}, 12, 1)  # 1024^2 px: the 1024 tier
+    micro_step({"latents": torch.zeros(1, 128, 32, 32)}, 7, 2)  # 512^2 px
+    micro_step({"images": torch.zeros(1, 3, 1024, 1024)}, 20, 3)  # uncached latents: pixels / 16
+    micro_step({"latents": torch.zeros(1, 128, 128, 128)}, 30, 4)  # 2048^2 px
+    assert tr._tier_timer is not None and not tr._tier_timer.cuda
+    assert [s for s, _ in accel.logged] == [2, 4]
+    first, second = accel.logged[0][1], accel.logged[1][1]
+    assert first["tier_time/1024/count"] == 1.0 and first["tier_time/1024/text_tokens"] == 12.0
+    assert first["tier_time/512/text_tokens"] == 7.0
+    assert second["tier_time/1024/text_tokens"] == 20.0 and second["tier_time/2048/text_tokens"] == 30.0
+    with caplog.at_level(logging.INFO, logger="moss_train_network"):
+        tr.on_epoch_end(args, accel, 0, 4)
+    lines = [r.getMessage() for r in caplog.records if "tier timing" in r.getMessage()]
+    assert len(lines) == 1 and "1024 n=2" in lines[0] and "text 16 tok" in lines[0] and "512 n=1" in lines[0], lines
+
+
+def test_moss_parser_and_validation(tmp_path):
+    import moss_train_network as mtn
+    from library.moss import train_utils as mtu
+
+    parser = mtn.setup_parser()
+    ns = parser.parse_args([])
+    assert ns.moss_tier_timing is False and ns.moss_tier_timing_every == 50
+    ns = parser.parse_args(["--moss_tier_timing", "--moss_tier_timing_every", "10"])
+    assert ns.moss_tier_timing is True and ns.moss_tier_timing_every == 10
+    model, vae = tmp_path / "moss.safetensors", tmp_path / "vae.safetensors"
+    model.write_bytes(b"")
+    vae.write_bytes(b"")
+
+    def refusal(**kw):
+        a = parser.parse_args(["--pretrained_model_name_or_path", str(model), "--vae", str(vae)])
+        for k, v in kw.items():
+            setattr(a, k, v)
+        try:
+            mtu.validate_moss_args(a, None, None)
+        except ValueError as e:
+            return str(e)
+        return ""
+
+    assert "--moss_tier_timing_every must be >= 1" in refusal(moss_tier_timing=True, moss_tier_timing_every=0)
+    assert "moss_tier_timing_every" not in refusal(moss_tier_timing=True, moss_tier_timing_every=1)  # a later check
+    assert "moss_tier_timing_every" not in refusal(moss_tier_timing=False, moss_tier_timing_every=0)

@@ -40,7 +40,7 @@ stage-2 step and the router learns it back).
 | `dora_wd` | False | DoRA magnitude (output axis; `wd_on_output=False` is refused) |
 | `tsm_offload_states` | True | core experts' AdamW states in pinned RAM between optimizer steps |
 | `tsm_resident_cores` | n_core | core experts whose fp32 weights stay on the GPU (least recently used are swapped out) |
-| `tsm_grouped_accumulation` | False | all samples of one optimizer step from one core interval (Anima trainer only) |
+| `tsm_grouped_accumulation` | False | all samples of one optimizer step from one core interval (Anima and MOSS trainers only) |
 
 Nothing is switched on, off or changed at runtime: no memory guard, no fallback. If memory runs out the run stops
 with an out-of-memory error and the settings are changed by hand. Inconsistent settings stop at start-up with an

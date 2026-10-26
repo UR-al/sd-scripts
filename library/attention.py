@@ -3,7 +3,7 @@
 import logging
 from dataclasses import dataclass
 import torch
-from typing import Optional, Union
+from typing import List, Optional, Sequence, Union
 
 _logger = logging.getLogger(__name__)
 
@@ -72,6 +72,10 @@ class AttentionParams:
     seqlens: Optional[torch.Tensor] = None
     cu_seqlens: Optional[torch.Tensor] = None
     max_seqlen: Optional[int] = None
+    # host copy of seqlens (Python ints), set when the caller already holds the text lengths on the CPU
+    # (create_attention_params_from_mask(text_lengths=...)): attention() then decides the trim / per-sample split from
+    # it instead of reading the device tensor - one GPU->CPU sync per call otherwise, i.e. per block
+    seqlens_host: Optional[List[int]] = None
 
     @property
     def supports_fp32(self) -> bool:
@@ -87,8 +91,11 @@ class AttentionParams:
 
     @staticmethod
     def create_attention_params_from_mask(
-        attn_mode: Optional[str], split_attn: bool, img_len: Optional[int], attention_mask: Optional[torch.Tensor]
+        attn_mode: Optional[str], split_attn: bool, img_len: Optional[int], attention_mask: Optional[torch.Tensor],
+        text_lengths: Optional[Sequence[int]] = None,
     ) -> "AttentionParams":
+        """text_lengths: attention_mask.sum(1) as Python ints when the caller already has them on the CPU (computed once
+        per forward); the params then carry a host copy of seqlens and attention() never reads the device tensor."""
         if attention_mask is None:
             # No attention mask provided: assume all tokens are valid
             return AttentionParams(attn_mode, split_attn, None, None, None, None, None)
@@ -96,10 +103,11 @@ class AttentionParams:
             # Note: attention_mask is only for text tokens, not including image tokens
             seqlens = attention_mask.sum(dim=1).to(torch.int32) + img_len  # [B]
             max_seqlen = attention_mask.shape[1] + img_len
+            seqlens_host = None if text_lengths is None else [int(n) + img_len for n in text_lengths]
 
             if split_attn:
                 # cu_seqlens is not needed for split attention
-                return AttentionParams(attn_mode, split_attn, img_len, attention_mask, seqlens, None, max_seqlen)
+                return AttentionParams(attn_mode, split_attn, img_len, attention_mask, seqlens, None, max_seqlen, seqlens_host)
 
             # Convert attention mask to cumulative sequence lengths for flash attention
             batch_size = attention_mask.shape[0]
@@ -112,14 +120,14 @@ class AttentionParams:
             attention_mask = torch.nn.functional.pad(attention_mask, (img_len, 0), value=1)  # [B, img_len + L]
 
             if attn_mode == "xformers":
-                seqlens_list = seqlens.cpu().tolist()
+                seqlens_list = list(seqlens_host) if seqlens_host is not None else seqlens.cpu().tolist()
                 attention_mask = xops.fmha.attn_bias.BlockDiagonalMask.from_seqlens(
                     seqlens_list, seqlens_list, device=attention_mask.device
                 )
             elif attn_mode == "torch":
                 attention_mask = attention_mask[:, None, None, :].to(torch.bool)  # [B, 1, 1, img_len + L]
 
-            return AttentionParams(attn_mode, split_attn, img_len, attention_mask, seqlens, cu_seqlens, max_seqlen)
+            return AttentionParams(attn_mode, split_attn, img_len, attention_mask, seqlens, cu_seqlens, max_seqlen, seqlens_host)
 
 
 def attention(
@@ -157,11 +165,18 @@ def attention(
     if attn_params is None:
         attn_params = AttentionParams.create_attention_params("torch", False)
 
-    # If split attn is False, attention mask is provided and all sequence lengths are same, we can trim the sequence
+    # If split attn is False, attention mask is provided and all sequence lengths are same, we can trim the sequence.
+    # With a host copy of the lengths (seqlens_host) the decision costs no GPU->CPU sync; without one it reads the
+    # device tensor as before (a sync per call).
     seqlen_trimmed = False
     if not attn_params.split_attn and attn_params.attention_mask is not None and attn_params.seqlens is not None:
-        if torch.all(attn_params.seqlens == attn_params.seqlens[0]):
-            seqlen = attn_params.seqlens[0].item()
+        host = attn_params.seqlens_host
+        if host is not None:
+            uniform = all(n == host[0] for n in host)
+        else:
+            uniform = bool(torch.all(attn_params.seqlens == attn_params.seqlens[0]))
+        if uniform:
+            seqlen = host[0] if host is not None else attn_params.seqlens[0].item()
             q = q[:, :seqlen]
             k = k[:, :seqlen]
             v = v[:, :seqlen]
@@ -193,8 +208,9 @@ def attention(
         # into DELETE_DEREF - a bytecode torch.compile (dynamo, torch 2.7) does not trace, i.e. a graph break per
         # attention call under --anima_block_compile. With plain locals the del is DELETE_FAST.
         qs, ks, vs = [], [], []
+        host = attn_params.seqlens_host
         for i in range(len(q)):
-            n = attn_params.seqlens[i]
+            n = host[i] if host is not None else attn_params.seqlens[i]  # a device element as a slice end: a sync each
             qs.append(transpose_fn(q[i : i + 1, :n]))
             ks.append(transpose_fn(k[i : i + 1, :n]))
             vs.append(transpose_fn(v[i : i + 1, :n]))

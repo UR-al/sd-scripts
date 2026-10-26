@@ -75,6 +75,16 @@ def add_moss_training_arguments(parser) -> None:
                         help="sample images: sigma shift (official 5.0); --fs in a prompt line overrides it")
     parser.add_argument("--moss_sample_uncond_skip_layers", type=str, default=DEFAULT_UNCOND_SKIP_LAYERS,
                         help="sample images: main blocks skipped in the negative CFG branch (official '22'; '' = off)")
+    parser.add_argument("--moss_tier_timing", action="store_true",
+                        help="--anima_tier_timing for MOSS (library/tier_timing.py): time every micro-step's forward +"
+                             " backward and group the times by resolution tier of its image tokens per sample (one latent"
+                             " pixel = one DiT token: 512^2 = 1024, 1024^2 = 4096, 1536^2 = 9216, 2048^2 = 16384); the text"
+                             " tokens of the joint sequence are reported per tier next to it (tier_time/<tier>/text_tokens,"
+                             " 'text N tok'). CUDA: event pairs read only once finished (no synchronization); CPU:"
+                             " perf_counter. Every --moss_tier_timing_every optimizer steps the window goes to the tracker,"
+                             " at the end of every epoch one INFO line. Off (default): one attribute check per micro-step")
+    parser.add_argument("--moss_tier_timing_every", type=int, default=50,
+                        help="optimizer steps between --moss_tier_timing reports (default 50)")
     # Accepted and ignored so Anima command lines / train.ps1 do not fail argparse.
     parser.add_argument("--vae_chunk_size", type=int, default=None, help="ignored for MOSS-Image")
     parser.add_argument("--vae_disable_cache", action="store_true", help="ignored for MOSS-Image")
@@ -108,6 +118,8 @@ def validate_moss_args(args, train_dataset_group, val_dataset_group) -> None:
         fail(f"timestep_sampling must be one of {TIMESTEP_CHOICES} (flux_shift assumes 8x latents), got {args.timestep_sampling}")
     if not 1 <= int(args.moss_max_token_length) <= 4096:
         fail("moss_max_token_length must be in 1..4096")
+    if getattr(args, "moss_tier_timing", False) and int(getattr(args, "moss_tier_timing_every", 50) or 0) < 1:
+        fail(f"--moss_tier_timing_every must be >= 1 (optimizer steps between reports), got {args.moss_tier_timing_every}")
     if args.cache_text_encoder_outputs_to_disk and not args.cache_text_encoder_outputs:
         args.cache_text_encoder_outputs = True
     if not args.cache_text_encoder_outputs:

@@ -4,7 +4,9 @@ Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe tests/test_moss_pipeline.py
 """
 import argparse
 import contextlib
+import inspect
 import io
+import logging
 import os
 import tempfile
 import types
@@ -565,6 +567,427 @@ def test_canonical_caption_drops_separator():
     dataset = types.SimpleNamespace(replacements={})
     out = captions.canonical_caption(dataset, subset, "@mytrigger, 1girl ||| solo, smile ||| A girl smiles, softly.")
     assert out == "@mytrigger, 1girl, solo, smile, A girl smiles, softly.", out
+
+
+# ------------------------------------------------------------------------------------------------- trainer paths
+# MossNetworkTrainer.get_noise_pred_and_target / sampling as train_network.train runs them, on the tiny DiT: the
+# LyCORIS timestep of TSM / T-LoRA / TSM-LoKr (training and sample images), TSM-LoKr grouped accumulation,
+# --flow_use_ot, the adv term, the default path bit for bit, and the host-side caption-dropout check.
+
+LOG = logging.getLogger("test_moss_pipeline")
+
+
+class _Accel:
+    device = torch.device("cpu")
+
+    def autocast(self):
+        return contextlib.nullcontext()
+
+    def unwrap_model(self, model):
+        return model
+
+
+def _train_args(**kw):
+    import moss_train_network
+
+    args = moss_train_network.setup_parser().parse_args([])
+    for k, v in kw.items():
+        setattr(args, k, v)
+    return args
+
+
+def _trainer(args, network=None, algo=""):
+    import moss_train_network
+
+    trainer = moss_train_network.MossNetworkTrainer()
+    trainer._sigma_sampler = flow.MossSigmaSampler(args)
+    if network is not None:  # what train_network.train sets up with the LyCORIS fixed paths on
+        from library import lycoris_algo_fixes
+
+        trainer.network = network
+        trainer._lycoris_fix_on, trainer._lycoris_fixes, trainer._lycoris_fix_algo = True, lycoris_algo_fixes, algo
+    return trainer
+
+
+def _train_inputs(b=2, seed=7):
+    g = torch.Generator().manual_seed(seed)
+    latents = torch.randn(b, 128, 2, 3, generator=g)
+    text = torch.randn(b, 5, TINY["text_dim"], generator=g)
+    mask = torch.ones(b, 5, dtype=torch.bool)
+    mask[-1, 3:] = False
+    return latents, text, mask
+
+
+def _step(trainer, args, model, latents, text, mask, net=None):
+    """One micro-step: forward through get_noise_pred_and_target, backward; with LyCORIS the timestep is kept until after
+    the backward (train_network sets _lycoris_fix_defer_clear around the chunk, _lycoris_fix_after_backward clears)."""
+    trainer._lycoris_fix_defer_clear = net is not None
+    out = trainer.get_noise_pred_and_target(args, _Accel(), trainer.get_noise_scheduler(args, "cpu"), latents, {},
+                                            [text, mask], None, model, net, torch.float32, True)
+    (out[0].float() - out[1].float()).square().mean().backward()
+    if net is not None:
+        trainer._lycoris_fix_after_backward(net)
+    return out
+
+
+# algo: (network_dim, network_alpha, network_args); TSM-LoKr as config_moss.toml's LoKr (full matrix, DoRA on the output)
+TIMESTEP_ALGOS = {
+    "tsm": (4, 4, {"tsm_n_scales": "4,1"}),
+    "tlora": (8, 8, {}),
+    "tsm-lokr": (10000, 10000, {"factor": 4, "full_matrix": True, "dora_wd": True, "wd_on_output": True,
+                                "tsm_n_scales": "4,1"}),
+}
+
+
+@contextlib.contextmanager
+def _fixed_paths():
+    """The LyCORIS fixed paths for one test, in the production order (prepare_moss_runtime installs the fast LoKr forward,
+    train() then patches LyCORIS); reverted afterwards unless they were on already."""
+    from library import lycoris_algo_fixes as laf
+    from library import lycoris_fast
+    from lycoris.modules.tlora import clear_timestep_mask
+    from lycoris.modules.tsm import clear_tsm_timestep
+
+    was_on = bool(laf._PATCHES)
+    lycoris_fast.install_fast_lokr_forward()
+    laf.apply_module_patches()
+    register_moss_lycoris_presets()
+    try:
+        yield laf
+    finally:
+        clear_timestep_mask()
+        clear_tsm_timestep()
+        laf._TSM_SAMPLE_T.clear()
+        if not was_on:
+            laf._revert_module_patches()
+
+
+def _moss_network(laf, algo, **network_args):
+    """(tiny DiT, LyCORIS network with preset moss on it), made as train_network makes it with the fixed paths on."""
+    from lycoris import kohya
+
+    dim, alpha, base = TIMESTEP_ALGOS[algo]
+    raw = {"algo": algo, **{k: str(v) for k, v in {**base, **network_args}.items()}}
+    model = _tiny_dit()
+    net = kohya.create_network(1.0, dim, alpha, None, [], model, preset="moss", **laf.prepare_network_kwargs(algo, raw, LOG))
+    net.apply_to([], model, apply_text_encoder=False, apply_unet=True)
+    laf.after_network_created(net, argparse.Namespace(network_args=[f"{k}={v}" for k, v in raw.items()], network_dim=dim,
+                                                      network_alpha=alpha, lycoris_algo_fixes=True), LOG)
+    net.prepare_grad_etc(None, model)
+    return model, net
+
+
+def _is_tlora(laf, net):
+    return any(type(m).__name__ == "TLoraModule" for m in laf._all_loras(net))
+
+
+def _timestep_state(laf, net):
+    """What the adapters read in a forward: T-LoRA's rank mask, or TSM's (timestep, per-sample timesteps)."""
+    from lycoris.modules.tlora import get_timestep_mask
+    from lycoris.modules.tsm import get_tsm_timestep
+
+    if _is_tlora(laf, net):
+        mask = get_timestep_mask(0)
+        return None if mask is None else mask.detach().clone()
+    return get_tsm_timestep(0), list(laf._TSM_SAMPLE_T.get(0, []))
+
+
+def _no_timestep(state):
+    return state is None or (isinstance(state, tuple) and state == (None, []))
+
+
+def _expected_state(laf, net, timesteps):
+    """The state lycoris_algo_fixes.set_timestep makes from the DiT's timestep argument taken as [0, 1000]."""
+    t = timesteps.detach().float().reshape(-1)
+    if _is_tlora(laf, net):
+        from lycoris.modules.tlora import compute_timestep_mask, compute_timestep_mask_batch
+
+        cfg = laf._network_cfg(net)["tlora"]
+        if t.numel() == 1:
+            return compute_timestep_mask(int(t.item()), 1000, cfg["max_rank"], cfg["min_rank"], cfg["alpha"])
+        return compute_timestep_mask_batch(t, 1000, cfg["max_rank"], cfg["min_rank"], cfg["alpha"])
+    T = int(laf._all_loras(net)[0].tsm_num_timesteps)
+    ints = [max(0, min(T, int(round(v * T / 1000.0)))) for v in t.tolist()]
+    return ints[0], (ints if len(ints) > 1 else [])
+
+
+def _same_state(a, b):
+    if isinstance(a, torch.Tensor) or isinstance(b, torch.Tensor):
+        return isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor) and torch.equal(a, b.to(a.dtype))
+    return a == b
+
+
+def test_training_step_gives_tsm_tlora_tsmlokr_their_timesteps():
+    """Training: every adapter of TSM / T-LoRA / TSM-LoKr (preset moss) sees the timesteps the DiT is called with
+    (1000 * sigma, the [0, 1000] scale of the masks and expert intervals), per sample, in the forward and in gradient
+    checkpointing's recompute; after the backward nothing is left set."""
+    for algo in TIMESTEP_ALGOS:
+        for gc in (False, True):
+            with _fixed_paths() as laf:
+                model, net = _moss_network(laf, algo)
+                if gc:
+                    model.enable_gradient_checkpointing()
+                args = _train_args(timestep_sampling="uniform", gradient_checkpointing=gc)
+                trainer = _trainer(args, net, algo)
+                latents, text, mask = _train_inputs()
+                ts, states = [], []
+                hooks = [model.register_forward_pre_hook(lambda m, a, k: ts.append(a[1].detach().clone()), with_kwargs=True),
+                         # an adapted Linear inside block 0: also runs in the checkpoint recompute (block._forward)
+                         model.layers[0].proj.q.register_forward_pre_hook(
+                             lambda m, a: states.append(_timestep_state(laf, net)))]
+                torch.manual_seed(5)
+                _step(trainer, args, model, latents, text, mask, net)
+                for h in hooks:
+                    h.remove()
+                assert len(ts) == 1 and len(states) == (2 if gc else 1), (algo, gc, len(states))
+                want = _expected_state(laf, net, ts[0])
+                assert all(_same_state(s, want) for s in states), (algo, gc, states, want)
+                assert _no_timestep(_timestep_state(laf, net)), algo
+
+
+def test_sample_images_feed_every_sampler_step_timestep():
+    """Sample images: moss_sample calls dit(x, 1000 * sigma, ...) (cond, and the skip-layer uncond branch); the sampling
+    hook now hands each call's timestep to TSM / T-LoRA / TSM-LoKr (MossNetworkTrainer._lycoris_fix_sampler_timestep_scale
+    = 1). The base answer (None, what MOSS inherited) ran every step with no timestep: TSM's highest-noise experts, the
+    full T-LoRA rank. Nothing stays set afterwards."""
+    from library.moss import train_utils as moss_train_utils
+
+    steps, shift = 4, 3.0
+    want_t = [float(v) for v in (moss_train_utils.moss_inference_sigmas(steps, shift)[:-1] * 1000.0) for _ in (0, 1)]
+    for algo in TIMESTEP_ALGOS:
+        with _fixed_paths() as laf:
+            model, net = _moss_network(laf, algo)
+            args = _train_args()
+            trainer = _trainer(args, net, algo)
+            _, text, mask = _train_inputs()
+
+            def sample_images(accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
+                return moss_train_utils.moss_sample(unet, (text[:1], mask[:1]), (text[1:], mask[1:]), 32, 48, steps, 2.0,
+                                                    shift, seed=0, device="cpu", skip_layers=(1,))
+
+            assert trainer._lycoris_fix_sampler_timestep_scale() == 1.0
+            for inherited in (False, True):
+                if inherited:
+                    trainer._lycoris_fix_sampler_timestep_scale = lambda: None
+                calls = []
+                hooks = [model.register_forward_pre_hook(lambda m, a, k: calls.append([a[1].detach().clone()]),
+                                                         with_kwargs=True),  # before the wrapper's hook: the raw t
+                         model.layers[0].proj.q.register_forward_pre_hook(
+                             lambda m, a: calls[-1].append(_timestep_state(laf, net)))]
+                trainer._lycoris_fix_wrap_sampling(sample_images)(_Accel(), args, 0, 1, "cpu", None, None, None, model)
+                for h in hooks:
+                    h.remove()
+                assert [float(t) for t, _ in calls] == want_t, (algo, calls)
+                if inherited:
+                    assert all(_no_timestep(state) for _, state in calls), algo
+                else:
+                    assert all(_same_state(state, _expected_state(laf, net, t)) for t, state in calls), algo
+                assert _no_timestep(_timestep_state(laf, net)), algo
+
+
+def test_tsm_lokr_grouped_accumulation_on_moss():
+    """tsm_grouped_accumulation=True: the base trainer refuses it, MOSS attaches it (_tsm_grouped_supported) and draws all
+    samples of an optimizer step from one core interval (grouped_draw around flow.get_noisy_model_input_and_timesteps;
+    each row of the noisy input stays its accepted draw's). Off, an optimizer step's samples spread over the intervals."""
+    import train_network
+
+    assert not train_network.NetworkTrainer()._tsm_grouped_supported
+    for grouped in (True, False):
+        with _fixed_paths() as laf:
+            model, net = _moss_network(laf, "tsm-lokr", tsm_grouped_accumulation=grouped,
+                                       tsm_resident_cores=2 if grouped else 4)
+            res = net.prepare_optimizer_params(text_encoder_lr=None, unet_lr=1e-2, learning_rate=1e-2)
+            opt = torch.optim.AdamW(res[0] if isinstance(res, tuple) else res, lr=1e-2, fused=True)
+            accum = argparse.Namespace(gradient_accumulation_steps=2)
+            args = _train_args(timestep_sampling="uniform")
+            trainer = _trainer(args, net, "tsm-lokr")
+            assert trainer._tsm_grouped_supported
+            if grouped:
+                try:
+                    laf.attach_tsm_offload(net, opt, accum, torch.device("cpu"), batch_size=2, grouped_supported=False)
+                    raise AssertionError("grouped accumulation attached for a trainer without it")
+                except ValueError as e:
+                    assert "moss_train_network.py" in str(e)
+            mgr = laf.attach_tsm_offload(net, opt, accum, torch.device("cpu"), batch_size=2,
+                                         grouped_supported=trainer._tsm_grouped_supported)
+            assert mgr is not None and mgr.grouped is grouped
+            trainer._tsm_offload = mgr
+            latents, text, mask = _train_inputs()
+            seen = []
+            hook = model.register_forward_pre_hook(lambda m, a, k: seen.append((a[0].detach().clone(), a[1].detach().clone())),
+                                                   with_kwargs=True)
+            torch.manual_seed(11)
+            cores_per_step = []
+            for _ in range(6):
+                seen.clear()
+                for _ in range(accum.gradient_accumulation_steps):
+                    _, _, sigmas, _, noise = _step(trainer, args, model, latents, text, mask, net)
+                    s = sigmas.view(-1, 1, 1, 1)
+                    torch.testing.assert_close(seen[-1][0], (1 - s) * latents + s * noise.float())  # rows of one draw
+                    torch.testing.assert_close(seen[-1][1], sigmas * 1000)
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+                cores_per_step.append({mgr.core_index_t(v) for _, t in seen for v in t.tolist()})
+            hook.remove()
+            if grouped:
+                assert all(len(c) == 1 for c in cores_per_step), cores_per_step
+            else:
+                assert any(len(c) > 1 for c in cores_per_step), cores_per_step
+
+
+def test_flow_use_ot_reorders_the_noise_like_anima():
+    """--flow_use_ot (anima_train_network.get_noise_pred_and_target): the batch's noise rows reassigned to the latents by
+    cosine optimal transport (train_util.cosine_optimal_transport; fp32 cost - cached latents may be bf16), before the
+    antithetic pairing; the target uses the reordered noise, and the assignment is the cheapest permutation. Off (the
+    default) the noise is the plain draw; a batch of one is never reordered."""
+    import itertools
+
+    from library import train_util
+
+    g = torch.Generator().manual_seed(3)
+    latents = torch.randn(4, 128, 2, 3, generator=g).bfloat16()
+    text = torch.randn(4, 5, TINY["text_dim"], generator=g)
+    mask = torch.ones(4, 5, dtype=torch.bool)
+    model = _tiny_dit()
+    for ot in (False, True):
+        for b in (4, 1):
+            args = _train_args(flow_use_ot=ot)
+            trainer = _trainer(args)
+            torch.manual_seed(9)
+            _, target, _, _, noise = trainer.get_noise_pred_and_target(
+                args, _Accel(), trainer.get_noise_scheduler(args, "cpu"), latents[:b], {}, [text[:b], mask[:b]], None,
+                model, None, torch.float32, True)
+            torch.manual_seed(9)
+            plain = torch.randn_like(latents[:b], dtype=torch.float32)
+            assert torch.equal(target, noise - latents[:b].double())
+            if not ot or b == 1:
+                assert torch.equal(noise, plain.double()), (ot, b)
+                continue
+            _, (_, cols) = train_util.cosine_optimal_transport(latents.reshape(4, -1).float(), plain.reshape(4, -1))
+            assert torch.equal(noise, plain[cols.squeeze(0)].double()) and not torch.equal(noise, plain.double())
+            x = torch.nn.functional.normalize(latents.reshape(4, -1).float(), dim=1)
+            y = torch.nn.functional.normalize(plain.reshape(4, -1), dim=1)
+            cost = -(x @ y.t())
+            best = min(itertools.permutations(range(4)), key=lambda p: float(sum(cost[i, p[i]] for i in range(4))))
+            assert list(best) == cols.squeeze(0).tolist()
+
+
+def test_adv_term_is_live_on_moss():
+    """adv_scale > 0 (the stationary RFF-MMD term, train_network._apply_adv_term): MOSS stores the noisy input it fed the
+    DiT (it never did: the term warned once and stayed INERT), and the reference cache keys disk-cached latents by MOSS's
+    stride 16 (a 48x32 px bucket is a 2x3 latent grid; the stride-8 key 4x6 made build_adv_references refuse it)."""
+    import train_network
+    from library import adv_cache
+
+    args = _train_args(adv_scale=1.0, adv_levels=1, adv_tokens_per_band=4, adv_reference_samples=16, adv_features=8)
+    trainer = _trainer(args)
+    trainer.setup_adv_objective(args)
+    assert (trainer.adv_prediction_mode, trainer.adv_timesteps_in_sigma) == ("flow", True)
+
+    # one image cached to disk by MossLatentsCachingStrategy (bucket 48x32 px -> 2x3 latents) with 2 augmentation variants
+    latent_cache = strategy.MossLatentsCachingStrategy(True, 1, False)
+    subset = types.SimpleNamespace(num_repeats=1, flip_aug=False, is_val=False, is_reg=False)
+    with tempfile.TemporaryDirectory() as tmp:
+        npz = os.path.join(tmp, "a_0048x0032" + latent_cache.cache_suffix)
+        g = torch.Generator().manual_seed(1)
+        latent_cache.save_latents_to_disk(npz, torch.randn(128, 2, 3, generator=g), [48, 32], [0, 0, 48, 32],
+                                          key_reso_suffix="_2x3", aug_variants=[
+                                              {"latents": torch.randn(128, 2, 3, generator=g), "crop_ltrb": [0, 0, 48, 32]}
+                                              for _ in range(2)])
+        info = types.SimpleNamespace(latents=None, latents_npz=npz, bucket_reso=(48, 32), is_val=False, is_reg=False)
+        dataset = types.SimpleNamespace(image_data={"a": info}, image_to_subset={"a": subset},
+                                        latents_caching_strategy=latent_cache, get_effective_aug_variant_count=lambda s: 3)
+        group = types.SimpleNamespace(datasets=[dataset])
+        assert trainer.latent_stride == 16 and train_network.NetworkTrainer().latent_stride == 8
+        sources = trainer._adv_cache_sources(group, trainer.latent_stride)  # as prepare_adv_reference calls it
+        assert [s.adv_grid_key for s in sources] == ["2x3"] * 3
+        assert "self._adv_cache_sources(train_dataset_group, self.latent_stride)" in inspect.getsource(
+            train_network.NetworkTrainer.prepare_adv_reference)
+        build = dict(levels=1, token_budget=4, reference_samples=16, features=8, bandwidths="", seed=0, device="cpu")
+        trainer.adv_references = adv_cache.build_adv_references(sources, **build)
+        assert list(trainer.adv_references) == ["2x3"]
+        stride8 = train_network.NetworkTrainer._adv_cache_sources(group)  # the key MOSS had: 4x6
+        assert [s.adv_grid_key for s in stride8] == ["4x6"] * 3
+        try:
+            adv_cache.build_adv_references(stride8, **build)
+            raise AssertionError("a 2x3 latent was accepted under a 4x6 grid key")
+        except ValueError as e:
+            assert "inconsistent" in str(e)
+    model = _tiny_dit()
+    latents = torch.randn(2, 128, 2, 3, generator=torch.Generator().manual_seed(4))
+    _, text, mask = _train_inputs()
+    seen = []
+    hook = model.register_forward_pre_hook(lambda m, a, k: seen.append(a[0].detach().clone()), with_kwargs=True)
+    sched = trainer.get_noise_scheduler(args, "cpu")
+    torch.manual_seed(9)
+    pred, _, sigmas, weighting, _ = trainer.get_noise_pred_and_target(args, _Accel(), sched, latents, {}, [text, mask],
+                                                                      None, model, None, torch.float32, True)
+    hook.remove()
+    assert torch.equal(trainer._adv_noisy_latents, seen[0])
+    base = torch.tensor(0.5)
+    assert float(trainer._apply_adv_term(base, pred, latents, sigmas, weighting, sched, args, {})) > 0.5
+    assert trainer.adv_loss_value is not None
+    trainer._adv_noisy_latents = None  # MOSS before: nothing stored, the loss came back unchanged
+    assert float(trainer._apply_adv_term(base, pred, latents, sigmas, weighting, sched, args, {})) == 0.5
+
+
+def test_default_training_step_is_the_previous_one_bit_for_bit():
+    """OT, adv, grouped accumulation and tier timing off (the defaults): get_noise_pred_and_target replays the previous
+    step exactly (moss-image 09383988): the same RNG use, noise, timesteps, prediction, target and weighting."""
+    from library import anima_train_utils
+    from library.custom_train_functions import maybe_apply_antithetic_noise_pairing
+
+    for sampling in ("moss", "uniform", "sigmoid"):
+        args = _train_args(timestep_sampling=sampling)
+        model = _tiny_dit()
+        latents, text, mask = _train_inputs(b=3)
+        trainer = _trainer(args)
+        sched = trainer.get_noise_scheduler(args, "cpu")
+        torch.manual_seed(21)
+        got = trainer.get_noise_pred_and_target(args, _Accel(), sched, latents, {}, [text, mask], None, model, None,
+                                                torch.float32, True)
+        torch.manual_seed(21)
+        noise = maybe_apply_antithetic_noise_pairing(args, torch.randn_like(latents, dtype=torch.float32), is_train=True)
+        noisy, timesteps, sigmas = flow.get_noisy_model_input_and_timesteps(
+            args, sched, latents, noise, torch.device("cpu"), torch.float32, trainer._sigma_sampler, is_train=True)
+        want = (model(noisy, timesteps, text, mask), noise.double() - latents.double(), sigmas.flatten(),
+                anima_train_utils.compute_loss_weighting_for_anima(args.weighting_scheme, sigmas), noise.double())
+        assert all(torch.equal(a, b) for a, b in zip(got, want)), sampling
+
+
+def test_caption_dropout_rate_is_checked_on_the_host():
+    """drop_cached_text_encoder_outputs no longer reads the batch's rates back from the GPU every step (the .item() was a
+    sync per batch): a cached caption_dropout_rate other than 0 is refused where the outputs are made (in-memory cache)
+    or read (load_outputs_npz, in the DataLoader worker), and rates still on the CPU are checked as before."""
+    encoding = strategy.MossTextEncodingStrategy()
+    embeds, mask = torch.zeros(2, 3, 4), torch.ones(2, 3)
+    assert encoding.drop_cached_text_encoder_outputs(embeds, mask, torch.zeros(2))[0] is embeds
+    for rates in (torch.tensor([0.0, 0.1]), [0.0, 0.1]):
+        try:
+            encoding.drop_cached_text_encoder_outputs(embeds, mask, rates)
+            raise AssertionError("a non-zero CPU rate was accepted")
+        except RuntimeError as e:
+            assert "cache_caption_variants" in str(e)
+    # a rate on another device (accelerate moved the batch) is not read: a meta tensor has no value to read
+    assert encoding.drop_cached_text_encoder_outputs(embeds, mask, torch.empty(2, device="meta"))[1] is mask
+    model = _tiny_te()
+    provider = strategy.MossTextEncoderProvider("unused", "cpu", loader=lambda *a, **k: model)
+    with tempfile.TemporaryDirectory() as tmp:
+        for to_disk in (True, False):
+            caching = strategy.MossTextEncoderOutputsCachingStrategy(to_disk, 2, False, signature="sig")
+            for rate in (0.0, 0.25):
+                info = _Info(os.path.join(tmp, f"{int(to_disk)}_{rate}.png"), "a caption")
+                info.caption_dropout_rate = rate
+                info.text_encoder_outputs_npz = caching.get_outputs_npz_path(info.absolute_path) if to_disk else None
+                try:
+                    caching.cache_batch_outputs(_fake_tokenize_strategy(), [provider], encoding, [info])
+                    if to_disk:
+                        caching.load_outputs_npz(info.text_encoder_outputs_npz)
+                    refused = False
+                except RuntimeError as e:
+                    assert "cache_caption_variants" in str(e)
+                    refused = True
+                assert refused == (rate > 0), (to_disk, rate)
 
 
 if __name__ == "__main__":

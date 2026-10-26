@@ -171,10 +171,29 @@ class MossTextEncodingStrategy(TextEncodingStrategy):
 
     def drop_cached_text_encoder_outputs(self, text_embeds, text_mask, caption_dropout_rates=None):
         """Caption dropout lives in the cached caption variants (a dropped caption is encoded as '' through the chat
-        template, the official unconditional prompt). Zeroing cached rows is not a valid MOSS encoding: refuse it."""
-        if caption_dropout_rates is not None and not torch.all(caption_dropout_rates == 0.0).item():
-            raise RuntimeError("MOSS: caption dropout needs --cache_caption_variants N>1 (cached outputs are never zeroed)")
+        template, the official unconditional prompt). Zeroing cached rows is not a valid MOSS encoding: refuse it.
+
+        The rates are checked on the host where the outputs are made or read (cache_batch_outputs, load_outputs_npz), so
+        a batch that reaches the trainer on the GPU (accelerate's DataLoader moves it) is not read back here: that
+        .item() was a GPU->CPU sync per batch. Rates still on the CPU (a CPU tensor, a list) are checked here as before."""
+        if (caption_dropout_rates is not None and _is_host(caption_dropout_rates)
+                and not torch.all(torch.as_tensor(caption_dropout_rates) == 0.0).item()):
+            raise RuntimeError(CAPTION_DROPOUT_ERROR)
         return [text_embeds, text_mask]
+
+
+CAPTION_DROPOUT_ERROR = "MOSS: caption dropout needs --cache_caption_variants N>1 (cached outputs are never zeroed)"
+
+
+def _is_host(rates) -> bool:
+    return not isinstance(rates, torch.Tensor) or rates.device.type == "cpu"
+
+
+def check_caption_dropout_rate(rate) -> None:
+    """The per-sample half of drop_cached_text_encoder_outputs' check, on the host: a cached caption_dropout_rate other
+    than 0 (a cache written with caption dropout and no caption variants) is refused when it is made or read."""
+    if bool((np.asarray(rate, dtype=np.float64) != 0.0).any()):
+        raise RuntimeError(CAPTION_DROPOUT_ERROR)
 
 
 def _decode_cached(array: np.ndarray, stored_dtype: Optional[str]):
@@ -237,6 +256,7 @@ class MossTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
                 key = variant_key(base, variant) if variant > 0 and variant_key(base, variant) in files else base
                 outputs.append(_decode_cached(npz[key], dtypes.get(key)))
             rate = npz["caption_dropout_rate"]
+        check_caption_dropout_rate(rate)  # on the host (DataLoader worker): no device read per batch later
         return outputs + [rate]
 
     def cache_batch_outputs(self, tokenize_strategy: TokenizeStrategy, models: List[Any],
@@ -262,6 +282,8 @@ class MossTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         for i, info in enumerate(infos):
             n_variants = len(info.caption_variants) if getattr(info, "caption_variants", None) else 0
             rate = torch.tensor(info.caption_dropout_rate if n_variants <= 1 else 0.0, dtype=torch.float32)
+            if not self.cache_to_disk:  # in-memory outputs are never read through load_outputs_npz: check them here
+                check_caption_dropout_rate(rate)
             own = []
             for k, (group, rows) in enumerate(variant_rows, start=1):
                 indices = [index for index, _ in group]

@@ -198,6 +198,9 @@ class NetworkTrainer:
         self.adv_loss_value = None
         self._adv_noisy_latents = None
         self._adv_warned_missing = False
+        # pixels per latent pixel: the adv reference cache keys disk-cached latents by bucket resolution / this
+        # (8: the SD/SDXL/FLUX/Anima VAEs; moss_train_network.py sets 16, FLUX.2 VAE + 2x2 packing)
+        self.latent_stride = 8
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -851,8 +854,9 @@ class NetworkTrainer:
         return adv_cache.fingerprint_payload(payload)
 
     @staticmethod
-    def _adv_cache_sources(train_dataset_group):
-        """Yield lazy loaders for canonical training latents (plus cached variants)."""
+    def _adv_cache_sources(train_dataset_group, latent_stride: int = 8):
+        """Yield lazy loaders for canonical training latents (plus cached variants). latent_stride: pixels per latent
+        pixel, the grid of a disk-cached latent from its bucket resolution (NetworkTrainer.latent_stride)."""
         sources = []
 
         def add_source(loader, grid_key=None, source_weight=1):
@@ -939,7 +943,7 @@ class NetworkTrainer:
                 except (AttributeError, TypeError):
                     variant_count = 1
                 for resolution in resolutions:
-                    grid_key = f"{int(resolution[1]) // 8}x{int(resolution[0]) // 8}"
+                    grid_key = f"{int(resolution[1]) // latent_stride}x{int(resolution[0]) // latent_stride}"
                     for variant_index in range(max(1, int(variant_count))):
                         def load_variant(path=latent_path, reso=resolution, vi=variant_index, strategy=latent_strategy):
                             return strategy.load_latents_from_disk(path, reso, variant=vi)[0]
@@ -970,7 +974,7 @@ class NetworkTrainer:
             except (OSError, ValueError, RuntimeError, EOFError) as exc:
                 if os.path.exists(cache_path):
                     logger.warning(f"Rebuilding invalid stationary adv reference cache ({exc})")
-                sources = self._adv_cache_sources(train_dataset_group)
+                sources = self._adv_cache_sources(train_dataset_group, self.latent_stride)
                 transformed_sources = []
                 for source in sources:
                     transformed = lambda source=source: self.shift_scale_latents(args, source())

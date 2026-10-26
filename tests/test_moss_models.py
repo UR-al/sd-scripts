@@ -19,8 +19,14 @@ try:
 except ImportError:  # the training venv has no pytest: `python tests/test_moss_models.py` runs every test
     pytest = None
 
+from library import attention
 from library.moss.models import MossTransformer
 from library.moss.qwen35 import MossTokenizer, format_moss_prompt, unescape_prompt
+
+try:
+    from tests._device_reads import count_device_reads
+except ImportError:  # `python tests/test_moss_models.py`: the tests directory is sys.path[0]
+    from _device_reads import count_device_reads
 
 REF = os.environ.get("MOSS_REF_PIPELINE")
 
@@ -338,6 +344,93 @@ def test_tokenizer_golden_ids():
         assert tok.encode(prompt) == ids, prompt
     # escaped and raw parentheses give the same ids (ComfyUI strips the backslash)
     assert tok.encode(r"shrug \(clothing\)") == tok.encode("shrug (clothing)")
+
+
+def _previous_right_align_text(text, mask):
+    """MossTransformer._right_align_text before the host lengths (moss-image 09383988): the lengths stay on the device."""
+    lengths = mask.sum(1)
+    positions = torch.arange(mask.shape[1], device=mask.device)[None]
+    if torch.equal(mask, positions < lengths[:, None]):
+        return text, mask, lengths
+    order = torch.argsort((~mask).to(torch.int8), dim=1, stable=True)
+    text = torch.gather(text, 1, order[..., None].expand_as(text))
+    return text, positions < lengths[:, None], lengths
+
+
+def test_right_align_text_matches_the_previous_implementation():
+    """Same text / mask as before; the lengths now come back as Python ints (one host transfer with the aligned test)."""
+    _, _, text, mask = _batch()
+    shuffled = mask[:, torch.randperm(mask.shape[1], generator=torch.Generator().manual_seed(2))]
+    for m in (mask, mask.flip(1), shuffled, torch.ones_like(mask)):
+        want = _previous_right_align_text(text, m)
+        got = MossTransformer._right_align_text(text, m)
+        assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])
+        assert got[2] == want[2].tolist() and all(type(n) is int for n in got[2])
+
+
+def _swap_params_factory(factory):
+    """Install `factory` as AttentionParams.create_attention_params_from_mask; returns the restore function."""
+    raw = attention.AttentionParams.__dict__["create_attention_params_from_mask"]
+    attention.AttentionParams.create_attention_params_from_mask = staticmethod(factory)
+    return lambda: setattr(attention.AttentionParams, "create_attention_params_from_mask", raw)
+
+
+def test_host_lengths_forward_is_bit_identical_to_the_device_path():
+    """The forward with the host lengths in its attention params == the same forward with every attention call reading
+    the device lengths (the previous path): outputs and gradients, batched and split attention, aligned or not."""
+    device_only_of = attention.AttentionParams.create_attention_params_from_mask
+
+    def device_only(attn_mode, split_attn, img_len, attention_mask, text_lengths=None):
+        return device_only_of(attn_mode, split_attn, img_len, attention_mask)  # seqlens_host stays None
+
+    for split in (False, True):
+        for aligned in (True, False):
+            runs = []
+            for use_device in (False, True):
+                _, ours = _tiny_pair(split_attn=split)
+                x, t, text, mask = _batch()
+                if not aligned:
+                    mask, text = mask.flip(1), text.flip(1)
+                restore = _swap_params_factory(device_only) if use_device else (lambda: None)
+                try:
+                    y = ours(x, t, text, mask)
+                    y.square().mean().backward()
+                finally:
+                    restore()
+                runs.append([y.detach()] + [p.grad for p in ours.parameters()])
+            assert all(torch.equal(a, b) for a, b in zip(*runs)), (split, aligned)
+
+
+def test_forward_reads_the_text_lengths_once():
+    """One host transfer per forward (the lengths + aligned test in _right_align_text); the empty-caption check, the
+    trim, the RoPE rows and the trim / per-sample split of every attention call read those ints. Before: 4 reads per
+    forward plus 1-2 per attention call batched (torch.all, .item()) or one per sample and q/k/v split - in every block.
+    Gradient checkpointing's recompute in backward reads nothing either."""
+    for split in (False, True):
+        for aligned in (True, False):
+            _, ours = _tiny_pair(split_attn=split)
+            x, t, text, mask = _batch()
+            if not aligned:
+                mask, text = mask.flip(1), text.flip(1)
+            with count_device_reads() as reads:
+                ours(x, t, text, mask)
+            assert reads.ops == ["tolist"], (split, aligned, reads.ops)
+    _, ours = _tiny_pair()
+    ours.enable_gradient_checkpointing()
+    ours.train()
+    x, t, text, mask = _batch(lengths=(4, 4, 4))  # uniform lengths: the trimmed path
+    with count_device_reads() as reads:
+        ours(x, t, text, mask).square().mean().backward()
+    assert reads.ops == ["tolist"], reads.ops
+
+
+def test_forward_records_the_text_length():
+    """last_text_tokens: the padded text length the forward ran with (--moss_tier_timing reports it), a host int."""
+    _, ours = _tiny_pair()
+    assert ours.last_text_tokens is None
+    x, t, text, mask = _batch()  # lengths 5, 9, 2 padded to 11: the joint sequence carries 9 text rows
+    ours(x, t, text, mask)
+    assert ours.last_text_tokens == 9 and type(ours.last_text_tokens) is int
 
 
 if __name__ == "__main__":
