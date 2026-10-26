@@ -554,6 +554,12 @@ def _define_module():
                 w = self.router_fc.weight
                 g = F.linear(z.to(w.dtype), w, self.router_fc.bias)
                 E = self.timestep_embed.weight
+                hx = self.__dict__.get("_hx_tidx") if torch.compiler.is_compiling() and "_hx_idx" in self.__dict__ else None
+                if hx is not None:
+                    # block compile: the step's row as the index tensor set_timestep hoisted (inside the graph
+                    # _timesteps is the constant (0,), so `ts` holds no timestep)
+                    emb = E.index_select(0, hx.to(E.device))
+                    return g + emb.to(g.dtype)
                 T = self.tsm_num_timesteps
                 rows = [min(max(int(t) - 1, 0), T - 1) for t in ts]
                 if all(r == rows[0] for r in rows):

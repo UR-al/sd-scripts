@@ -6,10 +6,12 @@
 # exactly that host work (the 640 LyCORIS module calls of a micro-step are ~0.5 s of Python, the launches another
 # ~0.3-0.5 s; the GPU is idle), so this is where the step time of the 512 / 1024 tiers goes. Measured on a CPU harness
 # (torch 2.7.1, aot_eager, the fork's own Block and LyCORIS fixed paths): one graph per Block, no graph breaks, outputs
-# and gradients identical to eager for LoKr+DoRA, TSM stage 1 / 2 and TSM-LoKr (plain LoRA: the six adaLN-modulation
-# up-weight gradients within a bf16 ulp or two, a K = 1 outer product rounded at another site in the AOT backward); per-Block
-# launches TSM 672 -> 235 (GC) / 475 -> 153, LoKr+DoRA 980 -> 121 (GC) / 736 -> 77 (inductor CPU wrapper counts). GPU
-# numbers: measure with the A/B in docs/anima_train_network.md.
+# and gradients identical to eager for LoKr+DoRA, TSM stage 1 / 2, TSM-LoKr, plain LoRA, LoHa (+DoRA), full, T-LoRA,
+# ABBA (+DoRA), diag-OFT and BOFT (the autocast state handed to the graph, see below: before that the traced backward's
+# fp32 matmuls ran in bf16, plain LoRA's adaLN lora_up gradients off by a bf16 ulp or two); DyLoRA is refused
+# (anima_train_network.validate_block_compile_args: a random rank per forward). Per-Block launches TSM 672 -> 235 (GC) /
+# 475 -> 153, LoKr+DoRA 980 -> 121 (GC) / 736 -> 77 (inductor CPU wrapper counts). GPU numbers: measure with the A/B
+# in docs/anima_train_network.md.
 #
 # Pieces (and why each exists):
 # * compile `_forward`, not `forward`: the unsloth / torch checkpoint wrappers hold `@torch._disable_dynamo` or are not
@@ -36,6 +38,28 @@
 #   dynamo refuses to inline any function that has one ("Inline attempt with __self__").
 # * known limitation: --split_attn slices each row by its device seqlens tensor (data-dependent): one graph break per
 #   row inside every attention call. Anima's default attention (attn_mode torch, no split) traces whole.
+# * the autocast state as graph arguments: the compiled entry is called with autocast disabled and re-enters the
+#   caller's state inside the graph. AOTAutograd traces the backward under the autocast state in force at the first
+#   call (the trainer's accelerator.autocast()), while eager's autograd engine runs the backward with autocast off:
+#   every fp32 matmul of the traced backward - the Block's fp32 region (the adaLN modulations, autocast disabled in the
+#   forward) and the adapters' own fp32 math (LoHa's dense Hadamard delta, BOFT's rotation) - ran in bf16 (plain LoRA's
+#   six adaLN-up lora_up gradients off by a bf16 ulp or two; LoHa's hada_w2_a and BOFT's oft_blocks on the attention /
+#   MLP layers too, max|d| / max|g| ~3e-3 .. 8e-3; full, ABBA (+DoRA), T-LoRA and diag-OFT were unaffected). With the
+#   entry state off the forward graph is unchanged (dynamo enters the region for real while tracing, so
+#   is_autocast_enabled() and the casts inside are as before) and the backward computes in the saved tensors' dtypes.
+#   AOTAutograd disables autocast around a compiled backward only for a graph compiled under autocast, so where the
+#   ENGINE runs the backward under autocast - the unsloth offload checkpointer's @custom_bwd (CUDA) restores the
+#   forward's - eager's fp32 backward math is bf16-rounded, inductor's generated backward is not (its kernels ignore
+#   autocast: the compiled run then matches un-checkpointed eager, a bf16-level gap by eager's doing), and an
+#   aot_eager / eager backend backward re-dispatches its ops under that autocast like eager does.
+# * only `_forward` is compiled: `_forward_hoisted` (--anima_adaln_hoist under checkpointing) forwards to it eagerly.
+# * one compiled entry per Block class (the Block passed as an argument), shared by every Block (see shared_entry).
+# * compiled when the call is a training forward: train mode (gradient checkpointing) or grad enabled (without
+#   checkpointing the trainer keeps the DiT in eval mode for training). state.compiled_calls counts the calls handed to
+#   dynamo; past the recompile limit dynamo itself runs them eager (it warns once).
+# * path rules that read the row count (LoHa / ABBA: factored vs dense rebuild, lycoris_algo_fixes._hada_factored_cheaper)
+#   would guard the symbolic token axis; inside the graphs they run at a planned row count instead
+#   (lycoris_algo_fixes.plan_block_compile_rows, set by after_network_loaded: the largest token count per sample).
 # * the fork's own ElementwiseChains and LoKr weight-rebuild compiles are switched off under block compile (nested
 #   torch.compile inside a compiled frame exhausts the recompile budget).
 # * the per-module caches the fixed paths fill lazily (lycoris_fast._static_eligible: a float(scalar) .item() per LoKr
@@ -312,11 +336,13 @@ def compile_blocks(
     skip_call: Optional[Callable[[], bool]] = None,
     isolate_cache: bool = True,
 ) -> CompiledBlocks:
-    """torch.compile every Block's `_forward` (and `_forward_hoisted`) of `anima`; the model flattens its token grid to
-    the fake-5D layout around the Block loop from now on (anima._block_compile). Call AFTER the network's apply_to and
-    weight loading (the compiled graph traces the patched Linear forwards). `bands`: plan_bands() output ([]: static).
-    `soft_marks`: None = soft under attn_mode "torch" (SDPA), strict otherwise. `skip_call()`: when it returns True the
-    call runs the eager `_forward` (a mixed-timestep TSM chunk)."""
+    """torch.compile every Block's `_forward` of `anima`; the model flattens its token grid to the fake-5D layout around
+    the Block loop from now on (anima._block_compile). `_forward_hoisted` (the ADALN_HOIST entry of a checkpointed Block)
+    is left eager: it only forwards to `self._forward`, i.e. to the compiled wrapper - compiled itself, its trace reached
+    that wrapper's mark_dynamic ("Attempt to trace forbidden callable") at the first checkpointed call. Call AFTER the
+    network's apply_to and weight loading (the compiled graph traces the patched Linear forwards). `bands`:
+    plan_bands() output ([]: static). `soft_marks`: None = soft under attn_mode "torch" (SDPA), strict otherwise.
+    `skip_call()`: when it returns True the call runs the eager `_forward` (a mixed-timestep TSM chunk)."""
     if dynamic not in DYNAMIC_MODES:
         raise ValueError(f"dynamic must be one of {DYNAMIC_MODES}, got {dynamic!r}")
     bands = [tuple(int(v) for v in b) for b in bands] if dynamic != "static" else []
@@ -332,28 +358,72 @@ def compile_blocks(
     state = CompiledBlocks()
     state.bands = list(bands)
 
+    entries: Dict[Any, Callable] = {}
+
+    def shared_entry(fn: Callable) -> Callable:
+        """The compiled entry for the class function `fn`, made once and called with the Block as an argument. dynamo
+        keys its cache on the entry's code object and guards a closure cell by identity: an entry closing over each
+        Block's bound _forward gave every Block cache entries of its own (28 graphs per regime on Anima 2.9B instead of
+        2, past the recompile limit, then the rest eager); over the class function, which is one object for every Block,
+        the Blocks share the entries again (their parameters are graph inputs)."""
+        compiled = entries.get(fn)
+        if compiled is None:
+
+            def entry(autocast_enabled: bool, autocast_dtype: torch.dtype, block_: torch.nn.Module, x, *args, **kw):
+                # the caller's autocast state, re-entered INSIDE the graph (see wrapped): the forward traces as before
+                with torch.autocast(device_type=x.device.type, dtype=autocast_dtype, enabled=autocast_enabled):
+                    return fn(block_, x, *args, **kw)
+
+            compiled = entries[fn] = torch.compile(entry, **kwargs)
+        return compiled
+
     def make(block: torch.nn.Module, name: str):
-        orig = getattr(block, name)  # the bound class method
-        compiled = torch.compile(orig, **kwargs)
+        orig = getattr(block, name)  # the bound class method (the eager calls)
+        fn = getattr(orig, "__func__", None) if getattr(orig, "__self__", None) is block else None
+        if fn is not None:
+            compiled = shared_entry(fn)
+
+            def call(enabled, dtype, x, *args, **kw):
+                return compiled(enabled, dtype, block, x, *args, **kw)
+
+        else:  # not a bound method of the Block (an instance-level replacement): its own entry, closing over it
+
+            def entry_one(autocast_enabled: bool, autocast_dtype: torch.dtype, x, *args, **kw):
+                with torch.autocast(device_type=x.device.type, dtype=autocast_dtype, enabled=autocast_enabled):
+                    return orig(x, *args, **kw)
+
+            call = torch.compile(entry_one, **kwargs)
 
         def wrapped(x, *args, **kw):
-            if not (_active and block.training) or (skip_call is not None and skip_call()):
+            # a training forward: the Block in train mode (with gradient checkpointing the trainer keeps the DiT in train
+            # mode; the unsloth checkpointer's forward runs under no_grad) or grad enabled (without checkpointing the
+            # trainer puts the DiT in eval mode for training too). Validation (eval, no_grad) and sampling (pause()) run
+            # the eager _forward.
+            if not (_active and (block.training or torch.is_grad_enabled())) or (skip_call is not None and skip_call()):
                 state.eager_calls += 1
                 return orig(x, *args, **kw)
             if bands and x.dim() == 5:
                 _mark_dynamic(x, _rope_of(args, kw), bands, soft_marks)
             state.compiled_calls += 1
-            return compiled(x, *args, **kw)
+            dev = x.device.type
+            # Autocast OFF around the compiled call, the state handed to the graph as arguments: AOTAutograd traces the
+            # BACKWARD under the autocast state in force when the graph is first called, and the trainer calls the Blocks
+            # inside accelerator.autocast(). Every fp32 matmul of the backward - the Block's fp32 region (the adaLN
+            # modulations run with autocast disabled) and the adapters' own fp32 math (LoHa's dense delta, BOFT's
+            # rotation) - would then be autocast to bf16, where eager's autograd engine runs the backward with autocast
+            # off. With the entry state off, the forward is identical (entry re-enters it) and the traced backward
+            # computes in the saved tensors' dtypes, as eager does.
+            enabled, dtype = torch.is_autocast_enabled(dev), torch.get_autocast_dtype(dev)  # read BEFORE disabling
+            with torch.autocast(device_type=dev, enabled=False):
+                return call(enabled, dtype, x, *args, **kw)
 
         wrapped.__name__ = f"compiled_{name}"
         wrapped.__wrapped__ = orig
         return wrapped
 
     for block in anima.blocks:
-        for name in ("_forward", "_forward_hoisted"):
-            if hasattr(block, name):
-                state.originals.append((block, name, getattr(block, name)))
-                setattr(block, name, make(block, name))
+        state.originals.append((block, "_forward", block._forward))
+        block._forward = make(block, "_forward")
     anima._block_compile = True
     anima._block_compile_state = state
     logger.info(f"block compile: {len(anima.blocks)} Blocks, backend={backend}, mode={mode or 'default'}, dynamic={dynamic}"
