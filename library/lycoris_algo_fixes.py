@@ -701,10 +701,11 @@ def _loha_gamma(self) -> torch.Tensor:
     from the same Python float in the factors' dtype on their device (the operand stock builds: bit-identical) and remade
     only if the module was cast or moved after it was made (dtype / device differ; the value never changes). Kept in
     __dict__, not as a buffer: nothing new in any state_dict (--resume) or save, and a later .to() never casts it (an fp32
-    -> bf16 cast of the tensor could differ from the bf16 made from the float by a double rounding). Inside a compiled
-    Block graph (--anima_block_compile) the operand is a graph constant made from the float instead (dynamo 2.7 traces
-    torch.tensor(float, dtype, device) as an op): no lazily filled module state inside the graph, so the trainer's
-    network.to(device / dtype) after compile_blocks changes nothing and nothing needs priming."""
+    -> bf16 cast of the tensor could differ from the bf16 made from the float by a double rounding). Under a
+    torch.compile trace (--anima_block_compile traces the whole Block) the operand is a graph constant made from the
+    float instead (dynamo 2.7 traces torch.tensor(float, dtype, device) as an op): no lazily filled module state inside
+    the graph, so the trainer's network.to(device / dtype) after compile_blocks changes nothing and nothing needs
+    priming."""
     ref = self.hada_w1_b
     if torch.compiler.is_compiling():
         return torch.tensor(float(self.scale), dtype=ref.dtype, device=ref.device)
@@ -820,9 +821,10 @@ def _abba_forward(self, x):
     # DoRA form is skipped (_lf_dora_dense prefers it for its fewer launches, which inductor's fusion removes anyway) and
     # _hada_factored_cheaper makes a fixed choice at the planned row count (plan_block_compile_rows: the largest token
     # count on the token-row Linears; factored without a plan). At Anima's layer shapes the rule picks factored for ABBA
-    # up to dim 16 at every token count (DoRA: dense on the adaLN layers, static rows; dim 32: dense on 2048x2048 from
-    # ~7.5k rows, with DoRA from ~3.7k): where the fixed choice differs from eager's per-call one, the compiled path is
-    # the same math rounded elsewhere (as accurate against fp64). Eager keeps both rules; --torch_compile alone too.
+    # up to dim 16 at every token count on the token-row Linears (DoRA: dense on the adaLN down Linears, the adaLN up
+    # Linears factored at small batch - static rows either way; dim 32: dense on 2048x2048 from ~7.5k rows, with DoRA
+    # from ~3.7k): where the fixed choice differs from eager's per-call one, the compiled path is the same math rounded
+    # elsewhere (as accurate against fp64). Eager keeps both rules; --torch_compile alone too.
     compiled = BLOCK_COMPILE and torch.compiler.is_compiling()
     if self.wd and self.wd_on_output and _ABBA_DORA_FUSED and not compiled:
         y = _abba_dora_dense(self, x, dt, mult)
@@ -1199,7 +1201,8 @@ def _blocks(t: torch.Tensor, nb: int, S: int) -> torch.Tensor:
 
 
 def _block_residual_mm(v: torch.Tensor, D: torch.Tensor, shape) -> torch.Tensor:
-    """v + v @ D for the [nb, rows, S] block view v, back in the [..., nb*S] layout `shape` (block compile only).
+    """v + v @ D for the [nb, rows, S] block view v, back in the [..., nb*S] layout `shape` (under a torch.compile
+    trace only; --anima_block_compile is the one that traces the rotation whole).
     dynamo 2.7 refuses an out= into a non-contiguous view ("out= op was called where output tensor was non-contiguous"):
     traced, _BlockResidualMM's strided write was one graph break per adapted Linear (diag-oft: 26 per Block). Here the
     same baddbmm (same operands, same kernel; only the output stride differs) writes a fresh [nb, rows, S] that is
@@ -1210,9 +1213,9 @@ def _block_residual_mm(v: torch.Tensor, D: torch.Tensor, shape) -> torch.Tensor:
 
 class _BlockResidualMM(torch.autograd.Function):
     """y = z + z @ D on contiguous blocks of the last axis: z [..., nb*S] contiguous, D [nb, S, S] in z's dtype.
-    Strided batched matmuls on views of z/y (no permute copies); call with autocast off. Inside a compiled Block graph
-    (torch.compiler.is_compiling(): --anima_block_compile traces this Function's forward and backward) the out= views
-    give way to _block_residual_mm; the eager path is untouched."""
+    Strided batched matmuls on views of z/y (no permute copies); call with autocast off. Under a torch.compile trace
+    (torch.compiler.is_compiling(); --anima_block_compile traces this Function's forward and backward inside the Block
+    graphs) the out= views give way to _block_residual_mm; the eager path is untouched."""
 
     @staticmethod
     def forward(ctx, z, D):
@@ -1430,12 +1433,17 @@ def plan_block_compile_rows(network, anima, rows: Optional[int]) -> int:
     """--anima_block_compile with dynamic token bands: the row count the LoHa / ABBA path rule (_hada_factored_cheaper,
     factored (x KA^T) KB^T vs the dense rebuild) assumes inside a compiled Block graph. There the token axis is symbolic,
     and the rule's comparison on it would guard the marked axis (strict marks: ConstraintViolationError before the
-    first graph, soft marks: a recompile at the flip); at Anima's shapes LoHa's rule flips inside a 4-tier band from dim
-    16 on (2048x2048: ~6.6k rows, with DoRA ~2.4k). The adapted Linears of the Blocks whose rows are the token axis get
-    `rows` (the plan's largest token count, so the GPU-bound tier gets its cheaper path; batch 1) as _bc_rows; the
-    cross-attention key / value Linears (text rows) and the adaLN modulation Linears (a row per sample) get 0: their
-    row count is static in the graph and the rule reads it as eager does. rows None / 0 (static plan: every row count
-    static) gives 0 everywhere. Not a buffer / state_dict entry; eager ignores it. Returns how many got `rows`."""
+    first graph, soft marks: a recompile at the flip). At Anima's shapes the rule flips inside a 4-tier band (880 ..
+    16384 tokens) for LoHa from dim 16 (fp32 factors under bf16 autocast, the default: 2048x2048 at ~3.4k rows) and with
+    DoRA from dim 8 (~8.2k; dim 16 ~1.5k) - ~6.6k / ~2.3k at dim 16 with --full_bf16 - and for ABBA from dim 32. The
+    adapted Linears of the Blocks whose rows are the token axis get `rows` (the plan's largest token count PER SAMPLE -
+    the batch size is not counted -, so the GPU-bound tier gets its cheaper path) as _bc_rows; the cross-attention key /
+    value Linears (text rows) and the adaLN modulation Linears (a row per sample) get 0: their row count is static in the
+    graph and the rule reads it as eager does. rows None / 0 (static plan: every row count static) gives 0 everywhere.
+    One value for every band (with --anima_block_compile_dynamic bands too: the largest tier's choice). Call it before
+    the first compiled call: a graph traced without the key keeps its choice (dynamo guards the key only once present),
+    or torch._dynamo.reset() after re-planning. Not a buffer / state_dict entry; eager ignores it. Returns how many got
+    `rows`."""
     rows = int(rows or 0)
     roles: Dict[int, int] = {}
     for block in getattr(anima, "blocks", ()):
@@ -1549,6 +1557,18 @@ def _hoist_tsm_step(modules, ints: List[int]) -> None:
             idx_fn = getattr(m, "_expert_indices", None)
             if idx_fn is not None:
                 d["_hx_idx"] = idx_fn(t)
+            if int(getattr(m, "tsm_stage", 1)) == 2 and hasattr(m, "timestep_embed"):
+                # the stage-2 router's embedding row as an index tensor, as for TSMModule: inside the graph
+                # TSMLokrModule._timesteps is the constant 0 and its _gates read row 0 for every timestep before
+                w = m.timestep_embed.weight
+                t_idx = min(max(int(t) - 1, 0), int(m.tsm_num_timesteps) - 1)
+                prev = d.get("_hx_tidx")
+                if prev is not None and prev.device == w.device:
+                    prev.fill_(t_idx)
+                else:
+                    d["_hx_tidx"] = torch.tensor([t_idx], dtype=torch.long, device=w.device)
+            else:
+                d.pop("_hx_tidx", None)
 
 
 def _hoist_tlora_step(modules, mask: torch.Tensor) -> None:
@@ -1603,6 +1623,13 @@ def _tsm_experts(self, t) -> Tuple[int, ...]:
     return idx
 
 
+def _tsm_step_hoisted(self) -> bool:
+    """Inside a block-compiled graph with this micro-step hoisted (_hoist_tsm_step: one timestep for every row). Then
+    the per-sample timesteps (_TSM_SAMPLE_T) are not read: reading them guarded every row's value, so a batch >= 2 whose
+    rows share one timestep compiled a set of graphs per timestep value."""
+    return torch.compiler.is_compiling() and "_hx_experts" in self.__dict__
+
+
 def _tsm_get_timestep(self) -> int:
     """TSMModule._get_timestep. Under block compile with a hoisted step (one timestep per chunk) the graph needs no
     integer timestep - _tsm_experts reads the hoisted expert choice and _tsm_compute_gates the hoisted embedding row - so
@@ -1634,8 +1661,10 @@ def _tsm_compute_gates(self, bottleneck, input_features, timestep):
             fc_b = self.router_fc.bias.to(device)
             embed_w = self.timestep_embed.weight.to(device)
             fc_out = F.linear(z.to(fc_w.dtype), fc_w, fc_b)
-            if torch.compiler.is_compiling():
-                hx_idx = self.__dict__.get("_hx_tidx")  # block compile: the row as a per-step index tensor (set_timestep)
+            if torch.compiler.is_compiling() and "_hx_experts" in self.__dict__:
+                # block compile: the row as a per-step index tensor (set_timestep), read only while the step is hoisted
+                # (after clear_timestep the experts come from the stock global, so must the row)
+                hx_idx = self.__dict__.get("_hx_tidx")
                 if hx_idx is not None:
                     return fc_out + embed_w.index_select(0, hx_idx.to(embed_w.device)).squeeze(0)
             t_idx = min(max(int(timestep) - 1, 0), self.tsm_num_timesteps - 1)
@@ -1724,7 +1753,7 @@ def _tsm_split_forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
     """org_forward(x) + the expert delta as a separate tensor (the fused path's fallback: conv, RamTorch base weights,
     delta dropout, dtype mixes the stock forward would not run either)."""
     base = self.org_forward(x, *args, **kwargs)
-    ints = _TSM_SAMPLE_T.get(self.mask_group_id)
+    ints = None if _tsm_step_hoisted(self) else _TSM_SAMPLE_T.get(self.mask_group_id)
     if ints is not None and len(ints) > 1 and x.dim() >= 2 and x.shape[0] == len(ints) and len(set(ints)) > 1:
         # one expert (stage 1) / one timestep embedding (stage 2) per sample instead of one int per batch
         delta = _tsm_grouped_delta(self, x, ints, self.multiplier)
@@ -2055,7 +2084,10 @@ def _tsm_fused_linear(self, x2: torch.Tensor, t, W0, bias, s, k, cdt: torch.dtyp
     """One fused call for the rows x2 (tokens, in) of one expert group at timestep t."""
     weights = _tsm_active_weights(self, t)
     ld = torch.promote_types(weights[0].dtype, torch.float32) if _tsm_lowrank_fp32(self) else cdt
-    if not _TSM_EXPERT_FN:
+    hoisted2 = self.tsm_stage == 2 and torch.compiler.is_compiling() and "_hx_experts" in self.__dict__
+    if not _TSM_EXPERT_FN or hoisted2:
+        # block compile, stage 2: the factor path, whose gates read the hoisted embedding row (_hx_tidx); the Function
+        # takes the row as a Python int, the constant 0 inside a graph (_tsm_get_timestep) - every step read row 0
         return _tsm_factor_linear(self, x2, t, W0, bias, s, k, cdt, ld, weights)
     if self.tsm_stage != 2:
         return _TSMExpertLinear.apply(x2, W0, bias, s, k, None, None, None, 0, False, cdt, ld, *weights)
@@ -2221,7 +2253,7 @@ def _tsm_forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
     W0, bias, cdt = plan
     s, k = _tsm_scale(self)
     shape = x.shape
-    ints = _TSM_SAMPLE_T.get(self.mask_group_id)
+    ints = None if _tsm_step_hoisted(self) else _TSM_SAMPLE_T.get(self.mask_group_id)
     if ints is not None and len(ints) > 1 and shape[0] == len(ints) and len(set(ints)) > 1:
         if _TSM_MIXED and not _TSM_EXPERT_FN:
             y = _tsm_mixed_linear(self, x.reshape(-1, shape[-1]), ints, W0, bias, s, k, cdt, x[0].numel() // shape[-1])
@@ -2662,6 +2694,8 @@ def _lf_dora_dense(t: int, out_f: int, in_f: int, rank: int, cdt: torch.dtype, d
     On the CPU (no launch-bound host; the tests) the factored form, as before."""
     if _LF_DORA_PATH is not None:
         return _LF_DORA_PATH == "dense"
+    if BLOCK_COMPILE and torch.compiler.is_compiling():
+        return False  # inside a block-compiled graph t is the symbolic token axis: the factored form, no guard on it
     if device.type == "cpu":
         return False
     w = float(out_f) * in_f
@@ -2780,10 +2814,11 @@ def _tlora_mask(self, device) -> torch.Tensor:
 
 
 def _tlora_org_forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-    """The base layer's output, org_forward(x). While a compiled Block graph is traced (--anima_block_compile) a float
-    Linear runs as F.linear on the weight and bias read through org_module[0] - the very call nn.Linear.forward makes,
-    on the same tensors - because dynamo 2.7.1 builds the bound org_forward's module without a source and breaks the
-    graph at each Parameter it reads (7 breaks per Block, 20 fragments; the other fixed paths read org_module[0] too).
+    """The base layer's output, org_forward(x). Under a torch.compile trace (--anima_block_compile traces the whole
+    Block) a float Linear runs as F.linear on the weight and bias read through org_module[0] - the very call
+    nn.Linear.forward makes, on the same tensors - because dynamo 2.7.1 builds the bound org_forward's module without a
+    source and breaks the graph at each Parameter it reads (7 breaks per Block, 20 fragments; the other fixed paths read
+    org_module[0] too).
     Eager, conv, float8 base weights (their patched forward casts) and extra arguments call org_forward as before."""
     if torch.compiler.is_compiling() and not (args or kwargs) and not self.isconv:
         w = self.get_org_weight_for_compute(x.device)
@@ -4537,8 +4572,11 @@ def clear_timestep(network) -> None:
     no-timestep state eager reads, without a new tensor or a recompile: T-LoRA's _hx_tmask copies are filled with ones IN
     PLACE (eager's mask when none is set: every rank), the TSM expert choices (_hx_experts / _hx_idx, Python tuples) are
     removed so a traced read falls back to the stock global (stage 2's _hx_tidx tensor stays for the in-place rewrite;
-    it is read only next to _hx_experts). A compiled forward run before the next set_timestep then computes what eager
-    does - the trainer never runs one (set_timestep precedes every training forward), the check is for the edge case."""
+    it is read only next to _hx_experts / _hx_idx). A compiled forward run before the next set_timestep (the adaptive-
+    timestep passes run one under no_grad) then computes what eager does - after a per-sample (B > 1) T-LoRA mask the
+    refilled ones keep the per-sample shape: the same values through the batched path, eager's rounding of another
+    path. Call it after the backward: the compiled graphs save the mask for it (the trainer clears after
+    accelerator.backward)."""
     loras = _all_loras(network)
     tl_groups = {int(getattr(m, "mask_group_id", 0)) for m in loras if type(m).__name__ == "TLoraModule"}
     tsm_groups = {int(getattr(m, "mask_group_id", 0)) for m in loras if type(m).__name__ in _TSM_KINDS}

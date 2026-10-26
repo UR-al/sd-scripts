@@ -177,13 +177,20 @@ def validate_block_compile_args(args) -> None:
                " dynamo cannot trace; the fixed paths re-bind them")
     net_kwargs = dict(item.split("=", 1) for item in (getattr(args, "network_args", None) or []) if "=" in item)
     algo = str(net_kwargs.get("algo", "lora") or "lora").strip().lower()
-    if (module.startswith("lycoris") and algo == "dylora") or module == "networks.dylora":
+    if module.startswith("lycoris") and algo == "dylora":
         # unfit by design, not fixable in the fork: dylora draws its random rank per forward (dylora.py:114-116, a Python
         # random number that sets the step's tensor shapes: a graph per rank at best) and the fixed path reads
         # torch._C._current_graph_task_id() to give a checkpoint recompute the forward's draw - neither traces
-        refuse(f"not with DyLoRA ({'algo=dylora' if algo == 'dylora' else module}): it draws a random rank per forward,"
-               " which sets the tensor shapes of the step, and reuses it in a checkpoint recompute through"
-               " torch._C._current_graph_task_id(); a compiled graph can hold neither. Use another algo or train eager")
+        refuse("not with LyCORIS DyLoRA (algo=dylora): it draws a random rank per forward, which sets the tensor shapes"
+               " of the step, and reuses it in a checkpoint recompute through torch._C._current_graph_task_id(); a"
+               " compiled graph can hold neither. Use another algo or train eager")
+    if module == "networks.dylora":
+        # kohya's DyLoRA (networks/dylora.py:110-123): random.randint per forward, then requires_grad flipped on that
+        # rank's slice of the parameters inside the forward - a parameter mutation in the traced code and a re-guard per
+        # drawn rank
+        refuse("not with networks.dylora: kohya's DyLoRA draws a random rank every forward and flips requires_grad on"
+               " that rank's slice of its parameters inside the forward (graph breaks, a recompile per drawn rank). Use"
+               " another network or train eager")
     mode = getattr(args, "anima_block_compile_dynamic", "union")
     if mode not in anima_block_compile.DYNAMIC_MODES:
         refuse(f"--anima_block_compile_dynamic must be one of {anima_block_compile.DYNAMIC_MODES}, got {mode!r}")

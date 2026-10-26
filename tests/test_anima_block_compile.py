@@ -9,16 +9,19 @@ graph as inductor, without codegen) on a 2-Block toy Anima and networks built th
 * every Block._forward traces to ONE graph with no graph break for lokr+DoRA, lora, tsm stage 1 / 2, tsm-lokr, loha
   (+DoRA; both of its fixed paths, the dense Hadamard delta and the factored (x KA^T) KB^T), full, tlora, abba (+DoRA),
   diag-oft and boft (its token rows on the blockwise rotation path, the adaLN rows on the few-rows stage path);
-* compiled forward + backward reproduce the eager outputs and every network gradient exactly, with and without gradient
-  checkpointing (unsloth offload and torch.utils.checkpoint); the compiled call hands the caller's autocast state to the
-  graph, which re-enters it (compile_blocks), so the backward is traced without the ambient autocast like eager's and
-  the Block's fp32 region (the adaLN modulations) computes its gradients in fp32 - before, AOTAutograd traced the
-  backward under the trainer's autocast and every adaLN adapter's weight gradient came back rounded to bf16 (plain
-  LoRA's lora_up by a bf16 ulp or two, LoHa's hada_w2_a by up to ~0.8 relative per element, BOFT's oft_blocks at the
-  bf16 level). The pinned exceptions are in _ULP_GRADS / _FP32_GRADS (assert_same);
+* compiled forward + backward reproduce the eager outputs and every network gradient exactly (zero-init factors seeded:
+  seed_zero_factors, perturb_tlora, perturb_tsm), with and without gradient checkpointing (unsloth offload and
+  torch.utils.checkpoint); the compiled call hands the caller's autocast state to the graph, which re-enters it
+  (compile_blocks), so the backward is traced without the ambient autocast like eager's - before, AOTAutograd traced it
+  under the trainer's autocast and every fp32 matmul of the backward ran in bf16 (plain LoRA's six adaLN-up lora_up
+  gradients off by a bf16 ulp or two, LoHa's hada_w2_a and BOFT's oft_blocks on the attention / MLP layers too). The
+  pinned exception is in _FP32_GRADS (assert_same);
+* the Blocks share one compiled entry (2 graphs for 4 Blocks, as for 2); a training forward of an eval-mode DiT (the
+  trainer without gradient checkpointing) runs compiled, eval under no_grad (validation) eager;
+* TSM stage 2 (TSMModule, the tsm_expert_fn path, TSM-LoKr) reads the step's embedding row inside the graphs;
 * dylora is refused by validate_block_compile_args: it draws a random rank per forward (tensor shapes from a Python
   random number) and reads torch._C._current_graph_task_id() to reuse it in a checkpoint recompute - untraceable by
-  design, and a graph per rank otherwise;
+  design, and a graph per rank otherwise (kohya's networks.dylora too: it flips requires_grad per drawn rank);
 * TSM: timesteps of one expert interval share the graphs (no recompile), another interval adds at most one graph per
   Block dtype regime; a mixed-timestep chunk (batch > 1 with different timesteps) runs eager through skip_call;
 * T-LoRA: every timestep shares the graphs (the rank mask is hoisted onto the modules and rewritten in place per step;
@@ -72,6 +75,11 @@ PRESETS = {
     "tsm_lokr": dict(args=["algo=tsm-lokr", "preset=anima-exp", "tsm_n_scales=8,1", "tsm_stage=1", "factor=4",
                            "full_matrix=True", "decompose_both=False", "dora_wd=True", "wd_on_output=True",
                            "tsm_offload_states=False"], dim=10000, alpha=10000),
+    "tsm_stage2_fn": dict(args=["algo=tsm", "preset=anima-exp", "tsm_n_scales=8,1", "tsm_stage=2", "tsm_expert_fn=True"],
+                          dim=8, alpha=8),  # the opt-in _TSMExpertLinear path
+    "tsm_lokr_stage2": dict(args=["algo=tsm-lokr", "preset=anima-exp", "tsm_n_scales=8,1", "tsm_stage=2", "factor=4",
+                                  "full_matrix=True", "decompose_both=False", "dora_wd=True", "wd_on_output=True",
+                                  "tsm_offload_states=False"], dim=10000, alpha=10000),
     "loha": dict(args=["algo=loha", "preset=anima-exp"], dim=8, alpha=8),
     "loha_dora": dict(args=["algo=loha", "preset=anima-exp", "dora_wd=True", "wd_on_output=True"], dim=8, alpha=8),
     "full": dict(args=["algo=full", "preset=anima-exp"], dim=8, alpha=8),
@@ -81,10 +89,11 @@ PRESETS = {
     "diag_oft": dict(args=["algo=diag-oft", "preset=anima-exp"], dim=4, alpha=4),
     # boft: network_dim >= 6. LyCORIS' butterfly factorization (power2factorization) takes the largest even block size
     # b <= network_dim with out_dim / b a power of two; the adaLN-LoRA up Linears are 3 x model_channels wide (192 here,
-    # 6144 on Anima 2.9B), so they need b = 6 (dim 6: b = 6 there, 4 on the 64-wide Linears; dim 4 cannot build).
-    # oft_max_block 8: the toy's 16 .. 64 token rows take the blockwise rotation path (_BlockResidualMM, chunked and
-    # permuted stages) that production's >= 1024 token rows take under the default _OFT_MAX_BLOCK 256; the adaLN rows
-    # (one per sample) take the few-rows stage path either way.
+    # 6144 on Anima 2.9B), so their b is 3 x 2^k, at least 6 (dim 6: b = 6 there, 4 on the 64-wide Linears; dim 4
+    # cannot build). oft_max_block 8: the toy's 16 .. 64 token rows take the blockwise rotation path (_BlockResidualMM,
+    # chunked and permuted stages) that production's >= 880 token rows take under the default _OFT_MAX_BLOCK 256; the
+    # adaLN rows (one per sample) and here the toy's 8 text rows take the few-rows stage path (production's text is
+    # padded to 512 rows: blockwise).
     "boft": dict(args=["algo=boft", "preset=anima-exp"], dim=6, alpha=6, oft_max_block=8),
     "boft_rows": dict(args=["algo=boft", "preset=anima-exp"], dim=6, alpha=6),  # default 256: token rows on the few-rows path
     "dylora": dict(args=["algo=dylora", "preset=anima-exp", "block_size=2"], dim=8, alpha=8),  # refused, see test_dylora_*
@@ -112,6 +121,7 @@ def _env():
     yield
     laf.set_block_compile(False)
     laf._OFT_MAX_BLOCK = _OFT_MAX_BLOCK_DEFAULT
+    laf._TSM_EXPERT_FN = False  # tsm_stage2_fn's network_args set it
     laf._TSM_SAMPLE_T.clear()
     from lycoris.modules.tsm import clear_tsm_timestep
 
@@ -188,17 +198,41 @@ def step(unet, network, x, t, ctx, pad, checkpoint=False, backward=True):
     return y.detach().float().clone(), grads
 
 
-def seed_abba_up2(network, seed: int = 3) -> int:
-    """ABBA's second up factor is zero at init (abba.py:255), so the delta is zero and only lora_up2 and dora_scale get
-    gradients: seed it, so a compiled-vs-eager comparison exercises the delta and every factor's gradient."""
+_ZERO_INIT = ("lora_up2.weight", "hada_w2_a", "oft_blocks")  # ABBA (abba.py:255), LoHa, diag-OFT / BOFT (R = I)
+
+
+def seed_zero_factors(network, seed: int = 3, scale: float = 0.05) -> int:
+    """The factor each of these algos starts at zero, so that its delta is zero at init - ABBA's second up factor,
+    LoHa's hada_w2_a, (diag-)OFT / BOFT's oft_blocks - seeded small: with it zero every path or delta form a graph can
+    compute returns the base layer's output and the other factors get no gradient, so a compiled-vs-eager comparison
+    would only see that one factor's gradient. Returns the number of modules seeded."""
     g = torch.Generator().manual_seed(seed)
     n = 0
     with torch.no_grad():
         for m in laf._all_loras(network):
-            up2 = getattr(m, "lora_up2", None)
-            if up2 is not None:
-                up2.weight.copy_(torch.randn(up2.weight.shape, generator=g) * 0.05)
-                n += 1
+            hit = False
+            for name, p in m.named_parameters():
+                if name in _ZERO_INIT and not bool(p.any()):
+                    p.copy_(torch.randn(p.shape, generator=g).to(p.dtype) * scale)
+                    hit = True
+            n += hit
+    return n
+
+
+def perturb_tsm(network, seed: int = 7, scale: float = 0.05) -> int:
+    """TSM's stage-2 router, timestep embedding and context experts' up factors start at zero (tsm.py:228-230, 267;
+    tsm_lokr.py:307, 310, 382-384): the gated term is zero whichever embedding row a graph reads. Every float parameter of
+    the TSM modules perturbed, so outputs and gradients depend on the step's experts and embedding row. Returns the
+    number of tensors perturbed."""
+    g = torch.Generator().manual_seed(seed)
+    n = 0
+    with torch.no_grad():
+        for m in laf._all_loras(network):
+            if type(m).__name__ in laf._TSM_KINDS:
+                for p in m.parameters():
+                    if p.is_floating_point():
+                        p.add_(torch.randn(p.shape, generator=g).to(p.dtype) * scale)
+                        n += 1
     return n
 
 
@@ -442,11 +476,12 @@ def test_cold_start_traces_whole_after_priming(preset):
     assert primed.graph_break_count == 0 and primed.graph_count == 1, [str(r.reason)[:100] for r in primed.break_reasons]
 
 
-# gradients allowed to differ from eager (assert_same), per preset. By a bf16 step: none since compile_blocks hands the
-# autocast state to the graph (plain LoRA's adaLN up weights and ABBA+DoRA's factor / scale gradients needed it while the
-# backward was traced under the trainer's autocast). By fp32 rounding: boft_rows' oft_blocks (token rows on the few-rows
-# stage path, a toy-only regime: the AOT backward sums the einsum over the rows in another order than eager's bmm;
-# 5.8e-8 on a 4.2e-2 gradient measured; production's >= 1024 token rows take the blockwise path, exact as `boft`)
+# gradients allowed to differ from eager (assert_same), per preset. By a bf16 step: none. Plain LoRA's adaLN up weights
+# needed it while the backward was traced under the trainer's autocast (compile_blocks now hands the state to the graph);
+# ABBA+DoRA's factor / scale gradients while the graph took the factored path and eager the dense one (the path rule now
+# runs at the planned row count, eager's choice on the toy). By fp32 rounding: boft_rows' oft_blocks (token rows on the
+# few-rows stage path, a toy-only regime: the AOT backward sums the einsum over the rows in another order than eager's
+# bmm; 5.8e-8 on a 4.2e-2 gradient measured; production's >= 880 token rows take the blockwise path, exact as `boft`)
 _ULP_GRADS: dict = {}
 _FP32_GRADS = {"boft_rows": ("oft_blocks",)}
 
@@ -458,20 +493,20 @@ _FP32_GRADS = {"boft_rows": ("oft_blocks",)}
                                          ("loha_dora", "unsloth"), ("full", "none"), ("full", "unsloth"),
                                          ("tlora", "none"), ("tlora", "unsloth"),
                                          ("abba", "none"), ("abba", "unsloth"), ("abba_dora", "none"),
-                                         ("diag_oft", "none"), ("diag_oft", "unsloth"),
+                                         ("abba_dora", "unsloth"), ("diag_oft", "none"), ("diag_oft", "unsloth"),
                                          ("boft", "none"), ("boft", "unsloth"), ("boft", "torch"), ("boft_rows", "none")])
 def test_compiled_blocks_match_eager(preset, ckpt):
     """compile_blocks (aot_eager): the compiled forward + backward give the eager output and every network gradient
     exactly, without checkpointing and under the unsloth offload / torch.utils.checkpoint recompute (the checkpointed
-    callable is the compiled _forward, the marks are re-applied on the recompute pass). ABBA runs with its zero init
-    factor seeded (seed_abba_up2), so the delta and all four factors' gradients are compared. Inside the graphs LoHa's
+    callable is the compiled _forward, the marks are re-applied on the recompute pass). ABBA, LoHa and the OFTs run with
+    their zero-init factor seeded (seed_zero_factors), so the delta and every factor's gradient are compared. Inside the graphs LoHa's
     and ABBA's path rule runs at the planned row count (compile_toy: the band's 64 tokens), which on the toy is the path
     eager picks at every grid of the band (test_planned_rows_fix_the_path_choice_under_block_compile covers a band the
     rule flips in). boft_rows (token rows on the few-rows stage path): oft_blocks within fp32 rounding (_FP32_GRADS)."""
     bf16_backward_or_skip()
     unet, net, _ = build(preset)
-    if preset.startswith("abba"):
-        assert seed_abba_up2(net) == len(laf._all_loras(net))
+    if preset.startswith(("abba", "loha", "diag_oft", "boft")):
+        assert seed_zero_factors(net) == len(laf._all_loras(net))
     if ckpt != "none":
         unet.enable_gradient_checkpointing(unsloth_offload=ckpt == "unsloth")
     x, t, ctx, pad = inputs(t=[0.3])
@@ -481,22 +516,23 @@ def test_compiled_blocks_match_eager(preset, ckpt):
     new = step(unet, net, x, t, ctx, pad, checkpoint=ckpt != "none")
     assert state.compiled_calls >= len(unet.blocks) and state.eager_calls == 0, (state.compiled_calls, state.eager_calls)
     ulp, fp32 = _ULP_GRADS.get(preset, ()), _FP32_GRADS.get(preset, ())
-    loose = assert_same(ref, new, f"{preset} {ckpt}: compiled vs eager", ulp_grads=ulp, fp32_grads=fp32)
-    assert all(any(k in n for k in ulp + fp32) for n in loose), loose
+    assert_same(ref, new, f"{preset} {ckpt}: compiled vs eager", ulp_grads=ulp, fp32_grads=fp32)
     # a second step (the cached graphs) gives the same results as the first compiled one
     again = step(unet, net, x, t, ctx, pad, checkpoint=ckpt != "none")
     assert_same(new, again, f"{preset} {ckpt}: second compiled step vs first")
 
 
-@pytest.mark.parametrize("preset,factored", [("loha", True), ("loha", False), ("loha_dora", True)])
-def test_loha_forced_path_traces_and_matches_eager(preset, factored, monkeypatch):
-    """Both LoHa fixed paths inside the graph, whatever the cost rule picks for the toy shapes (on the GPU the choice
-    varies per layer and token count): _hada_factored_cheaper forced to the factored (x KA^T) KB^T path (_HadaDelta;
-    with DoRA _HadaDoRAOut, which the toy never picks on its own) or to the dense Hadamard delta (_HadaWeight). One graph,
-    no break, and the compiled forward + backward equal eager exactly."""
+@pytest.mark.parametrize("preset,factored", [("loha", True), ("loha", False), ("loha_dora", True), ("loha_dora", False),
+                                             ("abba", False), ("abba_dora", False)])
+def test_forced_path_traces_and_matches_eager(preset, factored, monkeypatch):
+    """Both fixed paths of LoHa / ABBA (+DoRA) inside the graph, whatever the cost rule picks for the toy shapes (at
+    Anima's shapes the planned row count picks dense on many layers from dim 16 / 32): _hada_factored_cheaper forced to
+    the factored (x KA^T) KB^T path (_HadaDelta; with DoRA _HadaDoRAOut) or to the dense rebuild (LoHa: _HadaWeight).
+    One graph, no break, and the compiled forward + backward equal eager exactly (zero-init factors seeded)."""
     bf16_backward_or_skip()
     monkeypatch.setattr(laf, "_hada_factored_cheaper", lambda *a, **k: factored)
     unet, net, _ = build(preset)
+    assert seed_zero_factors(net) == len(laf._all_loras(net))
     unet._block_compile = True
     x, t, ctx, pad = inputs(t=[0.3])
     cap = capture_block_args(unet, net, x, t, ctx, pad)
@@ -510,6 +546,78 @@ def test_loha_forced_path_traces_and_matches_eager(preset, factored, monkeypatch
     compile_toy(unet, net)
     new = step(unet, net, x, t, ctx, pad)
     assert_same(ref, new, f"{preset} forced factored={factored}: compiled vs eager")
+
+
+@pytest.mark.parametrize("preset", ["lora", "loha", "tsm"])
+def test_blocks_share_the_compiled_graphs(preset):
+    """compile_blocks compiles one entry per Block class and calls it with the Block as an argument: a 4-Block toy runs
+    on the same 2 graphs as a 2-Block one (Block 0's bf16 input, the fp32 residual of Blocks 1+). An entry closing over
+    each Block's bound _forward gave every Block graphs of its own (4 here; 28 per regime on Anima 2.9B, past the
+    recompile limit, the rest then eager)."""
+    unet, net, _ = build(preset, num_blocks=4)
+    backend, calls = counting_backend("aot_eager")
+    state = compile_toy(unet, net, backend=backend)
+    x, t, ctx, pad = inputs(t=[0.3])
+    step(unet, net, x, t, ctx, pad, backward=False)
+    assert state.compiled_calls == 4 and state.eager_calls == 0, (state.compiled_calls, state.eager_calls)
+    assert len(calls) == 2, f"{len(calls)} graphs for 4 Blocks"
+
+
+def test_eval_mode_training_forward_runs_compiled():
+    """Without --gradient_checkpointing the trainer keeps the DiT in eval mode for training too (train_network.py:
+    unet.eval() unless gradient checkpointing). A forward with grad enabled is a training forward and runs compiled -
+    it ran eager, so block compile (and --anima_activation_memory_budget with it) did nothing without checkpointing; the
+    compiled step equals eager. Eval under no_grad (validation) still runs the eager Blocks."""
+    bf16_backward_or_skip()
+    unet, net, _ = build("lora")
+    unet.eval()
+    x, t, ctx, pad = inputs(t=[0.3])
+    ref = step(unet, net, x, t, ctx, pad)
+    state = compile_toy(unet, net)
+    new = step(unet, net, x, t, ctx, pad)
+    assert state.compiled_calls == len(unet.blocks) and state.eager_calls == 0, (state.compiled_calls, state.eager_calls)
+    assert_same(ref, new, "eval-mode training step: compiled vs eager")
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        unet(x, t, ctx, padding_mask=pad)
+    assert state.eager_calls == len(unet.blocks)
+
+
+def _embed_rows(grads):
+    """The timestep-embedding rows that got a gradient, per module (sorted names)."""
+    return [g.abs().sum(1).nonzero().flatten().tolist() for n, g in sorted(grads.items()) if n.endswith("timestep_embed.weight")]
+
+
+@pytest.mark.parametrize("preset", ["tsm_stage2", "tsm_stage2_fn", "tsm_lokr_stage2"])
+def test_tsm_stage2_compiled_reads_the_step_embedding_row(preset):
+    """Stage 2's router adds the step's timestep-embedding row. Inside a graph the integer timestep is the constant 0
+    (the step is hoisted), so the row must come from the hoisted index tensor _hx_tidx: TSMModule's gates read it; before
+    this fix TSM-LoKr's gates and the opt-in tsm_expert_fn Function (now the factor path inside the graphs) read row 0
+    for every timestep. With the stage-2 weights perturbed (router, embedding and context experts are zero at init, so the
+    gated term vanished whichever row was read), timesteps 260 and 369 (one expert interval, different rows) run on the
+    same graphs and equal eager, and the embedding gradient lands on the step's row; 900 (other experts) too."""
+    bf16_backward_or_skip()
+    unet, net, _ = build(preset)
+    assert perturb_tsm(net) > 0
+    x, _, ctx, pad = inputs(t=[0.3])
+    sigmas = (0.26, 0.37, 0.9)
+    fn = laf._TSM_EXPERT_FN
+    try:
+        laf._TSM_EXPERT_FN = False  # the eager reference: the factor path, which the graphs take for stage 2
+        refs = {s: step(unet, net, x, torch.tensor([s]).to(torch.bfloat16), ctx, pad) for s in sigmas}
+    finally:
+        laf._TSM_EXPERT_FN = fn
+    assert _embed_rows(refs[0.26][1]) != _embed_rows(refs[0.37][1]) and all(r for r in _embed_rows(refs[0.26][1]))
+    backend, calls = counting_backend("aot_eager")
+    compile_toy(unet, net, backend=backend)
+    first = None
+    for s in sigmas:
+        new = step(unet, net, x, torch.tensor([s]).to(torch.bfloat16), ctx, pad)
+        if first is None:
+            first = len(calls)
+        elif s == 0.37:
+            assert len(calls) == first, f"sigma {s}: recompiled inside one expert interval"
+        assert_same(refs[s], new, f"{preset} sigma {s}: compiled vs eager")
+        assert _embed_rows(new[1]) == _embed_rows(refs[s][1]), f"{preset} sigma {s}: embedding rows differ"
 
 
 def test_tsm_timesteps_of_one_expert_interval_share_the_graphs():
@@ -556,11 +664,12 @@ def test_tlora_timesteps_share_the_graphs_through_the_hoisted_mask():
     assert len(mods) == len(laf._all_loras(net))
     hx = mods[0].__dict__["_hx_tmask"]
     assert hx.shape == (1, 8) and hx.dtype == torch.float32 and hx.sum().item() == 6
+    hx0 = {id(m): m.__dict__["_hx_tmask"] for m in mods}
     for s in sigmas[1:]:
         y, _ = step(unet, net, x, torch.tensor([s]).to(torch.bfloat16), ctx, pad, backward=False)
         assert len(calls) == first, f"sigma {s}: recompiled ({len(calls) - first} new graphs)"
         assert torch.equal(y, refs[s]), f"sigma {s}: compiled output differs from eager"
-        assert all(m.__dict__["_hx_tmask"] is m.__dict__["_hx_tmask"] for m in mods)
+        assert all(m.__dict__["_hx_tmask"] is hx0[id(m)] for m in mods)  # every module's copy rewritten in place
     assert mods[0].__dict__["_hx_tmask"] is hx and hx.tolist() == [[1.0] * 7 + [0.0]]  # sigma 0.05: 7 ranks, in place
     assert all(torch.equal(m.__dict__["_hx_tmask"], hx) for m in mods)
     # eager reads the global; the hoisted copy holds the same values
@@ -680,7 +789,7 @@ def test_abba_path_choice_is_fixed_under_compile():
     over the whole band, the output identical to the factored eager path at every row count (eager keeps the rule and
     picks dense past the flip)."""
     unet, net, _ = build("abba")
-    seed_abba_up2(net)
+    seed_zero_factors(net)
     m = laf._all_loras(net)[0]
     lin = m.org_module[0]
     assert tuple(m.shape) == (64, 64) and not m.wd
@@ -712,26 +821,29 @@ def test_abba_path_choice_is_fixed_under_compile():
 @pytest.mark.parametrize("preset,where", [("loha", "mlp.layer1"), ("abba", "self_attn.q_proj")])
 def test_planned_rows_fix_the_path_choice_under_block_compile(preset, where):
     """The LoHa / ABBA rule (_hada_factored_cheaper) flips inside a strict band of 16 .. 4096 rows on these toy Linears
-    (LoHa's 256 x 64 MLP Linear between 64 and 256 rows, ABBA's 64 x 64 projection between 256 and 1024), as LoHa's
-    does inside a 4-tier band at Anima's shapes from dim 16 on. plan_block_compile_rows (after_network_loaded) gives the
-    token-row Linears a fixed row count - the cross-attention key / value and the adaLN Linears 0 (their rows are
-    static in the graph) - and the rule runs at it inside the graphs: one graph over the band, every output equal to
-    the eager path the rule picks at the planned count (factored at 64, dense at 4096)."""
+    (LoHa's 256 x 64 MLP Linear between 64 and 256 rows, ABBA's 64 x 64 projection between 256 and 1024), as it does
+    inside a 4-tier band at Anima's shapes (LoHa with fp32 factors from dim 16, with DoRA from dim 8; ABBA from dim 32).
+    plan_block_compile_rows (after_network_loaded) gives the token-row Linears a fixed row count - the cross-attention
+    key / value and the adaLN Linears 0 (their rows are static in the graph) - and the rule runs at it inside the graphs:
+    one graph over the band, every output equal to the eager path the rule picks at the planned count (factored at 64,
+    dense at 4096) and different from the other path's."""
     unet, net, _ = build(preset)
-    if preset == "abba":
-        seed_abba_up2(net)
+    assert seed_zero_factors(net) == len(laf._all_loras(net))  # a zero delta made both paths return the base output
     blk = unet.blocks[0]
     lin = blk.get_submodule(where)
     of = {id(m.org_module[0]): m for m in laf._all_loras(net)}
     m = of[id(lin)]
     rank = m.r1 * m.r2 if preset == "abba" else m.hada_w1_a.shape[1] * m.hada_w2_a.shape[1]
+    fp32_grads = preset == "loha"  # as the forwards pass it: LoHa's fp32 factors under bf16 autocast; ABBA always False
     rows = (16, 64, 256, 1024, 2000, 4096)
-    rule = [laf._hada_factored_cheaper(m, torch.empty(1, n, lin.in_features, device="meta"), preset, rank, False, False)
-            for n in rows]
+    rule = [laf._hada_factored_cheaper(m, torch.empty(1, n, lin.in_features, device="meta"), preset, rank, False,
+                                       fp32_grads) for n in rows]
     assert rule[0] is True and rule[-1] is False, rule  # the eager rule flips inside the band
     n_token = laf.plan_block_compile_rows(net, unet, 4096)
-    static = [of[id(blk.cross_attn.k_proj)], of[id(blk.cross_attn.v_proj)], of[id(blk.adaln_modulation_self_attn[1])]]
-    assert all(s.__dict__["_bc_rows"] == 0 for s in static) and m.__dict__["_bc_rows"] == 4096
+    static = [of[id(blk.cross_attn.k_proj)], of[id(blk.cross_attn.v_proj)], of[id(blk.adaln_modulation_self_attn[1])],
+              of[id(blk.adaln_modulation_mlp[2])]]
+    token = [m, of[id(blk.self_attn.k_proj)], of[id(blk.self_attn.v_proj)], of[id(blk.cross_attn.output_proj)]]
+    assert all(s.__dict__["_bc_rows"] == 0 for s in static) and all(t.__dict__["_bc_rows"] == 4096 for t in token)
     assert 0 < n_token < len(laf._all_loras(net))
     orig_rule = laf._hada_factored_cheaper
     g = torch.Generator().manual_seed(0)
@@ -748,9 +860,12 @@ def test_planned_rows_fix_the_path_choice_under_block_compile(preset, where):
                 try:
                     laf._hada_factored_cheaper = lambda *a, **k: factored  # the eager path the plan picks
                     y_ref = lin(x)
+                    laf._hada_factored_cheaper = lambda *a, **k: not factored  # and the other one
+                    y_other = lin(x)
                 finally:
                     laf._hada_factored_cheaper = orig_rule
             assert len(calls) == 1, f"planned {planned}, {n} rows: {len(calls)} graphs"
+            assert not torch.equal(y_ref, y_other), f"{n} rows: the two paths round alike, the check would be blind"
             assert torch.equal(y, y_ref), f"planned {planned}, {n} rows: compiled differs from the planned eager path"
 
 
@@ -846,8 +961,8 @@ def test_static_plan_compiles_per_token_count():
 
 
 def test_pause_eval_and_restore_run_the_eager_blocks():
-    """pause() (sample images) and eval mode (validation) take the eager _forward; restore_blocks removes the wrappers
-    and the fake-5D flag."""
+    """pause() (sample images) and eval mode under no_grad (validation) take the eager _forward; restore_blocks removes
+    the wrappers and the fake-5D flag."""
     unet, net, _ = build("lora")
     state = compile_toy(unet, net, backend="eager")
     x, t, ctx, pad = inputs(t=[0.3])
@@ -874,7 +989,8 @@ def test_pause_eval_and_restore_run_the_eager_blocks():
 
 
 def test_rebind_forwards_keeps_the_lokr_sample_cache_targets():
-    """rebind_forwards: every adapted Linear's forward becomes a closure (dynamo-traceable) carrying __self__, so
+    """rebind_forwards: every adapted Linear's forward becomes a closure (dynamo-traceable) carrying the module as __wrapped_lora__ (not
+    __self__: dynamo refuses to inline a function that has one), so
     lycoris_fast._cache_targets (the merged-weight cache of sample images) finds the same LoKr modules; idempotent;
     a foreign forward patch is left alone."""
     unet, net, _ = build("lokr_dora", block_compile=False)

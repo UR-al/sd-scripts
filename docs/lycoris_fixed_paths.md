@@ -100,11 +100,14 @@ changes the eager math):
   `_HadaDoRAOut`, and the dense one).
 - LoHa's and ABBA's path rule (`_hada_factored_cheaper`: factored vs dense rebuild by a cost model on the row count):
   inside a graph the token axis is symbolic and the comparison would guard it (strict marks: `ConstraintViolationError`
-  before the first graph; soft marks: a recompile at the flip; at Anima's shapes LoHa's rule flips inside a 4-tier band
-  from dim 16 on, ABBA's from dim 32). `plan_block_compile_rows` (called by `after_network_loaded`) gives the Blocks'
-  token-row Linears the plan's largest token count and the cross-attention key / value and adaLN Linears 0 (static rows,
-  read as eager reads them); the rule then makes one fixed choice per Linear inside the graphs (without a plan: the
-  factored form). ABBA's fused dense DoRA form (`_abba_dora_dense`) is skipped inside the graphs. Where the fixed choice
+  before the first graph; soft marks: a recompile at the flip). At Anima's shapes the rule flips inside a 4-tier band
+  for LoHa from dim 16 (fp32 factors under bf16 autocast, the default: 2048x2048 at ~3.4k rows), with DoRA from dim 8
+  (~8.2k rows) - ~6.6k / ~2.3k at dim 16 with `--full_bf16` - and for ABBA from dim 32 (~7.5k, with DoRA ~3.7k).
+  `plan_block_compile_rows` (called by `after_network_loaded`, before the first compiled call) gives the Blocks'
+  token-row Linears the plan's largest token count per sample (the batch size is not counted; one value for every band)
+  and the cross-attention key / value and adaLN Linears 0 (static rows, read as eager reads them); the rule then makes
+  one fixed choice per Linear inside the graphs (without a plan: the factored form). GoRA / RaLoRA / LoRA² + DoRA
+  (`_lf_dora_dense`, the same kind of rule on CUDA) take the factored form inside the graphs (not covered by tests). ABBA's fused dense DoRA form (`_abba_dora_dense`) is skipped inside the graphs. Where the fixed choice
   differs from eager's per-call one the compiled result is the same math rounded elsewhere (bf16-ulp level; on CUDA
   eager ABBA+DoRA takes `_DenseDoRAOut` on nearly every layer, so compiled ABBA+DoRA is not bit-identical to eager there).
 - `full`: `{**kw_dict, ...}` instead of `kw_dict | {...}` in the forward (dynamo 2.7 cannot trace `dict.__or__`: a
@@ -123,16 +126,30 @@ changes the eager math):
   draw in a checkpoint recompute; neither traces.
 - the compiled Block is called with autocast disabled and re-enters the caller's autocast state inside the graph
   (`compile_blocks`): AOTAutograd traces the backward under the autocast state of the first call, the trainer's
-  `accelerator.autocast()`, so the backward of the Block's fp32 region (the adaLN modulations) ran its matmuls in bf16
-  and every adaLN adapter's weight gradient came back rounded to bf16 (plain LoRA's `lora_up` by a bf16 ulp or two,
-  LoHa's `hada_w2_a` by up to ~0.8 relative per element, ABBA+DoRA's and BOFT's at the bf16 level) where eager computes
-  them in fp32. Now identical to eager (on CUDA under the unsloth offload checkpointer, whose `@custom_bwd` backward
-  restores the forward's autocast, eager's are the bf16-rounded ones).
+  `accelerator.autocast()`, so every fp32 matmul of the traced backward - the Block's fp32 region (the adaLN
+  modulations) and the adapters' own fp32 math (LoHa's dense Hadamard delta, BOFT's rotation) - ran in bf16 (plain
+  LoRA's six adaLN-up `lora_up` gradients off by a bf16 ulp or two; LoHa's `hada_w2_a` and BOFT's `oft_blocks` on the
+  attention / MLP layers too; full, ABBA (+DoRA), T-LoRA and diag-OFT were unaffected). Now identical to eager. On CUDA
+  under the unsloth offload checkpointer, whose `@custom_bwd` backward restores the forward's autocast, eager's fp32
+  backward math is bf16-rounded; inductor's compiled backward is not, an `aot_eager` / `eager` backend's is.
+- one compiled entry per Block class, called with the Block as an argument: every Block shares its dynamo cache (an
+  entry closing over each Block's bound `_forward` gave every Block graphs of its own - 28 per regime on Anima 2.9B).
 - only `_forward` is compiled; `_forward_hoisted` (`--anima_adaln_hoist` under checkpointing) forwards to it eagerly.
+- a training forward runs compiled in eval mode too (without `--gradient_checkpointing` the trainer keeps the DiT in
+  eval mode): the wrapper compiles when the Block is in train mode or grad is enabled; validation (eval, no_grad) and
+  sampling (`pause()`) run eager.
+- TSM stage 2: the router's timestep-embedding row comes from the hoisted index tensor `_hx_tidx` inside the graphs for
+  TSM-LoKr too (`_hoist_tsm_step`, `TSMLokrModule._gates`) and for `tsm_expert_fn=True` (the factor path inside the
+  graphs) - both read row 0 for every timestep before (the integer timestep is the constant 0 in a graph); the row is
+  read only while the step is hoisted, and the per-sample timesteps are not read in a hoisted graph (a guard per
+  timestep value at batch >= 2 before).
 
 Covered by `tests/test_anima_block_compile.py` (lokr+DoRA, lora, tsm stage 1 / 2, tsm-lokr, loha, loha+DoRA, full, tlora,
 abba, abba+DoRA, diag-oft, boft: one graph per Block and no graph break from a cold network, compiled forward + backward
-identical to eager with and without checkpointing - boft with its token rows on the few-rows stage path, a toy-only
-regime, within fp32 rounding in `oft_blocks` - and no recompile inside an expert interval, across T-LoRA timesteps,
-across `clear_timestep` or across the bucket resolutions of the union band; LoHa / ABBA with a band across their rule's
-flip; the adaLN hoist under checkpointing; dylora's refusal).
+identical to eager with and without checkpointing, the zero-init factors seeded - boft with its token rows on the
+few-rows stage path, a toy-only regime, within fp32 rounding in `oft_blocks` - and no recompile inside an expert
+interval, across T-LoRA timesteps, across `clear_timestep` or across the bucket resolutions of the union band; both
+fixed paths of LoHa / ABBA (+DoRA) forced; LoHa / ABBA with a band across their rule's flip; 4 Blocks on 2 graphs; an
+eval-mode training forward; TSM stage 2's embedding rows; the adaLN hoist under checkpointing; dylora's refusal).
+`_boft_rotate`'s `rows <= _OFT_MAX_BLOCK` (256) is still a row-count comparison in the graph: a band containing forwards
+of 256 rows or fewer (a 256 px tier at batch 1) would get two specializations; Anima's tiers start at 880 tokens.
