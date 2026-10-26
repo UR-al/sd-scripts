@@ -6,10 +6,12 @@
 # exactly that host work (the 640 LyCORIS module calls of a micro-step are ~0.5 s of Python, the launches another
 # ~0.3-0.5 s; the GPU is idle), so this is where the step time of the 512 / 1024 tiers goes. Measured on a CPU harness
 # (torch 2.7.1, aot_eager, the fork's own Block and LyCORIS fixed paths): one graph per Block, no graph breaks, outputs
-# and gradients identical to eager for LoKr+DoRA, TSM stage 1 / 2 and TSM-LoKr (plain LoRA: the six adaLN-modulation
-# up-weight gradients within a bf16 ulp or two, a K = 1 outer product rounded at another site in the AOT backward); per-Block
-# launches TSM 672 -> 235 (GC) / 475 -> 153, LoKr+DoRA 980 -> 121 (GC) / 736 -> 77 (inductor CPU wrapper counts). GPU
-# numbers: measure with the A/B in docs/anima_train_network.md.
+# and gradients identical to eager for LoKr+DoRA, TSM stage 1 / 2, TSM-LoKr, plain LoRA, LoHa (+DoRA), full, T-LoRA,
+# ABBA (+DoRA), diag-OFT and BOFT (the autocast state handed to the graph, see below: before that the adaLN adapters'
+# weight gradients came back rounded to bf16, plain LoRA's lora_up by a bf16 ulp or two); DyLoRA is refused
+# (anima_train_network.validate_block_compile_args: a random rank per forward). Per-Block launches TSM 672 -> 235 (GC) /
+# 475 -> 153, LoKr+DoRA 980 -> 121 (GC) / 736 -> 77 (inductor CPU wrapper counts). GPU numbers: measure with the A/B
+# in docs/anima_train_network.md.
 #
 # Pieces (and why each exists):
 # * compile `_forward`, not `forward`: the unsloth / torch checkpoint wrappers hold `@torch._disable_dynamo` or are not
@@ -36,6 +38,21 @@
 #   dynamo refuses to inline any function that has one ("Inline attempt with __self__").
 # * known limitation: --split_attn slices each row by its device seqlens tensor (data-dependent): one graph break per
 #   row inside every attention call. Anima's default attention (attn_mode torch, no split) traces whole.
+# * the autocast state as graph arguments: the compiled entry is called with autocast disabled and re-enters the
+#   caller's state inside the graph. AOTAutograd traces the backward under the autocast state in force at the first
+#   call (the trainer's accelerator.autocast()), while eager's autograd engine runs the backward with autocast off: the
+#   backward matmuls of the Block's fp32 region (the adaLN modulations, autocast disabled in the forward) were traced
+#   with bf16 casts, so every adaLN adapter's weight gradient came back rounded to bf16 (plain LoRA's lora_up by a bf16
+#   ulp or two; LoHa's hada_w2_a, which mixes the dense delta's gradient across columns, by up to ~0.8 relative per
+#   element). With the entry state off the forward graph is unchanged (dynamo enters the region for real while tracing,
+#   so is_autocast_enabled() and the casts inside are as before) and the backward computes in the saved tensors' dtypes.
+#   On CUDA the unsloth offload checkpointer's eager backward is @custom_bwd (it restores the forward's autocast around
+#   the recompute and the backward), so there eager-unsloth's fp32-region gradients are the bf16-rounded ones and the
+#   compiled run matches the un-checkpointed eager numerics instead (a bf16-level difference, eager's doing).
+# * only `_forward` is compiled: `_forward_hoisted` (--anima_adaln_hoist under checkpointing) forwards to it eagerly.
+# * path rules that read the row count (LoHa / ABBA: factored vs dense rebuild, lycoris_algo_fixes._hada_factored_cheaper)
+#   would guard the symbolic token axis; inside the graphs they run at a planned row count instead
+#   (lycoris_algo_fixes.plan_block_compile_rows, set by after_network_loaded: the largest token count of the bands).
 # * the fork's own ElementwiseChains and LoKr weight-rebuild compiles are switched off under block compile (nested
 #   torch.compile inside a compiled frame exhausts the recompile budget).
 # * the per-module caches the fixed paths fill lazily (lycoris_fast._static_eligible: a float(scalar) .item() per LoKr
@@ -312,11 +329,13 @@ def compile_blocks(
     skip_call: Optional[Callable[[], bool]] = None,
     isolate_cache: bool = True,
 ) -> CompiledBlocks:
-    """torch.compile every Block's `_forward` (and `_forward_hoisted`) of `anima`; the model flattens its token grid to
-    the fake-5D layout around the Block loop from now on (anima._block_compile). Call AFTER the network's apply_to and
-    weight loading (the compiled graph traces the patched Linear forwards). `bands`: plan_bands() output ([]: static).
-    `soft_marks`: None = soft under attn_mode "torch" (SDPA), strict otherwise. `skip_call()`: when it returns True the
-    call runs the eager `_forward` (a mixed-timestep TSM chunk)."""
+    """torch.compile every Block's `_forward` of `anima`; the model flattens its token grid to the fake-5D layout around
+    the Block loop from now on (anima._block_compile). `_forward_hoisted` (the ADALN_HOIST entry of a checkpointed Block)
+    is left eager: it only forwards to `self._forward`, i.e. to the compiled wrapper - compiled itself, its trace reached
+    that wrapper's mark_dynamic ("Attempt to trace forbidden callable") at the first checkpointed call. Call AFTER the
+    network's apply_to and weight loading (the compiled graph traces the patched Linear forwards). `bands`:
+    plan_bands() output ([]: static). `soft_marks`: None = soft under attn_mode "torch" (SDPA), strict otherwise.
+    `skip_call()`: when it returns True the call runs the eager `_forward` (a mixed-timestep TSM chunk)."""
     if dynamic not in DYNAMIC_MODES:
         raise ValueError(f"dynamic must be one of {DYNAMIC_MODES}, got {dynamic!r}")
     bands = [tuple(int(v) for v in b) for b in bands] if dynamic != "static" else []
@@ -334,7 +353,13 @@ def compile_blocks(
 
     def make(block: torch.nn.Module, name: str):
         orig = getattr(block, name)  # the bound class method
-        compiled = torch.compile(orig, **kwargs)
+
+        def entry(autocast_enabled: bool, autocast_dtype: torch.dtype, x, *args, **kw):
+            # the caller's autocast state, re-entered INSIDE the graph (see wrapped): the forward traces as before
+            with torch.autocast(device_type=x.device.type, dtype=autocast_dtype, enabled=autocast_enabled):
+                return orig(x, *args, **kw)
+
+        compiled = torch.compile(entry, **kwargs)
 
         def wrapped(x, *args, **kw):
             if not (_active and block.training) or (skip_call is not None and skip_call()):
@@ -343,17 +368,25 @@ def compile_blocks(
             if bands and x.dim() == 5:
                 _mark_dynamic(x, _rope_of(args, kw), bands, soft_marks)
             state.compiled_calls += 1
-            return compiled(x, *args, **kw)
+            dev = x.device.type
+            # Autocast OFF around the compiled call, the state handed to the graph as arguments: AOTAutograd traces the
+            # BACKWARD under the autocast state in force when the graph is first called, and the trainer calls the Blocks
+            # inside accelerator.autocast(). The Block's fp32 region (the adaLN modulations run with autocast disabled)
+            # would then get its backward matmuls autocast to bf16 (a weight gradient rounded to bf16 for every adaLN
+            # adapter: plain LoRA's lora_up, LoHa's dense delta, ...), where eager's autograd engine runs the backward
+            # with autocast off. With the entry state off, the forward is identical (entry re-enters it) and the traced
+            # backward computes in the saved tensors' dtypes, as eager does.
+            enabled, dtype = torch.is_autocast_enabled(dev), torch.get_autocast_dtype(dev)  # read BEFORE disabling
+            with torch.autocast(device_type=dev, enabled=False):
+                return compiled(enabled, dtype, x, *args, **kw)
 
         wrapped.__name__ = f"compiled_{name}"
         wrapped.__wrapped__ = orig
         return wrapped
 
     for block in anima.blocks:
-        for name in ("_forward", "_forward_hoisted"):
-            if hasattr(block, name):
-                state.originals.append((block, name, getattr(block, name)))
-                setattr(block, name, make(block, name))
+        state.originals.append((block, "_forward", block._forward))
+        block._forward = make(block, "_forward")
     anima._block_compile = True
     anima._block_compile_state = state
     logger.info(f"block compile: {len(anima.blocks)} Blocks, backend={backend}, mode={mode or 'default'}, dynamic={dynamic}"

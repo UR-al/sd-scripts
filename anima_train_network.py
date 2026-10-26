@@ -171,9 +171,19 @@ def validate_block_compile_args(args) -> None:
         refuse("not with --blocks_to_swap: a swapped Block's weights change device between calls (a re-trace per step)")
     if getattr(args, "torch_compile", False):
         refuse("not together with --torch_compile (accelerate's regional compile): the Blocks are compiled here")
-    if getattr(args, "lycoris_stock", False) and str(getattr(args, "network_module", "") or "").startswith("lycoris"):
+    module = str(getattr(args, "network_module", "") or "")
+    if getattr(args, "lycoris_stock", False) and module.startswith("lycoris"):
         refuse("not with --lycoris_stock: the stock LyCORIS forwards read org_module[0] through a bound method, which"
                " dynamo cannot trace; the fixed paths re-bind them")
+    net_kwargs = dict(item.split("=", 1) for item in (getattr(args, "network_args", None) or []) if "=" in item)
+    algo = str(net_kwargs.get("algo", "lora") or "lora").strip().lower()
+    if (module.startswith("lycoris") and algo == "dylora") or module == "networks.dylora":
+        # unfit by design, not fixable in the fork: dylora draws its random rank per forward (dylora.py:114-116, a Python
+        # random number that sets the step's tensor shapes: a graph per rank at best) and the fixed path reads
+        # torch._C._current_graph_task_id() to give a checkpoint recompute the forward's draw - neither traces
+        refuse(f"not with DyLoRA ({'algo=dylora' if algo == 'dylora' else module}): it draws a random rank per forward,"
+               " which sets the tensor shapes of the step, and reuses it in a checkpoint recompute through"
+               " torch._C._current_graph_task_id(); a compiled graph can hold neither. Use another algo or train eager")
     mode = getattr(args, "anima_block_compile_dynamic", "union")
     if mode not in anima_block_compile.DYNAMIC_MODES:
         refuse(f"--anima_block_compile_dynamic must be one of {anima_block_compile.DYNAMIC_MODES}, got {mode!r}")
@@ -1188,6 +1198,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         # the per-module caches the fixed paths fill on the first forward (a .item() each for LoKr) must be warm before
         # the first trace: traced cold, the first call breaks the graph and dynamo keeps those fragments
         primed = self._lycoris_fixes.prime_module_caches(network) if getattr(self, "_lycoris_fix_on", False) else 0
+        if getattr(self, "_lycoris_fix_on", False):
+            # the LoHa / ABBA path rule reads the row count: inside a graph a fixed choice at the largest token count
+            self._lycoris_fixes.plan_block_compile_rows(network, anima, max((hi for _, hi in bands), default=0))
         if getattr(anima, "split_attn", False):
             logger.warning("--anima_block_compile with --split_attn: the per-row slice by the seqlens tensor is a graph break"
                            " inside every attention call (the Blocks still run, in pieces); attn_mode torch without"

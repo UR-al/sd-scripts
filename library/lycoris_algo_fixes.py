@@ -459,6 +459,14 @@ def _hada_factored_cheaper(self, x: torch.Tensor, algo: str, rank: int, wd: bool
     weight's gradient (bypass: the delta is a full matmul, 4 of them) and the dense passes. N = tokens of this call."""
     out_f, in_f = int(self.shape[0]), int(self.shape[1])
     n = x.numel() // in_f
+    if BLOCK_COMPILE and torch.compiler.is_compiling():
+        # inside a block-compiled graph the token axis is symbolic: comparing it would guard the marked axis (strict
+        # marks: ConstraintViolationError, soft: a recompile at the flip). A fixed choice instead (plan_block_compile_rows)
+        planned = self.__dict__.get("_bc_rows")
+        if planned is None:
+            return True  # no plan (a graph compiled outside after_network_loaded): the factored path, as for ABBA before
+        if planned:
+            n = planned
     nr = float(n) * rank
     thin = 4.0 * nr * (in_f + out_f) + 2.0 * nr * in_f
     nbytes = 4.0 * n * (in_f + out_f) + 60.0 * rank * (in_f + out_f)
@@ -687,13 +695,58 @@ def _hada_linear_forward(self, x: torch.Tensor, kb: torch.Tensor, ka: torch.Tens
     return torch.addmm(up.reshape(-1, out_f), xc.reshape(-1, xc.shape[-1]), w0.t()).view(up.shape)
 
 
-def _loha_weight(self) -> torch.Tensor:
-    """get_weight(self.shape) of a linear LoHa (no tucker / orthogonalize / rank dropout) with gamma made on the CPU:
-    loha.py:306 makes it with device=cuda, a blocking host-to-device copy per call. Same values (a 0-dim operand)."""
-    from lycoris.functional.loha import diff_weight
+def _loha_gamma(self) -> torch.Tensor:
+    """The 0-d alpha/dim operand of the dense Hadamard delta (functional/loha.py gamma; loha.py:306 makes it with
+    torch.tensor(self.scale, device=cuda) on every call, a blocking host-to-device copy each): one tensor per module, made
+    from the same Python float in the factors' dtype on their device (the operand stock builds: bit-identical) and remade
+    only if the module was cast or moved after it was made (dtype / device differ; the value never changes). Kept in
+    __dict__, not as a buffer: nothing new in any state_dict (--resume) or save, and a later .to() never casts it (an fp32
+    -> bf16 cast of the tensor could differ from the bf16 made from the float by a double rounding). Inside a compiled
+    Block graph (--anima_block_compile) the operand is a graph constant made from the float instead (dynamo 2.7 traces
+    torch.tensor(float, dtype, device) as an op): no lazily filled module state inside the graph, so the trainer's
+    network.to(device / dtype) after compile_blocks changes nothing and nothing needs priming."""
+    ref = self.hada_w1_b
+    if torch.compiler.is_compiling():
+        return torch.tensor(float(self.scale), dtype=ref.dtype, device=ref.device)
+    g = self.__dict__.get("_laf_gamma")
+    if g is None or g.dtype != ref.dtype or g.device != ref.device:
+        g = self.__dict__["_laf_gamma"] = torch.tensor(float(self.scale), dtype=ref.dtype, device=ref.device)
+    return g
 
-    gamma = torch.tensor(self.scale, dtype=self.hada_w1_b.dtype)
-    w = diff_weight(self.hada_w1_b, self.hada_w1_a, self.hada_w2_b, self.hada_w2_a, None, None, gamma=gamma)
+
+class _HadaWeight(torch.autograd.Function):
+    """functional/loha.py HadaWeight (the dense Hadamard delta (w1u w1d) * (w2u w2d) * scale and its hand-written
+    backward), op for op, with `scale` a required argument: the stock forward's signature carries a tensor default
+    (scale=torch.tensor(1)), which dynamo 2.7 has to wrap without a source when it traces the Function - a graph break at
+    every .apply under --anima_block_compile, whatever is passed for scale (a toy LoHa Block ran as 38 graphs, LoHa+DoRA
+    as 50). Same ops in the same order and dtypes, so eager results are bit-identical to stock's."""
+
+    @staticmethod
+    def forward(ctx, w1d, w1u, w2d, w2u, scale):
+        ctx.save_for_backward(w1d, w1u, w2d, w2u, scale)
+        return ((w1u @ w1d) * (w2u @ w2d)) * scale
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        (w1d, w1u, w2d, w2u, scale) = ctx.saved_tensors
+        # stock's body, unguarded: it runs under whatever autocast the engine inherits from the caller, as stock's does
+        # (the unsloth checkpointer's reentrant backward restores the forward's autocast). Inside a compiled Block the
+        # traced backward has no ambient autocast since compile_blocks hands the state to the graph (no guard needed).
+        grad_out = grad_out * scale
+        temp = grad_out * (w2u @ w2d)
+        grad_w1u = temp @ w1d.T
+        grad_w1d = w1u.T @ temp
+        temp = grad_out * (w1u @ w1d)
+        grad_w2u = temp @ w2d.T
+        grad_w2d = w2u.T @ temp
+        return grad_w1d, grad_w1u, grad_w2d, grad_w2u, None
+
+
+def _loha_weight(self) -> torch.Tensor:
+    """get_weight(self.shape) of a linear LoHa (no tucker / orthogonalize / rank dropout): functional/loha.py diff_weight
+    for 2-D factors (its reshapes are no-ops there) through the fork's _HadaWeight with the cached gamma operand
+    (_loha_gamma): no tensor from Python data and no host-to-device copy per call. Same values (a 0-dim operand)."""
+    w = _HadaWeight.apply(self.hada_w1_b, self.hada_w1_a, self.hada_w2_b, self.hada_w2_a, _loha_gamma(self))
     return w.reshape(self.shape)
 
 
@@ -760,7 +813,18 @@ def _abba_forward(self, x):
     if dt is None or self.r1 == 0 or self.r2 == 0:
         return _original(_abba_cls(), "forward")(self, x)
     mult = self.multiplier_buf
-    if self.wd and self.wd_on_output and _ABBA_DORA_FUSED:
+    # Block compile (library/anima_block_compile.py): both path choices below read the row count, which inside a
+    # compiled Block graph is the symbolic size of the dynamic token axis - the comparison became a guard on it (a
+    # ConstraintViolationError under strict marks before the first graph when the choice flips inside the band, the
+    # toy's 64-wide layers flip between 256 and 1024 rows; a recompile per flip under soft marks). There the fused dense
+    # DoRA form is skipped (_lf_dora_dense prefers it for its fewer launches, which inductor's fusion removes anyway) and
+    # _hada_factored_cheaper makes a fixed choice at the planned row count (plan_block_compile_rows: the largest token
+    # count on the token-row Linears; factored without a plan). At Anima's layer shapes the rule picks factored for ABBA
+    # up to dim 16 at every token count (DoRA: dense on the adaLN layers, static rows; dim 32: dense on 2048x2048 from
+    # ~7.5k rows, with DoRA from ~3.7k): where the fixed choice differs from eager's per-call one, the compiled path is
+    # the same math rounded elsewhere (as accurate against fp64). Eager keeps both rules; --torch_compile alone too.
+    compiled = BLOCK_COMPILE and torch.compiler.is_compiling()
+    if self.wd and self.wd_on_output and _ABBA_DORA_FUSED and not compiled:
         y = _abba_dora_dense(self, x, dt, mult)
         if y is not None:
             return y
@@ -1134,16 +1198,31 @@ def _blocks(t: torch.Tensor, nb: int, S: int) -> torch.Tensor:
     return t.view(-1, nb, S).transpose(0, 1)  # [nb, rows, S] view of a contiguous [..., nb*S]
 
 
+def _block_residual_mm(v: torch.Tensor, D: torch.Tensor, shape) -> torch.Tensor:
+    """v + v @ D for the [nb, rows, S] block view v, back in the [..., nb*S] layout `shape` (block compile only).
+    dynamo 2.7 refuses an out= into a non-contiguous view ("out= op was called where output tensor was non-contiguous"):
+    traced, _BlockResidualMM's strided write was one graph break per adapted Linear (diag-oft: 26 per Block). Here the
+    same baddbmm (same operands, same kernel; only the output stride differs) writes a fresh [nb, rows, S] that is
+    permuted back into z's layout - one copy, which inductor fuses into the next pointwise op (the dtype cast / bias
+    add of _finish, the row permutation of _boft_rotate). Eager keeps the strided write (no copy)."""
+    return torch.baddbmm(v, v, D).transpose(0, 1).reshape(shape)
+
+
 class _BlockResidualMM(torch.autograd.Function):
     """y = z + z @ D on contiguous blocks of the last axis: z [..., nb*S] contiguous, D [nb, S, S] in z's dtype.
-    Strided batched matmuls on views of z/y (no permute copies); call with autocast off."""
+    Strided batched matmuls on views of z/y (no permute copies); call with autocast off. Inside a compiled Block graph
+    (torch.compiler.is_compiling(): --anima_block_compile traces this Function's forward and backward) the out= views
+    give way to _block_residual_mm; the eager path is untouched."""
 
     @staticmethod
     def forward(ctx, z, D):
         nb, S, _ = D.shape
-        y = torch.empty_like(z, memory_format=torch.contiguous_format)
         zv = _blocks(z, nb, S)
-        torch.baddbmm(zv, zv, D, out=_blocks(y, nb, S))
+        if torch.compiler.is_compiling():
+            y = _block_residual_mm(zv, D, z.shape)
+        else:
+            y = torch.empty_like(z, memory_format=torch.contiguous_format)
+            torch.baddbmm(zv, zv, D, out=_blocks(y, nb, S))
         ctx.save_for_backward(z, D)
         return y
 
@@ -1156,8 +1235,11 @@ class _BlockResidualMM(torch.autograd.Function):
             gy = gy.contiguous()
             gyv = _blocks(gy, nb, S)
             if ctx.needs_input_grad[0]:
-                gz = torch.empty_like(gy)
-                torch.baddbmm(gyv, gyv, D.transpose(1, 2), out=_blocks(gz, nb, S))
+                if torch.compiler.is_compiling():
+                    gz = _block_residual_mm(gyv, D.transpose(1, 2), gy.shape)
+                else:
+                    gz = torch.empty_like(gy)
+                    torch.baddbmm(gyv, gyv, D.transpose(1, 2), out=_blocks(gz, nb, S))
             if ctx.needs_input_grad[1]:
                 gD = torch.bmm(_blocks(z, nb, S).transpose(1, 2), gyv)
         return gz, gD
@@ -1344,6 +1426,35 @@ def set_block_compile(enabled: bool) -> None:
     BLOCK_COMPILE = bool(enabled)
 
 
+def plan_block_compile_rows(network, anima, rows: Optional[int]) -> int:
+    """--anima_block_compile with dynamic token bands: the row count the LoHa / ABBA path rule (_hada_factored_cheaper,
+    factored (x KA^T) KB^T vs the dense rebuild) assumes inside a compiled Block graph. There the token axis is symbolic,
+    and the rule's comparison on it would guard the marked axis (strict marks: ConstraintViolationError before the
+    first graph, soft marks: a recompile at the flip); at Anima's shapes LoHa's rule flips inside a 4-tier band from dim
+    16 on (2048x2048: ~6.6k rows, with DoRA ~2.4k). The adapted Linears of the Blocks whose rows are the token axis get
+    `rows` (the plan's largest token count, so the GPU-bound tier gets its cheaper path; batch 1) as _bc_rows; the
+    cross-attention key / value Linears (text rows) and the adaLN modulation Linears (a row per sample) get 0: their
+    row count is static in the graph and the rule reads it as eager does. rows None / 0 (static plan: every row count
+    static) gives 0 everywhere. Not a buffer / state_dict entry; eager ignores it. Returns how many got `rows`."""
+    rows = int(rows or 0)
+    roles: Dict[int, int] = {}
+    for block in getattr(anima, "blocks", ()):
+        for name, sub in block.named_modules():
+            if isinstance(sub, nn.Linear):
+                static = name in ("cross_attn.k_proj", "cross_attn.v_proj") or name.startswith("adaln_modulation")
+                roles[id(sub)] = 0 if static else rows
+    n = 0
+    for m in _all_loras(network):
+        org = getattr(m, "org_module", None)
+        lin = org[0] if isinstance(org, (list, tuple)) and org else None
+        if lin is None or id(lin) not in roles:
+            m.__dict__.pop("_bc_rows", None)
+            continue
+        m.__dict__["_bc_rows"] = roles[id(lin)]
+        n += roles[id(lin)] > 0
+    return n
+
+
 def rebind_forwards(network) -> int:
     """Re-bind every adapted Linear's instance forward (LyCORIS apply_to: `org_module.forward = self.forward`, a bound
     method) to a closure over the LyCORIS module. Same call, same results; the closure cell gives dynamo a source for
@@ -1381,7 +1492,8 @@ def prime_module_caches(network) -> int:
     per LoKr module; inside a compiled Block graph that is a graph break, and dynamo keeps the fragmented graphs it
     compiled on that first call for the rest of the run (a LoKr+DoRA Block traced cold ran as ~20 graphs instead of one
     and re-specialised per resolution). Call after the network's weights are loaded (the caches depend on them: the LoKr
-    scalar must be 1.0 for the fast path) and before compile_blocks. Returns the number of modules primed."""
+    scalar must be 1.0 for the fast path) and before compile_blocks. Returns the number of modules primed. (LoHa needs
+    none: its 0-d alpha/dim operand is a graph constant under compile, _loha_gamma.)"""
     from library import lycoris_fast
 
     n = 0
@@ -1437,6 +1549,39 @@ def _hoist_tsm_step(modules, ints: List[int]) -> None:
             idx_fn = getattr(m, "_expert_indices", None)
             if idx_fn is not None:
                 d["_hx_idx"] = idx_fn(t)
+
+
+def _hoist_tlora_step(modules, mask: torch.Tensor) -> None:
+    """Block compile: store this micro-step's T-LoRA rank mask on each TLoraModule as _hx_tmask - (1 or B, lora_dim),
+    float32, on the module's device, the tensor _tlora_mask returns in eager - read by _tlora_mask while tracing instead
+    of LyCORIS' module-global dict (tlora.set_timestep_mask stores a NEW tensor every step: inside a graph that read is a
+    guard on the dict and a graph input re-sourced per step, and the eager path's device move writes the dict from
+    inside the graph). Rewritten IN PLACE while the shape holds (one _foreach_copy_ per distinct rank and device, not a
+    copy per module), so the graphs keep one tensor identity and read the step's values at run time: a timestep that
+    changes the active rank count changes values, never the graph."""
+    fresh: Dict[Tuple[int, torch.device], Tuple[torch.Tensor, list]] = {}
+    for m in modules:
+        r = int(m.lora_dim)
+        dev = m.lambda_layer.device
+        key = (r, dev)
+        if key not in fresh:
+            mm = mask
+            if mm.shape[1] > r:  # the mask covers max_rank: cut / pad to this module's rank as _tlora_mask does
+                mm = mm[:, :r]
+            elif mm.shape[1] < r:
+                mm = F.pad(mm, (0, r - mm.shape[1]), value=1.0)
+            fresh[key] = (mm.to(device=dev, dtype=torch.float32).contiguous(), [])
+        src, pending = fresh[key]
+        prev = m.__dict__.get("_hx_tmask")
+        if prev is not None and prev.shape == src.shape and prev.device == dev:
+            pending.append(prev)
+        else:
+            m.__dict__["_hx_tmask"] = src.clone()  # first step, or a new batch size (B, r): its own tensor per module
+    for src, pending in fresh.values():
+        if pending:
+            torch._foreach_copy_(pending, [src] * len(pending))
+
+
 _TSM_EXPERTS: Dict[Tuple[Any, int, Tuple[int, ...]], Tuple[int, ...]] = {}  # (t, T, n_scales) -> expert per scale
 _TSM_PLANS: Dict[Any, Any] = {}  # per-step grouping of a mixed-timestep batch (device index tensors)
 
@@ -2610,6 +2755,10 @@ def _tlora_mask(self, device) -> torch.Tensor:
     blocking host-to-device copy per call for a CPU mask: train_network.apply_tlora_mask stores compute_timestep_mask's
     CPU tensor over set_timestep's device copy, so every module call (and its checkpoint recompute) synced with the
     host. The first call of the step moves it and stores the device copy back (same values) for the others."""
+    if torch.compiler.is_compiling():
+        hx = self.__dict__.get("_hx_tmask")  # block compile: this step's mask, hoisted by set_timestep (_hoist_tlora_step)
+        if hx is not None:
+            return hx
     from lycoris.modules.tlora import get_timestep_mask, set_timestep_mask
 
     r = int(self.lora_dim)
@@ -2628,6 +2777,19 @@ def _tlora_mask(self, device) -> torch.Tensor:
     elif mask.shape[1] < r:
         mask = F.pad(mask, (0, r - mask.shape[1]), value=1.0)
     return mask.to(device)
+
+
+def _tlora_org_forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+    """The base layer's output, org_forward(x). While a compiled Block graph is traced (--anima_block_compile) a float
+    Linear runs as F.linear on the weight and bias read through org_module[0] - the very call nn.Linear.forward makes,
+    on the same tensors - because dynamo 2.7.1 builds the bound org_forward's module without a source and breaks the
+    graph at each Parameter it reads (7 breaks per Block, 20 fragments; the other fixed paths read org_module[0] too).
+    Eager, conv, float8 base weights (their patched forward casts) and extra arguments call org_forward as before."""
+    if torch.compiler.is_compiling() and not (args or kwargs) and not self.isconv:
+        w = self.get_org_weight_for_compute(x.device)
+        if w is not None and w.dtype in _FLOATS:
+            return F.linear(x, w, self.get_org_bias_for_compute(x.device))
+    return self.org_forward(x, *args, **kwargs)
 
 
 def _tlora_fast_forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
@@ -2658,9 +2820,9 @@ def _tlora_fast_forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
     if batched:
         mid = (mid.view(x.shape[0], -1, mid.shape[-1]) * m2.to(mid.dtype).unsqueeze(1)).view(mid.shape)
     if bypass:
-        base = self.org_forward(x)
+        base = _tlora_org_forward(self, x)
         return base + self.drop(F.linear(mid, up).view(*x.shape[:-1], up.shape[0]))
-    base = self.org_forward(x, *args, **kwargs)
+    base = _tlora_org_forward(self, x, *args, **kwargs)
     if base.dtype != mid.dtype and _lowp_autocast(x.device.type) is None:
         return base + F.linear(mid, up).view(base.shape)
     return torch.addmm(base.reshape(-1, base.shape[-1]), mid, up.t()).view(base.shape)
@@ -3353,7 +3515,10 @@ def _full_forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         w, b = _full_org(self, x.device, self._org_weight[0].dtype)
     else:
         w, b = self.make_weight(self.multiplier, x.device)
-    kw = self.kw_dict | {"weight": _full_for_input(w, x), "bias": _full_for_input(b, x)}
+    # {**a, **b}, not `a | b`: the same dict (kw_dict is a plain dict of the conv/norm constants, empty for a Linear),
+    # but dynamo 2.7 cannot trace dict.__or__ ("Failed to trace builtin operator": a graph break per adapted Linear
+    # under --anima_block_compile; a toy Block ran as 20 graphs)
+    kw = {**self.kw_dict, "weight": _full_for_input(w, x), "bias": _full_for_input(b, x)}
     return self.op(x, **kw)
 
 
@@ -4335,8 +4500,11 @@ def set_timestep(network, timesteps, max_timestep: int = 1000) -> None:
         else:
             mask = compute_timestep_mask_batch(t, max_timestep, cfg["max_rank"], cfg["min_rank"], cfg["alpha"])
         groups = {int(getattr(m, "mask_group_id", 0)) for m in tl}
+        mask = mask.to(t.device)  # one copy for every group (compute_timestep_mask builds it on the CPU)
         for g in groups:
-            set_timestep_mask(mask.to(t.device), g)
+            set_timestep_mask(mask, g)
+        if BLOCK_COMPILE:
+            _hoist_tlora_step(tl, mask)  # the compiled graphs read the per-module copy, not the dict
     if tsm:
         from lycoris.modules.tsm import set_tsm_timestep
 
@@ -4365,7 +4533,12 @@ def set_timestep(network, timesteps, max_timestep: int = 1000) -> None:
 
 
 def clear_timestep(network) -> None:
-    """Undo set_timestep (call after accelerator.backward, and after sampling)."""
+    """Undo set_timestep (call after accelerator.backward, and after sampling). The block-compile hoists go back to the
+    no-timestep state eager reads, without a new tensor or a recompile: T-LoRA's _hx_tmask copies are filled with ones IN
+    PLACE (eager's mask when none is set: every rank), the TSM expert choices (_hx_experts / _hx_idx, Python tuples) are
+    removed so a traced read falls back to the stock global (stage 2's _hx_tidx tensor stays for the in-place rewrite;
+    it is read only next to _hx_experts). A compiled forward run before the next set_timestep then computes what eager
+    does - the trainer never runs one (set_timestep precedes every training forward), the check is for the edge case."""
     loras = _all_loras(network)
     tl_groups = {int(getattr(m, "mask_group_id", 0)) for m in loras if type(m).__name__ == "TLoraModule"}
     tsm_groups = {int(getattr(m, "mask_group_id", 0)) for m in loras if type(m).__name__ in _TSM_KINDS}
@@ -4374,6 +4547,10 @@ def clear_timestep(network) -> None:
 
         for g in tl_groups:
             clear_timestep_mask(g)
+        hx = [m.__dict__["_hx_tmask"] for m in loras if "_hx_tmask" in m.__dict__]
+        if hx:  # ones in place: two multi-tensor kernels, no allocation (torch 2.7 has no _foreach_fill_)
+            torch._foreach_zero_(hx)
+            torch._foreach_add_(hx, 1.0)
     if tsm_groups:
         from lycoris.modules.tsm import clear_tsm_timestep
 
@@ -4381,6 +4558,10 @@ def clear_timestep(network) -> None:
         for g in tsm_groups:
             clear_tsm_timestep(g)
             _TSM_SAMPLE_T.pop(g, None)
+        for m in loras:
+            if type(m).__name__ in _TSM_KINDS:
+                m.__dict__.pop("_hx_experts", None)
+                m.__dict__.pop("_hx_idx", None)
 
 
 # ======================================================================================================================

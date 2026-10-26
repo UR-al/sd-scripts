@@ -69,13 +69,14 @@ trained on another base can bring one) gets that entry's gradient without its ba
 ## Under `--anima_block_compile`
 
 `anima_train_network.py --anima_block_compile` (`library/anima_block_compile.py`, `docs/anima_train_network.md`) traces
-each DiT Block with the fixed paths' forwards inside the compiled graph. Three things change for LyCORIS networks, none
-of them for the eager math:
+each DiT Block with the fixed paths' forwards inside the compiled graph. What changes for LyCORIS networks (none of it
+changes the eager math):
 
 - after `apply_to`, every adapted Linear's instance `forward` (LyCORIS binds `org_module.forward = module.forward`) is
   re-bound to a closure over the module (`rebind_forwards`): dynamo 2.7 cannot read `org_module[0]` through a bound
-  method (every adapted Linear would be a graph break); the closure carries `__self__`, so the sample-time merged LoKr
-  weight cache of `library/lycoris_fast.py` still finds its modules. Stock LyCORIS forwards are not re-bound, which is
+  method (every adapted Linear would be a graph break); the closure carries the module as `__wrapped_lora__` (not as
+  `__self__`: dynamo refuses to inline a function that has one), so the sample-time merged LoKr weight cache of
+  `library/lycoris_fast.py` still finds its modules. Stock LyCORIS forwards are not re-bound, which is
   why `--lycoris_stock` is refused together with block compile.
 - `set_timestep` hoists the TSM step data onto the modules (`_hoist_tsm_step`): the expert tuple (`_hx_experts`), in
   stage 2 the embedding row as an index tensor (`_hx_tidx`), for `tsm-lokr` the expert indices (`_hx_idx`). While
@@ -91,8 +92,47 @@ of them for the eager math:
   per LoKr module; `_locon_fast_ok`, `_ortho_fast_ok`) are primed by `prime_module_caches` after the weights are loaded
   and before the Blocks are compiled: traced cold, the `.item()` is a graph break and dynamo keeps the fragments it
   compiled on that first call (a LoKr+DoRA Block ran as ~20 graphs instead of one, re-specialised per resolution).
+- `loha` (+DoRA): the dense Hadamard delta goes through the fork's `_HadaWeight` (functional/loha.py `HadaWeight` op for
+  op, without the tensor default argument `scale=torch.tensor(1)` of the stock `forward` signature, which made dynamo
+  break the graph at every `.apply`: a toy LoHa Block ran as 38 graphs, LoHa+DoRA as 50); its 0-d alpha/dim operand is
+  one tensor per module in eager (`_loha_gamma`: no `torch.tensor(scale)` and no host-to-device copy per call) and a
+  graph constant under compile. Both fixed paths trace whole (the factored `(x KA^T) KB^T` with `_HadaDelta` /
+  `_HadaDoRAOut`, and the dense one).
+- LoHa's and ABBA's path rule (`_hada_factored_cheaper`: factored vs dense rebuild by a cost model on the row count):
+  inside a graph the token axis is symbolic and the comparison would guard it (strict marks: `ConstraintViolationError`
+  before the first graph; soft marks: a recompile at the flip; at Anima's shapes LoHa's rule flips inside a 4-tier band
+  from dim 16 on, ABBA's from dim 32). `plan_block_compile_rows` (called by `after_network_loaded`) gives the Blocks'
+  token-row Linears the plan's largest token count and the cross-attention key / value and adaLN Linears 0 (static rows,
+  read as eager reads them); the rule then makes one fixed choice per Linear inside the graphs (without a plan: the
+  factored form). ABBA's fused dense DoRA form (`_abba_dora_dense`) is skipped inside the graphs. Where the fixed choice
+  differs from eager's per-call one the compiled result is the same math rounded elsewhere (bf16-ulp level; on CUDA
+  eager ABBA+DoRA takes `_DenseDoRAOut` on nearly every layer, so compiled ABBA+DoRA is not bit-identical to eager there).
+- `full`: `{**kw_dict, ...}` instead of `kw_dict | {...}` in the forward (dynamo 2.7 cannot trace `dict.__or__`: a
+  graph break per adapted Linear).
+- `tlora`: LyCORIS keeps the step's rank mask in a module-global dict that `set_timestep_mask` refills with a new tensor
+  every step (inside a graph: a guard and a re-sourced input per step). Under block compile `set_timestep` also hoists
+  it onto each module (`_hoist_tlora_step`: `_hx_tmask`, float32 (1 or B, rank), rewritten in place while the shape
+  holds) and `_tlora_mask` reads that while tracing: every timestep shares the graphs. `clear_timestep` refills it with
+  ones in place (eager's value without a mask). The base layer runs as `F.linear` on `org_module[0]`'s weight while
+  tracing (`_tlora_org_forward`; the bound `org_forward` is built without a source: 7 graph breaks per Block).
+- `diag-oft` / `boft`: `_BlockResidualMM` writes `z + z D` through `baddbmm(out=)` into a strided view in eager (no copy);
+  while tracing it writes a fresh contiguous block tensor and permutes it back (`_block_residual_mm`): dynamo refuses an
+  `out=` into a non-contiguous view (diag-oft: 26 graph breaks per Block; boft: the trace failed).
+- `dylora` is refused together with block compile (`validate_block_compile_args`): it draws a random rank per forward
+  (the step's tensor shapes follow a Python random number) and reads `torch._C._current_graph_task_id()` to replay the
+  draw in a checkpoint recompute; neither traces.
+- the compiled Block is called with autocast disabled and re-enters the caller's autocast state inside the graph
+  (`compile_blocks`): AOTAutograd traces the backward under the autocast state of the first call, the trainer's
+  `accelerator.autocast()`, so the backward of the Block's fp32 region (the adaLN modulations) ran its matmuls in bf16
+  and every adaLN adapter's weight gradient came back rounded to bf16 (plain LoRA's `lora_up` by a bf16 ulp or two,
+  LoHa's `hada_w2_a` by up to ~0.8 relative per element, ABBA+DoRA's and BOFT's at the bf16 level) where eager computes
+  them in fp32. Now identical to eager (on CUDA under the unsloth offload checkpointer, whose `@custom_bwd` backward
+  restores the forward's autocast, eager's are the bf16-rounded ones).
+- only `_forward` is compiled; `_forward_hoisted` (`--anima_adaln_hoist` under checkpointing) forwards to it eagerly.
 
-Covered by `tests/test_anima_block_compile.py` (lokr+DoRA, lora, tsm stage 1 / 2, tsm-lokr: one graph per Block, no
-graph break, compiled forward + backward identical to eager with and without checkpointing - plain lora's adaLN
-up-weight gradients within a bf16 ulp or two - and no recompile inside an expert interval or across the bucket resolutions of
-the union band).
+Covered by `tests/test_anima_block_compile.py` (lokr+DoRA, lora, tsm stage 1 / 2, tsm-lokr, loha, loha+DoRA, full, tlora,
+abba, abba+DoRA, diag-oft, boft: one graph per Block and no graph break from a cold network, compiled forward + backward
+identical to eager with and without checkpointing - boft with its token rows on the few-rows stage path, a toy-only
+regime, within fp32 rounding in `oft_blocks` - and no recompile inside an expert interval, across T-LoRA timesteps,
+across `clear_timestep` or across the bucket resolutions of the union band; LoHa / ABBA with a band across their rule's
+flip; the adaLN hoist under checkpointing; dylora's refusal).
