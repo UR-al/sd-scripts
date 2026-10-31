@@ -219,7 +219,9 @@ def cached_lokr_weights(model: nn.Module, dtype: torch.dtype, device: Optional[t
                             weight = module.weight.data.to(lokr._cached_dtype)
                             bias = module.bias
                         diff = lokr.get_weight(lokr.shape).to(lokr._cached_dtype) * lokr.scalar
-                        merged = lokr.apply_weight_decompose(weight + diff, lokr.multiplier_buf).to(dtype)
+                        # a wider base keeps its width: MOSS's fp32 text Linears run outside autocast (--moss_stream_fp32)
+                        merged = lokr.apply_weight_decompose(weight + diff, lokr.multiplier_buf).to(
+                            torch.promote_types(dtype, module.weight.dtype))
                         del weight, diff
                         module.forward = partial(_cached_linear, merged, bias)
                         patched.append((module, forward))

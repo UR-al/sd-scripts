@@ -222,6 +222,7 @@ class MossNetworkTrainer(train_network.NetworkTrainer):
     def get_noise_pred_and_target(self, args, accelerator, noise_scheduler, latents, batch, text_encoder_conds,
                                   text_encoder_masks, unet, network, weight_dtype, train_unet, fixed_timesteps=None,
                                   is_train=True):
+        stream_dtype = torch.float32 if getattr(args, "moss_stream_fp32", False) else weight_dtype
         noise = torch.randn_like(latents, dtype=torch.float32)
         if getattr(args, "flow_use_ot", False) and latents.size(0) > 1:
             noise = self._ot_reorder_noise(latents, noise)  # before antithetic pairing, as Anima / train_util do
@@ -229,7 +230,7 @@ class MossNetworkTrainer(train_network.NetworkTrainer):
 
         def draw():
             return flow.get_noisy_model_input_and_timesteps(
-                args, noise_scheduler, latents, noise, accelerator.device, weight_dtype, self._sigma_sampler,
+                args, noise_scheduler, latents, noise, accelerator.device, stream_dtype, self._sigma_sampler,
                 fixed_timesteps=fixed_timesteps, is_train=is_train)
 
         tsm_plan = getattr(self, "_tsm_offload", None)
@@ -251,7 +252,7 @@ class MossNetworkTrainer(train_network.NetworkTrainer):
         if args.gradient_checkpointing:
             noisy.requires_grad_(True)  # unsloth offload only returns grad-carrying outputs for grad-carrying inputs
 
-        text = text_encoder_conds[0].to(accelerator.device, dtype=weight_dtype)
+        text = text_encoder_conds[0].to(accelerator.device, dtype=stream_dtype)
         text_mask = text_encoder_conds[1].to(accelerator.device).bool()
         with torch.set_grad_enabled(is_train), accelerator.autocast():
             model_pred = unet(noisy, timesteps, text, text_mask)
@@ -295,6 +296,8 @@ class MossNetworkTrainer(train_network.NetworkTrainer):
         return loss
 
     def prepare_unet_with_accelerator(self, args, accelerator: Accelerator, unet: torch.nn.Module) -> torch.nn.Module:
+        if getattr(args, "moss_stream_fp32", False):
+            unet.enable_stream_fp32()  # here: train_network casts the whole model to weight_dtype before this call
         if self._use_unsloth_offload_checkpointing and args.gradient_checkpointing:
             unet.enable_gradient_checkpointing(unsloth_offload=True)
         if not self.is_swapping_blocks:

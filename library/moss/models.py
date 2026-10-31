@@ -5,6 +5,7 @@
 # library.attention instead of the official per-sample loop - same result, see tests/test_moss_models.py),
 # gradient checkpointing (plain / CPU offload / unsloth offload) and block swap like library/anima_models.py.
 
+import contextlib
 from typing import Iterable, Optional
 
 import torch
@@ -93,6 +94,9 @@ def joint_attention(q, k, v, rope, heads, attn_params: attention.AttentionParams
     q = rotate(q.reshape(shape), rope)
     k = rotate(k.reshape(shape), rope)
     v = v.reshape(shape)
+    if v.dtype == torch.float32 and not attn_params.supports_fp32:
+        # --moss_stream_fp32 runs the text refiner outside autocast, and flash-attn has no fp32 kernels
+        return attention.attention([t.to(torch.bfloat16) for t in (q, k, v)], attn_params=attn_params).float()
     return attention.attention([q.to(v.dtype), k.to(v.dtype), v], attn_params=attn_params)  # [B, L, H*D]
 
 
@@ -288,6 +292,21 @@ class MossTransformer(nn.Module):
         self.blocks_to_swap = None
         self.offloader: Optional[custom_offloading_utils.ModelOffloader] = None
         self.last_text_tokens: Optional[int] = None  # set by forward (a host int it computes anyway)
+        self.stream_fp32 = False  # --moss_stream_fp32, see enable_stream_fp32
+
+    def enable_stream_fp32(self):
+        """Run the residual stream, modulation, norms, embedders and head in fp32 around the joint blocks' Linears.
+
+        Those 252 Linears stay in the training dtype (they are almost all of the weights, and LoRA wraps them), and each
+        block casts its stream input for them. Call this after the trainer's last whole-model ``.to(dtype)``."""
+        for name, parameter in self.named_parameters():
+            if not (name.startswith("layers.") and ".proj." in name):
+                parameter.data = parameter.data.float()
+        self.stream_fp32 = True
+
+    def _around_blocks(self, device: torch.device):
+        """Autocast off for what runs in fp32: under bf16 autocast those Linears would hand back a bf16 stream."""
+        return torch.autocast(device.type, enabled=False) if self.stream_fp32 else contextlib.nullcontext()
 
     # ---- properties / switches -----------------------------------------------------------------------------
     @property
@@ -396,20 +415,21 @@ class MossTransformer(nn.Module):
         img_len = height * width
         self.last_text_tokens = max_len  # the text length this forward ran with (--moss_tier_timing reads it)
 
-        mod, head = self.time_conditioning(timesteps, batch, x.device)
-        video = x.flatten(2).transpose(1, 2)
-        video = self.video_embedder(video.to(self.video_embedder.weight.dtype).contiguous())  # [B, HW, D]
-        # fp32 phases, then the activation dtype (official: rope.to(video.dtype)).
-        rope = self.rope.batched(height, width, lengths, max_len, x.device).to(video.dtype)
+        with self._around_blocks(x.device):
+            mod, head = self.time_conditioning(timesteps, batch, x.device)
+            video = x.flatten(2).transpose(1, 2)
+            video = self.video_embedder(video.to(self.video_embedder.weight.dtype).contiguous())  # [B, HW, D]
+            # fp32 phases, then the activation dtype (official: rope.to(video.dtype)).
+            rope = self.rope.batched(height, width, lengths, max_len, x.device).to(video.dtype)
 
-        # xformers' block-diagonal bias needs packed sequences; with padded batches use per-sample attention instead.
-        split = self.split_attn or (self.attn_mode == "xformers" and batch > 1)
-        # the host lengths go with the params: attention() decides its trim / per-sample split without a device read
-        text_params = attention.AttentionParams.create_attention_params_from_mask(self.attn_mode, split, 0, text_mask,
-                                                                                  text_lengths=lengths)
-        hidden = torch.cat((video, self.text_embedder(text, rope[:, img_len:], text_params)), 1)
-        joint_params = attention.AttentionParams.create_attention_params_from_mask(self.attn_mode, split, img_len, text_mask,
-                                                                                   text_lengths=lengths)
+            # xformers' block-diagonal bias needs packed sequences; with padded batches use per-sample attention instead.
+            split = self.split_attn or (self.attn_mode == "xformers" and batch > 1)
+            # the host lengths go with the params: attention() decides its trim / per-sample split without a device read
+            text_params = attention.AttentionParams.create_attention_params_from_mask(self.attn_mode, split, 0, text_mask,
+                                                                                      text_lengths=lengths)
+            hidden = torch.cat((video, self.text_embedder(text, rope[:, img_len:], text_params)), 1)
+            joint_params = attention.AttentionParams.create_attention_params_from_mask(self.attn_mode, split, img_len, text_mask,
+                                                                                       text_lengths=lengths)
 
         for index, layer in enumerate(self.layers):
             if self.blocks_to_swap:
@@ -420,7 +440,8 @@ class MossTransformer(nn.Module):
                 self.offloader.submit_move_blocks(self.layers, index)
         hidden = hidden.to(x.device)  # CPU-offload checkpointing hands back CPU tensors
 
-        hidden = self.final_norm_video(hidden[:, :img_len].to(self.final_norm_video.weight.dtype))
-        hidden = hidden * (1 + head[:, 1, None]) + head[:, 0, None]
-        hidden = self.final_linear_video(hidden.to(self.final_linear_video.weight.dtype))
+        with self._around_blocks(x.device):
+            hidden = self.final_norm_video(hidden[:, :img_len].to(self.final_norm_video.weight.dtype))
+            hidden = hidden * (1 + head[:, 1, None]) + head[:, 0, None]
+            hidden = self.final_linear_video(hidden.to(self.final_linear_video.weight.dtype))
         return hidden.transpose(1, 2).reshape(batch, -1, height, width)

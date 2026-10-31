@@ -57,6 +57,10 @@ def add_moss_training_arguments(parser) -> None:
                         help="attention backend (padding is handled with masks / varlen); default torch SDPA."
                              " flash (flash-attn varlen) is ~1.6x faster per step on an RTX 5090 at 1536")
     parser.add_argument("--split_attn", action="store_true", help="per-sample attention (slower, lowest memory)")
+    parser.add_argument("--moss_stream_fp32", action="store_true",
+                        help="run the residual stream, modulation, norms, embedders and head in fp32 around the joint blocks'"
+                             " 252 Linears, which stay in the training dtype (bf16 or fp16 mixed precision). Matches an fp32"
+                             " stream at inference; about 0.5 GB more for weights plus the checkpointed stream")
     parser.add_argument("--moss_no_compile", action="store_true",
                         help="do not torch.compile the MossBlock elementwise chains (RMSNorm/RoPE/SiTU/residual) on CUDA")
     parser.add_argument("--moss_no_lokr_compile", action="store_true",
@@ -122,6 +126,12 @@ def validate_moss_args(args, train_dataset_group, val_dataset_group) -> None:
         fail(f"--moss_tier_timing_every must be >= 1 (optimizer steps between reports), got {args.moss_tier_timing_every}")
     if args.cache_text_encoder_outputs_to_disk and not args.cache_text_encoder_outputs:
         args.cache_text_encoder_outputs = True
+    if getattr(args, "moss_stream_fp32", False):
+        for flag in ("full_bf16", "full_fp16", "fp8_base", "fp8_base_unet", "deepspeed"):
+            if getattr(args, flag, False):  # outside autocast needs fp32 network and base weights; deepspeed skips the switch
+                fail(f"--moss_stream_fp32 is not supported with --{flag}")
+        if args.mixed_precision not in ("bf16", "fp16"):
+            logger.warning("MOSS-Image: --moss_stream_fp32 changes nothing without bf16 or fp16 mixed precision")
     if not args.cache_text_encoder_outputs:
         fail("--cache_text_encoder_outputs is required (the 16 GB Qwen3.5-9B is only loaded while caching; the user guide"
              " keeps the text encoder frozen)")
