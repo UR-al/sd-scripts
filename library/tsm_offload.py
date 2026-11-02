@@ -482,14 +482,21 @@ class ExpertOffloadManager:
     # ------------------------------------------------------------------------------------- grouped accumulation
 
     def grouped_draw(self, draw: Callable[[], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-                     max_draws: int = 100000):
+                     max_draws: int = 100000, routing_dtype: Optional[torch.dtype] = None):
         """(noisy_model_input, timesteps, sigmas) with every row in the window's core interval.
 
         The first draw of a window fixes the interval (its first row: an exact draw from the trainer's sampler, so the
         interval is distributed like the sampler's); every other row is redrawn until its timestep falls in that
-        interval (rejection: the exact conditional). Row r of the result is row r of the accepting draw."""
+        interval (rejection: the exact conditional). Row r of the result is row r of the accepting draw.
+        routing_dtype: the dtype the trainer rounds these timesteps to for set_timestep, when it is not theirs: the
+        interval must hold the expert the row is routed to (--anima_stream_fp32 draws fp32 and routes on bf16)."""
+
+        def core_indices(timesteps: torch.Tensor) -> List[int]:
+            routed = timesteps.detach() if routing_dtype is None else timesteps.detach().to(routing_dtype)
+            return [self.core_index_t(v) for v in routed.float().reshape(-1).tolist()]
+
         nmi, ts, sg = draw()
-        cores = [self.core_index_t(v) for v in ts.detach().float().reshape(-1).tolist()]
+        cores = core_indices(ts)
         if self.window_core is None:
             self.window_core = cores[0]
         target = self.window_core
@@ -504,7 +511,7 @@ class ExpertOffloadManager:
                 raise RuntimeError(f"tsm-lokr grouped accumulation: no timestep in core interval {target} after"
                                    f" {max_draws} draws / {max_draws}번 뽑아도 구간 {target} 의 타임스텝이 나오지 않았습니다")
             n2, t2, s2 = draw()
-            c2 = [self.core_index_t(v) for v in t2.detach().float().reshape(-1).tolist()]
+            c2 = core_indices(t2)
             still = []
             for r in missing:
                 if c2[r] == target:

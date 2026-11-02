@@ -1,7 +1,9 @@
 # Anima Model Architecture
 # Original code: NVIDIA CORPORATION & AFFILIATES, licensed under Apache-2.0
 
+import contextlib
 import math
+import re
 from typing import Any, Optional, Tuple
 
 import torch
@@ -275,6 +277,9 @@ def enable_elementwise_compile(enabled: bool = True):
 # both - no measurable gain on that step (its host floor is elsewhere), so it stays off until a workload shows one.
 ADALN_HOIST = False
 
+# --anima_stream_fp32 (Anima.enable_stream_fp32): the Linears that stay in the training dtype
+_STREAM_BLOCK_LINEARS = re.compile(r"^blocks\.\d+\.(?:(?:self|cross)_attn\.(?:q|k|v|output)_proj|mlp\.layer[12])\.")
+
 
 def _per_block_grad_sum(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     """A view of t that collects the gradients of its uses in one Block before they reach t (exact: ViewBackward only
@@ -364,6 +369,7 @@ class Attention(nn.Module):
         self.qkv_format = qkv_format
         self.query_dim = query_dim
         self.context_dim = context_dim
+        self.stream_fp32 = False  # --anima_stream_fp32, see Anima.enable_stream_fp32
 
         self.q_proj = nn.Linear(query_dim, inner_dim, bias=False)
         self.k_proj = nn.Linear(context_dim, inner_dim, bias=False)
@@ -408,6 +414,8 @@ class Attention(nn.Module):
         q = q.unflatten(-1, (self.n_heads, self.head_dim))
         k = k.unflatten(-1, (self.n_heads, self.head_dim))
         v = v.unflatten(-1, (self.n_heads, self.head_dim))
+        if self.stream_fp32:  # the q / k norms and RoPE in fp32; forward rounds q and k for the attention kernel
+            q, k = q.float(), k.float()
 
         if _plain_module(self.q_norm) and _plain_module(self.k_norm):
             fn = _CHAINS.get(q)
@@ -436,7 +444,9 @@ class Attention(nn.Module):
     ) -> torch.Tensor:
         q, k, v = self.compute_qkv(x, context, rope_cos_sin=rope_cos_sin)
         if q.dtype != v.dtype:
-            if (not attn_params.supports_fp32 or attn_params.requires_same_dtype) and torch.is_autocast_enabled():
+            if self.stream_fp32 or (
+                (not attn_params.supports_fp32 or attn_params.requires_same_dtype) and torch.is_autocast_enabled()
+            ):
                 # FlashAttention requires fp16/bf16, xformers require same dtype; only cast when autocast is active.
                 target_dtype = v.dtype  # v has fp16/bf16 dtype
                 q = q.to(target_dtype)
@@ -1231,6 +1241,7 @@ class Anima(nn.Module):
         self.offloader: Optional[custom_offloading_utils.ModelOffloader] = None
         # --anima_block_compile (library/anima_block_compile.py): the Blocks see the token grid as (B, 1, L, 1, D)
         self._block_compile = False
+        self.stream_fp32 = False  # --anima_stream_fp32, see enable_stream_fp32
 
         self.build_patch_embed()
         self.build_pos_embed()
@@ -1294,6 +1305,24 @@ class Anima(nn.Module):
     def disable_gradient_checkpointing(self):
         for block in self.blocks:
             block.disable_gradient_checkpointing()
+
+    def enable_stream_fp32(self):
+        """Run the residual stream, adaLN modulation, q / k norms, RoPE, embedders and final layer in fp32 around the Blocks'
+        attention and MLP Linears.
+
+        Those Linears stay in the training dtype (they are most of the weights, and LoRA wraps them) and autocast rounds
+        their inputs. llm_adapter stays too: its output only feeds them. Call this after the trainer's last whole-model
+        ``.to(dtype)``."""
+        for name, parameter in self.named_parameters():
+            if not (name.startswith("llm_adapter.") or _STREAM_BLOCK_LINEARS.match(name)):
+                parameter.data = parameter.data.float()
+        for block in self.blocks:
+            block.self_attn.stream_fp32 = block.cross_attn.stream_fp32 = True
+        self.stream_fp32 = True
+
+    def _around_blocks(self, device: torch.device):
+        """Autocast off for what runs in fp32: under bf16 autocast those Linears would hand back a bf16 stream."""
+        return torch.autocast(device.type, enabled=False) if self.stream_fp32 else contextlib.nullcontext()
 
     @property
     def device(self):
@@ -1464,16 +1493,20 @@ class Anima(nn.Module):
             if t5_attn_mask is not None:
                 crossattn_emb[~t5_attn_mask.bool()] = 0
 
-        x_B_T_H_W_D, rope_cos_sin, extra_pos_emb = self.prepare_embedded_sequence(
-            x_B_C_T_H_W,
-            fps=fps,
-            padding_mask=padding_mask,
-        )
+        if self.stream_fp32:  # iLECO, ADDifT and the adaptive sampler may pass the training dtype
+            x_B_C_T_H_W, timesteps_B_T = x_B_C_T_H_W.float(), timesteps_B_T.float()
 
-        if timesteps_B_T.ndim == 1:
-            timesteps_B_T = timesteps_B_T.unsqueeze(1)
-        t_embedding_B_T_D, adaln_lora_B_T_3D = self.t_embedder(timesteps_B_T)
-        t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
+        with self._around_blocks(x_B_C_T_H_W.device):
+            x_B_T_H_W_D, rope_cos_sin, extra_pos_emb = self.prepare_embedded_sequence(
+                x_B_C_T_H_W,
+                fps=fps,
+                padding_mask=padding_mask,
+            )
+
+            if timesteps_B_T.ndim == 1:
+                timesteps_B_T = timesteps_B_T.unsqueeze(1)
+            t_embedding_B_T_D, adaln_lora_B_T_3D = self.t_embedder(timesteps_B_T)
+            t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
 
         # Cast RoPE cos/sin to the block compute dtype once. Without this, every
         # block's apply_rotary_pos_emb_qk re-materializes the fp32 cache in bf16.
@@ -1530,7 +1563,8 @@ class Anima(nn.Module):
         if flat_grid is not None:
             x_B_T_H_W_D = x_B_T_H_W_D.squeeze(3).squeeze(1).unflatten(1, flat_grid)
 
-        x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D, use_fp32=use_fp32)
+        with self._around_blocks(x_B_T_H_W_D.device):
+            x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D, use_fp32=use_fp32)
         x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)
         return x_B_C_Tt_Hp_Wp
 

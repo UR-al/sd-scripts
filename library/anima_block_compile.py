@@ -69,7 +69,8 @@
 # * the inductor cache is routed to a per-signature directory (the persistent caches key on the FX graph but not on the
 #   mark_dynamic ranges; two processes compiled with different bands poison each other through the shared default dir).
 #
-# Cache entries = 2 (Block 0's input is bf16, Blocks 1+ see the fp32 residual) x expert choices (TSM stage 1: n_core;
+# Cache entries = 2 (Block 0's input is bf16, Blocks 1+ see the fp32 residual; 1 under --anima_stream_fp32, where Block 0
+# sees it too) x expert choices (TSM stage 1: n_core;
 # LoKr / LoRA: 1) x checkpointing regimes (GC: no-grad forward + grad forward + backward; the un-checkpointed tiers:
 # forward + backward) x bands (1 with --anima_block_compile_dynamic union). The recompile limit is raised accordingly.
 # All Blocks share the entries (dynamo keys on the code object; the parameters are graph inputs).
@@ -281,8 +282,10 @@ def raise_recompile_limit(limit: int) -> int:
     return target
 
 
-def compile_signature(bands: Sequence[Tuple[int, int]], backend: str, mode: Optional[str], dynamic: str) -> str:
-    return f"torch={torch.__version__};backend={backend};mode={mode or None};dynamic={dynamic};bands={list(bands)}"
+def compile_signature(bands: Sequence[Tuple[int, int]], backend: str, mode: Optional[str], dynamic: str,
+                      stream_fp32: bool = False) -> str:
+    signature = f"torch={torch.__version__};backend={backend};mode={mode or None};dynamic={dynamic};bands={list(bands)}"
+    return f"{signature};stream=fp32" if stream_fp32 else signature
 
 
 def isolate_inductor_cache(signature: str) -> str:
@@ -335,6 +338,7 @@ def compile_blocks(
     soft_marks: Optional[bool] = None,
     skip_call: Optional[Callable[[], bool]] = None,
     isolate_cache: bool = True,
+    stream_fp32: bool = False,
 ) -> CompiledBlocks:
     """torch.compile every Block's `_forward` of `anima`; the model flattens its token grid to the fake-5D layout around
     the Block loop from now on (anima._block_compile). `_forward_hoisted` (the ADALN_HOIST entry of a checkpointed Block)
@@ -342,7 +346,8 @@ def compile_blocks(
     that wrapper's mark_dynamic ("Attempt to trace forbidden callable") at the first checkpointed call. Call AFTER the
     network's apply_to and weight loading (the compiled graph traces the patched Linear forwards). `bands`:
     plan_bands() output ([]: static). `soft_marks`: None = soft under attn_mode "torch" (SDPA), strict otherwise.
-    `skip_call()`: when it returns True the call runs the eager `_forward` (a mixed-timestep TSM chunk)."""
+    `skip_call()`: when it returns True the call runs the eager `_forward` (a mixed-timestep TSM chunk).
+    `stream_fp32`: --anima_stream_fp32, a compile cache of its own."""
     if dynamic not in DYNAMIC_MODES:
         raise ValueError(f"dynamic must be one of {DYNAMIC_MODES}, got {dynamic!r}")
     bands = [tuple(int(v) for v in b) for b in bands] if dynamic != "static" else []
@@ -350,7 +355,7 @@ def compile_blocks(
         soft_marks = getattr(anima, "attn_mode", "torch") in (None, "torch", "sdpa")
     limit = raise_recompile_limit(recompile_limit)
     if isolate_cache and backend == "inductor":
-        cache_dir = isolate_inductor_cache(compile_signature(bands, backend, mode, dynamic))
+        cache_dir = isolate_inductor_cache(compile_signature(bands, backend, mode, dynamic, stream_fp32))
         logger.info(f"block compile: inductor cache dir {cache_dir}")
     kwargs: Dict[str, Any] = {"backend": backend, "dynamic": False}
     if mode:

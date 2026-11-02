@@ -204,6 +204,18 @@ def validate_block_compile_args(args) -> None:
         refuse("--anima_block_compile_recompile_limit must be >= 8")
 
 
+def validate_stream_args(args) -> None:
+    """--anima_stream_fp32: refused where the fp32 parts could not run or the switch would be skipped. Raises ValueError."""
+    if not getattr(args, "anima_stream_fp32", False):
+        return
+    # autocast off needs an fp32 network and base weights; deepspeed and text-encoder-only training skip the switch
+    for flag in ("full_bf16", "full_fp16", "deepspeed", "network_train_text_encoder_only"):
+        if getattr(args, flag, False):
+            raise ValueError(f"--anima_stream_fp32 is not supported with --{flag}")
+    if args.mixed_precision not in ("bf16", "fp16"):
+        logger.warning("Anima: --anima_stream_fp32 changes nothing without bf16 or fp16 mixed precision")
+
+
 def validate_tier_timing_args(args) -> None:
     """--anima_tier_timing_every must be >= 1 when --anima_tier_timing is on. Raises ValueError."""
     if not getattr(args, "anima_tier_timing", False):
@@ -234,6 +246,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         self._ckpt_modes_logged = set()  # per-token-count checkpointing modes announced once (get_noise_pred_and_target)
         self._train_dataset_group = None  # --anima_block_compile: the buckets' token counts (after_network_loaded)
         self._tier_timer = None  # --anima_tier_timing: library/tier_timing.TierTimer, created at the first micro-step
+        self._stream_fp32 = False  # --anima_stream_fp32: the DiT was switched (prepare_unet_with_accelerator)
         self._micro_batch_logged = set()  # per-sample token counts whose chunking was announced (split_batch_for_backward)
         # Cache of zero padding masks keyed by (batch, height, width, dtype, device).
         # The Anima DiT consumes padding_mask read-only (resize/expand/concat, never
@@ -464,6 +477,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         micro_batch.validate_step_rows(args)  # --step_rows: accumulation 1, batch_loss_norm_rows 0 / N (processes: train())
         self._train_dataset_group = train_dataset_group
         validate_block_compile_args(args)  # --anima_block_compile: no RamTorch / block swap / accelerate compile / stock LyCORIS
+        validate_stream_args(args)  # --anima_stream_fp32: no full_bf16 / full_fp16 / deepspeed / text-encoder-only training
         validate_tier_timing_args(args)  # --anima_tier_timing_every >= 1
 
         if args.unsloth_offload_checkpointing:
@@ -926,6 +940,11 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             repeated.append(t)
         return repeated
 
+    def model_input_dtype(self, weight_dtype: torch.dtype) -> torch.dtype:
+        """The noisy latent's and timestep's dtype: fp32 once the DiT runs the fp32 stream. The switch decides, not the option:
+        the GoRA / RaLoRA pre-pass runs before prepare_unet_with_accelerator, on a DiT that is still all weight_dtype."""
+        return torch.float32 if self._stream_fp32 else weight_dtype
+
     def apply_limited_sigma_range(self, args, noise_scheduler, latents, noise, sigmas, min_sigma_arg, max_sigma_arg, dtype):
         if min_sigma_arg is None and max_sigma_arg is None:
             return None, None, None
@@ -976,8 +995,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             latents = latents.squeeze(2)
         noise = torch.randn_like(latents)
         noise = maybe_apply_antithetic_noise_pairing(args, noise)
+        input_dtype = self.model_input_dtype(weight_dtype)
         noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
-            args, noise_scheduler, latents, noise, accelerator.device, weight_dtype
+            args, noise_scheduler, latents, noise, accelerator.device, input_dtype
         )
         ranged_noisy_model_input, ranged_timesteps, ranged_sigmas = self.apply_limited_sigma_range(
             args,
@@ -987,7 +1007,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             sigmas,
             args.ileco_min_sigma,
             args.ileco_max_sigma,
-            weight_dtype,
+            input_dtype,
         )
         if ranged_noisy_model_input is not None:
             noisy_model_input = ranged_noisy_model_input
@@ -1117,8 +1137,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
         noise = torch.randn_like(source_latents)
         noise = maybe_apply_antithetic_noise_pairing(args, noise)
+        input_dtype = self.model_input_dtype(weight_dtype)
         noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
-            args, noise_scheduler, source_latents, noise, accelerator.device, weight_dtype
+            args, noise_scheduler, source_latents, noise, accelerator.device, input_dtype
         )
         ranged_noisy_model_input, ranged_timesteps, ranged_sigmas = self.apply_limited_sigma_range(
             args,
@@ -1128,13 +1149,13 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             sigmas,
             args.addift_min_sigma,
             args.addift_max_sigma,
-            weight_dtype,
+            input_dtype,
         )
         if ranged_noisy_model_input is not None:
             noisy_model_input = ranged_noisy_model_input
             timesteps = ranged_timesteps
             sigmas = ranged_sigmas
-        target_noisy_model_input = ((1.0 - sigmas) * teacher_latents + sigmas * noise).to(weight_dtype)
+        target_noisy_model_input = ((1.0 - sigmas) * teacher_latents + sigmas * noise).to(input_dtype)
         timesteps = timesteps / 1000.0
 
         addift_mask = None
@@ -1232,6 +1253,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             dynamic=args.anima_block_compile_dynamic,
             recompile_limit=int(args.anima_block_compile_recompile_limit),
             skip_call=skip,
+            stream_fp32=bool(getattr(args, "anima_stream_fp32", False)),
         )
         anima_block_compile.apply_activation_memory_budget(float(args.anima_activation_memory_budget),
                                                            bool(args.gradient_checkpointing))
@@ -1462,7 +1484,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 latents,
                 noise,
                 accelerator.device,
-                weight_dtype,
+                self.model_input_dtype(weight_dtype),
                 fixed_timesteps=adaptive_fixed_timesteps,
                 is_train=is_train,
             )
@@ -1470,7 +1492,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         tsm_plan = getattr(self, "_tsm_offload", None)
         if is_train and adaptive_fixed_timesteps is None and tsm_plan is not None and tsm_plan.grouped:
             # TSM-LoKr tsm_grouped_accumulation: every sample of this optimizer step in one core interval (redraws)
-            noisy_model_input, timesteps, sigmas = tsm_plan.grouped_draw(draw_noisy_model_input)
+            noisy_model_input, timesteps, sigmas = tsm_plan.grouped_draw(draw_noisy_model_input, routing_dtype=weight_dtype)
         else:
             noisy_model_input, timesteps, sigmas = draw_noisy_model_input()
         # Store noisy latents for LWD wavelet masking (used in process_batch via base class)
@@ -1490,7 +1512,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             self._adv_noisy_latents = noisy_model_input.detach()
 
         # Set T-LoRA timestep mask before timestep scaling (mask expects [0, max_timestep] range)
-        self.apply_tlora_mask(timesteps)
+        # In the training dtype whatever the DiT gets: Forge replays TSM's routing from ss_mixed_precision
+        self.apply_tlora_mask(timesteps.to(weight_dtype))
 
         timesteps = timesteps / 1000.0  # scale to [0, 1] range. timesteps is float32
 
@@ -1671,6 +1694,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         return train_util.get_sai_model_spec_dataclass(None, args, False, True, False, anima="preview").to_metadata_dict()
 
     def update_metadata(self, metadata, args):
+        if getattr(args, "anima_stream_fp32", False):
+            metadata["ss_stream"] = "fp32"  # a record only: the LoRA loads the same on either stream
         metadata["ss_weighting_scheme"] = args.weighting_scheme
         metadata["ss_logit_mean"] = args.logit_mean
         metadata["ss_logit_std"] = args.logit_std
@@ -1731,6 +1756,9 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def prepare_unet_with_accelerator(
         self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module
     ) -> torch.nn.Module:
+        if getattr(args, "anima_stream_fp32", False):
+            unet.enable_stream_fp32()  # here: train_network casts the whole model to weight_dtype before this call
+            self._stream_fp32 = True
         # The base NetworkTrainer only calls enable_gradient_checkpointing(cpu_offload=True/False),
         # so we re-apply with unsloth_offload if needed (after base has already enabled it).
         if self._use_unsloth_offload_checkpointing and args.gradient_checkpointing:
@@ -1819,6 +1847,13 @@ def setup_parser() -> argparse.ArgumentParser:
                              " checkpoint instead of inside it (forward, recompute and backward of the 6 modulation Linears"
                              " per Block); same results. Off by default: measured +-0 s/step on Anima 2.9B 4-tier batch 1"
                              " (library/anima_models.py ADALN_HOIST)")
+    parser.add_argument("--anima_stream_fp32", action="store_true",
+                        help="run the residual stream, adaLN modulation, q/k norms, RoPE, embedders and final layer in fp32"
+                             " around the Blocks' attention and MLP Linears, which stay in the training dtype (bf16 or fp16"
+                             " mixed precision), and keep the noisy input and timestep in fp32. Without it the stream is the"
+                             " training dtype, or fp32 from Block 1 when a network wraps the adaLN Linears (LoKr on"
+                             " preset=anima-exp). About 0.5 GB more for weights on 2.9B, plus the checkpointed stream where"
+                             " it was bf16; sample images run in fp32 too")
     parser.add_argument("--anima_no_compile", action="store_true",
                         help="do not torch.compile the Block elementwise chains (LayerNorm+AdaLN, q/k RMSNorm+RoPE, residual)")
     parser.add_argument("--anima_stock_lycoris", action="store_true",
