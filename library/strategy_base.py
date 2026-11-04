@@ -573,12 +573,44 @@ class TextEncoderOutputsCachingStrategy:
         return npz[key]
 
 
+# Source image of a latent cache (codex review 2026-11-04): its file size and mtime_ns per resolution
+# (``source_stat`` + key_reso_suffix, the resolutions of one npz are written at different times) and its path relative
+# to the npz (``source_name``). An image edited in place no longer matches, so its latents are rebuilt. Caches without
+# these keys (written before) and caches whose image is gone stay valid: existing datasets are not re-encoded.
+LATENT_SOURCE_STAT_KEY = "source_stat"
+LATENT_SOURCE_NAME_KEY = "source_name"
+
+
+def _latent_source_stat(path: str) -> Optional[np.ndarray]:
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return np.array([stat.st_size, stat.st_mtime_ns], dtype=np.int64)
+
+
+def _latent_source_changed(absolute_path: str, npz_path: str) -> bool:
+    """True when the npz records source stats and the image matches none of them (edited since it was cached)."""
+    current = _latent_source_stat(absolute_path)
+    if current is None:
+        return False
+    try:
+        with np.load(npz_path) as npz:
+            stored = [
+                npz[k].tolist() for k in npz.files if k == LATENT_SOURCE_STAT_KEY or k.startswith(LATENT_SOURCE_STAT_KEY + "_")
+            ]
+    except Exception:
+        return False
+    return bool(stored) and current.tolist() not in stored
+
+
 class LatentsCachingStrategy:
     # TODO commonize utillity functions to this class, such as npz handling etc.
 
     _strategy = None  # strategy instance: actual strategy class
 
     _warned_fallback_to_old_npz = False  # to avoid spamming logs about fallback
+    _logged_source_changed = False  # first image edited since its latents were cached
 
     def __init__(
         self,
@@ -616,6 +648,14 @@ class LatentsCachingStrategy:
 
     def get_image_size_from_disk_cache_path(self, absolute_path: str, npz_path: str) -> Tuple[Optional[int], Optional[int]]:
         w, h = os.path.splitext(npz_path)[0].split("_")[-2].split("x")
+        # the name holds the size of the image when it was cached: an image edited in place (cropped, resized) may have
+        # other dimensions now, so let the dataset read the real size. Fine-tuning passes the npz itself as the image.
+        if (
+            absolute_path
+            and os.path.normcase(os.path.abspath(absolute_path)) != os.path.normcase(os.path.abspath(npz_path))
+            and _latent_source_changed(absolute_path, npz_path)
+        ):
+            return None, None
         return int(w), int(h)
 
     def get_latents_npz_path(self, absolute_path: str, image_size: Tuple[int, int]) -> str:
@@ -695,6 +735,16 @@ class LatentsCachingStrategy:
             if apply_alpha_mask and ("alpha_mask" + key_reso_suffix not in npz and "alpha_mask" not in npz):
                 return False
 
+            stat_key = LATENT_SOURCE_STAT_KEY + key_reso_suffix
+            if stat_key in npz and LATENT_SOURCE_NAME_KEY in npz:
+                source_path = os.path.join(os.path.dirname(npz_path), str(npz[LATENT_SOURCE_NAME_KEY].tolist()))
+                current = _latent_source_stat(source_path)
+                if current is not None and np.asarray(npz[stat_key]).tolist() != current.tolist():
+                    if not self._logged_source_changed:
+                        self._logged_source_changed = True
+                        logger.info(f"image changed since its latents were cached, rebuilding (first: {npz_path})")
+                    return False
+
             if num_aug_variants > 0:
                 # variant caches must carry metadata, enough variants, a matching
                 # augmentation config hash, and all per-variant keys
@@ -771,6 +821,7 @@ class LatentsCachingStrategy:
             )
             return
 
+        source_stats = [_latent_source_stat(info.absolute_path) if getattr(info, "absolute_path", None) else None for info in image_infos]
         img_tensor, alpha_masks, original_sizes, crop_ltrbs = train_util.load_images_and_masks_for_caching(
             image_infos, apply_alpha_mask, random_crop, random_crop_padding_percent=random_crop_padding_percent
         )
@@ -799,7 +850,8 @@ class LatentsCachingStrategy:
 
             if self.cache_to_disk:
                 self.save_latents_to_disk(
-                    info.latents_npz, latents, original_size, crop_ltrb, flipped_latent, alpha_mask, key_reso_suffix
+                    info.latents_npz, latents, original_size, crop_ltrb, flipped_latent, alpha_mask, key_reso_suffix,
+                    source_path=getattr(info, "absolute_path", None), source_stat=source_stats[i],
                 )
             else:
                 info.latents_original_size = original_size
@@ -849,6 +901,7 @@ class LatentsCachingStrategy:
         """
         from library import train_util  # import here to avoid circular import
 
+        source_stats = [_latent_source_stat(info.absolute_path) if getattr(info, "absolute_path", None) else None for info in image_infos]
         images_per_variant, alpha_masks_per_variant, original_sizes, crop_ltrbs_per_variant, flippeds_per_variant = (
             train_util.load_image_variants_for_caching(
                 image_infos, num_aug_variants, apply_alpha_mask, flip_aug, augmentor, random_crop, random_crop_padding_percent
@@ -892,6 +945,8 @@ class LatentsCachingStrategy:
                     key_reso_suffix,
                     aug_variants=aug_variants,
                     aug_config_hash=aug_config_hash,
+                    source_path=getattr(info, "absolute_path", None),
+                    source_stat=source_stats[i],
                 )
             else:
                 info.latents_original_size = original_size
@@ -1002,6 +1057,8 @@ class LatentsCachingStrategy:
         key_reso_suffix="",
         aug_variants: Optional[List[Dict[str, Any]]] = None,
         aug_config_hash: Optional[str] = None,
+        source_path: Optional[str] = None,
+        source_stat: Optional[np.ndarray] = None,
     ):
         """
         Args:
@@ -1016,15 +1073,27 @@ class LatentsCachingStrategy:
                 keys ``latents`` (tensor), ``crop_ltrb``, ``flipped`` (bool) and optional ``alpha_mask``.
                 Flip is baked into the variant latents (pixels are flipped before encoding).
             aug_config_hash (Optional[str]): augmentation config hash for cache invalidation
+            source_path (Optional[str]): the image the latents were encoded from; its size and mtime are stored so an
+                image edited in place invalidates the cache
+            source_stat (Optional[np.ndarray]): that image's stat taken before its pixels were read (default: now)
 
         Returns:
             None
         """
         kwargs = {}
 
+        if source_stat is None and source_path:
+            source_stat = _latent_source_stat(source_path)
+
         if os.path.exists(npz_path):
             # load existing npz and update it
             kwargs.update(load_npz(npz_path))
+            stored_stat = kwargs.get(LATENT_SOURCE_STAT_KEY + key_reso_suffix)
+            if source_stat is not None and (stored_stat is None or np.asarray(stored_stat).tolist() != source_stat.tolist()):
+                # this resolution was cached from other (or unknown) pixels: drop what this call does not rewrite
+                # (flipped latents, alpha mask, variants) instead of passing it off under the new stat
+                for key in [k for k in kwargs if k.endswith(key_reso_suffix)]:
+                    del kwargs[key]
 
         # TODO float() is needed if vae is in bfloat16. Remove it if vae is float16.
         kwargs["latents" + key_reso_suffix] = latents_tensor.float().cpu().numpy()
@@ -1046,5 +1115,12 @@ class LatentsCachingStrategy:
             kwargs["aug_variants"] = np.array(len(aug_variants) + 1)
         if aug_config_hash is not None:
             kwargs["aug_config_hash"] = np.array(aug_config_hash)
+        if source_stat is not None and source_path:
+            kwargs[LATENT_SOURCE_STAT_KEY + key_reso_suffix] = source_stat
+            try:
+                source_name = os.path.relpath(source_path, os.path.dirname(os.path.abspath(npz_path)))
+            except ValueError:  # another drive
+                source_name = os.path.abspath(source_path)
+            kwargs[LATENT_SOURCE_NAME_KEY] = np.array(source_name)
 
         save_npz(npz_path, kwargs, cache_dtype=self.cache_dtype)

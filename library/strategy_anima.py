@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import random
+import struct
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -52,6 +53,20 @@ class AnimaTokenizeStrategy(TokenizeStrategy):
         self.qwen3_max_length = qwen3_max_length
         self.t5_tokenizer = t5_tokenizer
         self.t5_max_length = t5_max_length
+        self.qwen3_path = qwen3_path
+        self.t5_tokenizer_path = t5_tokenizer_path
+        self._cache_signature: Optional[str] = None
+
+    def cache_signature(self) -> Optional[str]:
+        """anima_te_signature of this tokenization (computed once). None when the Qwen3 tokenizer was handed over as an
+        object without qwen3_path: the encoder cannot be identified, so caches are neither signed nor checked."""
+        if self.qwen3_path is None:
+            return None
+        if self._cache_signature is None:
+            self._cache_signature = anima_te_signature(
+                self.qwen3_path, self.t5_tokenizer_path, self.qwen3_max_length, self.t5_max_length
+            )
+        return self._cache_signature
 
     def tokenize(self, text: Union[str, List[str]]) -> List[torch.Tensor]:
         text = [text] if isinstance(text, str) else text
@@ -159,6 +174,64 @@ CAPTION_DIGEST_KEY = "anima_caption_sha1"
 
 TE_OUTPUT_KEYS = ("prompt_embeds", "attn_mask", "t5_input_ids", "t5_attn_mask")
 
+# What a *_anima_te.npz was encoded with: the Qwen3 weights, the Qwen3 / T5 tokenizers and the Qwen3 / T5 max token
+# lengths (codex review SD-01, 2026-11-04). The caption digest does not see them, so a cache built under another
+# config (config_anima29.toml 540/620 and the 512 configs share the same files) or another Qwen3 file was reused as is.
+# Files without the signature are rebuilt once. Same idea as library/moss/strategy.py moss_te_signature.
+TE_SIGNATURE_KEY = "anima_te_signature"
+TE_CACHE_SCHEMA = "anima-te-v1"
+_CONFIGS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "configs")
+_TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "vocab.json", "merges.txt", "spiece.model")
+
+
+def _file_fingerprint(path: Optional[str], header_only: bool = False) -> str:
+    """sha1 of a whole file, or of a safetensors header (names/shapes/dtypes) plus size and mtime for weights (never
+    reads the tensors). The file name is not part of it: moving or renaming the file keeps its caches."""
+    if not path or not os.path.isfile(path):
+        return "missing"
+    digest = hashlib.sha1()
+    stat = os.stat(path)
+    with open(path, "rb") as f:
+        if header_only:
+            raw = f.read(8)
+            size = struct.unpack("<Q", raw)[0] if len(raw) == 8 else 0
+            if 0 < size <= stat.st_size - 8:  # not a safetensors file: size and mtime alone
+                digest.update(f.read(size))
+            digest.update(f"{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8"))
+        else:
+            for chunk in iter(lambda: f.read(1 << 22), b""):
+                digest.update(chunk)
+    return digest.hexdigest()[:16]
+
+
+def _tokenizer_fingerprint(directory: str) -> str:
+    """Content of the tokenizer files in a directory (a few MB, read once per run)."""
+    digest = hashlib.sha1()
+    for name in _TOKENIZER_FILES:
+        path = os.path.join(directory, name)
+        if os.path.isfile(path):
+            digest.update(f"{name}={_file_fingerprint(path)}|".encode("utf-8"))
+    return digest.hexdigest()[:16]
+
+
+def anima_te_signature(qwen3_path: str, t5_tokenizer_path: Optional[str], qwen3_max_length: int, t5_max_length: int) -> str:
+    """Identifies the encoder, tokenizers and token lengths of an Anima TE cache, resolved the way anima_utils loads
+    them: a Qwen3 directory holds weights and tokenizer, a Qwen3 file uses configs/qwen3_06b; T5 defaults to
+    configs/t5_old. Metadata and small tokenizer files only."""
+    if os.path.isdir(qwen3_path):
+        digest = hashlib.sha1()
+        for name in sorted(os.listdir(qwen3_path)):
+            if name.endswith((".safetensors", ".bin")):
+                digest.update(f"{name}={_file_fingerprint(os.path.join(qwen3_path, name), header_only=True)}|".encode("utf-8"))
+        weights, qwen3_tokenizer = digest.hexdigest()[:16], _tokenizer_fingerprint(qwen3_path)
+    else:
+        weights = _file_fingerprint(qwen3_path, header_only=True)
+        qwen3_tokenizer = _tokenizer_fingerprint(os.path.join(_CONFIGS_DIR, "qwen3_06b"))
+    t5_dir = t5_tokenizer_path if t5_tokenizer_path is not None else os.path.join(_CONFIGS_DIR, "t5_old")
+    t5_tokenizer = _tokenizer_fingerprint(t5_dir) if os.path.isdir(t5_dir) else f"id:{t5_dir}"
+    return (f"{TE_CACHE_SCHEMA}|qwen3={weights}|qwen3_tok={qwen3_tokenizer}|t5_tok={t5_tokenizer}"
+            f"|qwen3_max={int(qwen3_max_length)}|t5_max={int(t5_max_length)}")
+
 
 def cache_caption_digest(info) -> str:
     """Digest of the raw caption + the processed caption the cache encodes as variant 0 (caption_for_cache), so editing
@@ -201,11 +274,47 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         skip_disk_cache_validity_check: bool,
         is_partial: bool = False,
         cache_dtype: str = "auto",
+        te_signature: Optional[str] = None,
     ) -> None:
         super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check, is_partial, cache_dtype=cache_dtype)
         # npz_key(npz path) -> cache_caption_digest of the image's current caption (register_cache_captions)
         self.caption_text_digests: Dict[str, str] = {}
         self._logged_missing_caption_digest = False
+        # anima_te_signature the files must carry; None = the tokenize strategy's cache_signature() (see below)
+        self.te_signature = te_signature
+        self._logged_te_signature = False
+        self._warned_unsigned = False
+
+    def _warn_unsigned(self) -> None:
+        if not self._warned_unsigned:
+            self._warned_unsigned = True
+            logger.warning(
+                "Anima TE disk caches are not signed (tokenizers given without qwen3_path): a change of token lengths,"
+                " Qwen3 or tokenizers will not rebuild them. Delete the *_te.npz files by hand after such a change."
+            )
+
+    def expected_te_signature(self, tokenize_strategy: Optional[TokenizeStrategy] = None) -> Optional[str]:
+        """The given signature, else that of tokenize_strategy (or of the trainer's global TokenizeStrategy, set before
+        caching). None when neither can identify the encoder: then files are neither signed nor checked."""
+        if self.te_signature is not None:
+            return self.te_signature
+        strategy = tokenize_strategy if tokenize_strategy is not None else TokenizeStrategy.get_strategy()
+        get_signature = getattr(strategy, "cache_signature", None)
+        return get_signature() if callable(get_signature) else None
+
+    def _te_signature_matches(self, npz, npz_path: str) -> bool:
+        expected = self.expected_te_signature()
+        if expected is None:
+            self._warn_unsigned()
+            return True
+        stored = str(npz[TE_SIGNATURE_KEY].tolist()) if TE_SIGNATURE_KEY in npz else None
+        if stored == expected:
+            return True
+        if not self._logged_te_signature:
+            self._logged_te_signature = True
+            reason = "written before TE signatures" if stored is None else "built with other token lengths / Qwen3 / tokenizers"
+            logger.info(f"Anima TE caches {reason} are rebuilt (first: {npz_path})")
+        return False
 
     def get_outputs_npz_path(self, image_abs_path: str) -> str:
         return os.path.splitext(image_abs_path)[0] + self.ANIMA_TEXT_ENCODER_OUTPUTS_NPZ_SUFFIX
@@ -231,6 +340,8 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
                 for key in TE_OUTPUT_KEYS + ("caption_dropout_rate",):
                     if key not in npz:
                         return False
+                if not self._te_signature_matches(npz, npz_path):
+                    return False
                 expected_digest = self.caption_text_digests.get(_npz_key(npz_path))
                 if expected_digest is not None:
                     stored_digest = str(npz[CAPTION_DIGEST_KEY].tolist()) if CAPTION_DIGEST_KEY in npz else None
@@ -304,6 +415,9 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         variant_batched = [(group, encode_captions([c for _, c in group])) for group in variant_groups]
 
         base_keys = ["prompt_embeds", "attn_mask", "t5_input_ids", "t5_attn_mask"]
+        te_signature = self.expected_te_signature(tokenize_strategy) if self.cache_to_disk else None
+        if self.cache_to_disk and te_signature is None:
+            self._warn_unsigned()
 
         for i, info in enumerate(infos):
             n_variants = len(info.caption_variants) if getattr(info, "caption_variants", None) else 0
@@ -317,6 +431,8 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
                 save_kwargs = {key: batched[key][i] for key in base_keys}
                 save_kwargs["caption_dropout_rate"] = caption_dropout_rate
                 save_kwargs[CAPTION_DIGEST_KEY] = np.array(cache_caption_digest(info))
+                if te_signature is not None:
+                    save_kwargs[TE_SIGNATURE_KEY] = np.array(te_signature)
                 for k, (group, vb) in enumerate(variant_batched, start=1):
                     idxs = [idx for idx, _ in group]
                     if i not in idxs:

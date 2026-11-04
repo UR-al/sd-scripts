@@ -31,6 +31,7 @@ import torch
 
 from library.cache_utils import CACHE_DTYPE_METADATA_KEY, save_npz
 from library.strategy_anima import (
+    TE_SIGNATURE_KEY,
     AnimaTextEncoderOutputsCachingStrategy,
     AnimaTextEncodingStrategy,
     AnimaTokenizeStrategy,
@@ -213,6 +214,9 @@ class Anima38TextEncoderOutputsCachingStrategy(AnimaTextEncoderOutputsCachingStr
                         return False
                 if str(npz[SIGNATURE_KEY].tolist()) != self.qwen35_signature:
                     return False
+                # the Qwen3-0.6B prompt_embeds and T5 ids in the same file: Qwen3 file, tokenizers, token lengths
+                if not self._te_signature_matches(npz, npz_path):
+                    return False
                 expected_digest = self.caption_digests.get(npz_key(npz_path))
                 if expected_digest is not None and (
                     CAPTION_DIGEST_KEY not in npz or str(npz[CAPTION_DIGEST_KEY].tolist()) != expected_digest
@@ -287,6 +291,9 @@ class Anima38TextEncoderOutputsCachingStrategy(AnimaTextEncoderOutputsCachingStr
 
         canonical_rows = encode_captions(canonical_captions)
         variant_rows = [(group, encode_captions([caption for _, caption in group])) for group in variant_groups]
+        te_signature = self.expected_te_signature(tokenize_strategy) if self.cache_to_disk else None
+        if self.cache_to_disk and te_signature is None:
+            self._warn_unsigned()
 
         for i, info in enumerate(infos):
             n_variants = len(info.caption_variants) if getattr(info, "caption_variants", None) else 0
@@ -304,6 +311,8 @@ class Anima38TextEncoderOutputsCachingStrategy(AnimaTextEncoderOutputsCachingStr
                 save_kwargs = dict(canonical_rows[i])
                 save_kwargs["caption_dropout_rate"] = caption_dropout_rate
                 save_kwargs[SIGNATURE_KEY] = np.array(self.qwen35_signature)
+                if te_signature is not None:
+                    save_kwargs[TE_SIGNATURE_KEY] = np.array(te_signature)
                 save_kwargs[CAPTION_DIGEST_KEY] = np.array(caption_digest(getattr(info, "caption", None)))
                 save_kwargs[CACHE_CAPTION_DIGEST_KEY] = np.array(caption_digest(caption_for_cache(info)))
                 for k, row in own_variants:

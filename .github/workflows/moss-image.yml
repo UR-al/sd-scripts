@@ -59,6 +59,7 @@ jobs:
           tests/test_anima_speedups.py
           tests/test_anima_stream_fp32.py
           tests/test_attention_host_seqlens.py
+          tests/test_cache_source_signature.py
           tests/test_caption_lines_and_alpha.py
           tests/test_caption_processing_order.py
           tests/test_config_validation.py

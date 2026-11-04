@@ -274,6 +274,8 @@ def train(args):
             t5_tokenizer=t5_tokenizer,
             qwen3_max_length=args.qwen3_max_token_length,
             t5_max_length=args.t5_max_token_length,
+            qwen3_path=args.qwen3,
+            t5_tokenizer_path=args.t5_tokenizer_path,
         )
         strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)
 
@@ -306,6 +308,8 @@ def train(args):
         t5_tokenizer=t5_tokenizer,
         qwen3_max_length=args.qwen3_max_token_length,
         t5_max_length=args.t5_max_token_length,
+        qwen3_path=args.qwen3,
+        t5_tokenizer_path=args.t5_tokenizer_path,
     )
     strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)
 
