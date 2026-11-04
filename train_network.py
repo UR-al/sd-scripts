@@ -2241,6 +2241,7 @@ class NetworkTrainer:
         train_util.set_torch_cuda_reduced_precision(args)
         deepspeed_utils.prepare_deepspeed_args(args)
         setup_logging(args, reset=True)
+        cuda_memory.default_expandable_segments()  # torch >= 2.14; before the accelerator touches CUDA
 
         if getattr(args, "flow_model", False):
             logger.info("Using Rectified Flow training objective.")

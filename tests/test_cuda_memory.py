@@ -97,9 +97,78 @@ def test_alloc_conf_warnings(monkeypatch):
     assert cm._alloc_conf_warnings(0.85) == []
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     monkeypatch.setattr(cm.sys, "platform", "win32")
-    assert any("expandable_segments" in w for w in cm._alloc_conf_warnings(0.85))
+    assert any("expandable_segments" in w for w in cm._alloc_conf_warnings(0.85, version="2.7.1+cu128"))
+    assert cm._alloc_conf_warnings(0.85, version="2.14.0+cu130") == []  # Windows builds have them from 2.14
     monkeypatch.setattr(cm.sys, "platform", "linux")
-    assert cm._alloc_conf_warnings(0.85) == []
+    assert cm._alloc_conf_warnings(0.85, version="2.7.1+cu128") == []
+
+
+def test_torch_minor_version():
+    assert cm.torch_minor_version("2.14.0+cu130") == (2, 14)
+    assert cm.torch_minor_version("2.7.1+cu128") == (2, 7)
+    assert cm.torch_minor_version("2.15.0.dev20261101") == (2, 15)
+    assert cm.torch_minor_version("garbage") == (0, 0)
+    assert cm.torch_minor_version() == cm.torch_minor_version(torch.__version__)
+
+
+def test_default_expandable_segments_only_from_torch_2_14_and_only_when_unset():
+    """torch >= 2.14 gets PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (2026-11-04: Windows builds ship them from
+    2.14; without them the epoch-end empty_cache rebuilt the pool up to the VRAM ceiling); older torch and any
+    allocator config the user set are left alone."""
+    env = {}
+    assert cm.default_expandable_segments(env, version="2.7.1+cu128") is False and env == {}
+    assert cm.default_expandable_segments(env, version="2.13.0+cu130") is False and env == {}
+    assert cm.default_expandable_segments(env, version="2.14.0+cu130") is True
+    assert env == {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+    mine = {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False"}
+    assert cm.default_expandable_segments(mine, version="2.14.0+cu130") is False
+    assert mine == {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False"}
+    generic = {"PYTORCH_ALLOC_CONF": "max_split_size_mb:512"}  # torch 2.14's generic name counts as the user's too
+    assert cm.default_expandable_segments(generic, version="2.14.0+cu130") is False
+    assert generic == {"PYTORCH_ALLOC_CONF": "max_split_size_mb:512"}
+    blank = {"PYTORCH_CUDA_ALLOC_CONF": "  "}
+    assert cm.default_expandable_segments(blank, version="2.14.0") is True
+    assert blank["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
+
+
+def test_default_expandable_segments_applies_at_runtime_after_cuda_init(monkeypatch):
+    """Importing flash-attn / triton queries the device, so CUDA (and the allocator config) is initialized before the
+    trainer starts: the variable alone would be ignored, so the runtime setter must run too (2026-11-04 review)."""
+    for name in cm.ALLOC_CONF_VARS:  # empty = unset for the function; monkeypatch restores the real values afterwards
+        monkeypatch.setenv(name, "")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *a, **k: 0)
+    applied = []
+    monkeypatch.setattr(cm, "_set_allocator_settings", applied.append)
+    assert cm.default_expandable_segments(version="2.14.0+cu130") is True
+    assert applied == ["expandable_segments:True"]
+    assert os.environ["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"  # children inherit it
+
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "")
+
+    def refuse(conf):
+        raise RuntimeError("backend:cudaMallocAsync has no expandable_segments")
+
+    monkeypatch.setattr(cm, "_set_allocator_settings", refuse)
+    assert cm.default_expandable_segments(version="2.14.0+cu130") is False
+
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)  # not initialized yet: the variable is enough
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "")
+    monkeypatch.setattr(cm, "_set_allocator_settings", lambda conf: pytest.fail("no runtime call before CUDA init"))
+    assert cm.default_expandable_segments(version="2.14.0+cu130") is True
+
+
+def test_default_expandable_segments_runs_before_the_accelerator():
+    """NetworkTrainer.train and anima_train.train set the allocator config before prepare_accelerator."""
+    import inspect
+
+    import anima_train
+    import train_network
+
+    for fn in (train_network.NetworkTrainer.train, anima_train.train):
+        src = inspect.getsource(fn)
+        assert 0 <= src.index("cuda_memory.default_expandable_segments()") < src.index("train_util.prepare_accelerator(args)")
 
 
 def test_maybe_empty_cache_every_n_and_above(monkeypatch):

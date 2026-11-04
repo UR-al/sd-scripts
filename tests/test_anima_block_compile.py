@@ -1152,6 +1152,37 @@ def test_parser_defaults_and_runtime_switches():
         lycoris_fast.enable_compiled_rebuild(rebuild_before)
 
 
+def test_default_soft_marks_follow_attn_mode_and_torch_version():
+    """soft_marks=None: soft under SDPA on any torch; under flash / xformers strict on torch 2.7 (the tested range) and
+    soft from torch 2.14, whose Block graph carries a 4096 <= L guard the strict union band refused (2026-11-04)."""
+    for mode in (None, "torch", "sdpa"):
+        assert bc.default_soft_marks(mode, version="2.7.1+cu128") is True
+        assert bc.default_soft_marks(mode, version="2.14.0+cu130") is True
+    for mode in ("flash", "xformers"):
+        assert bc.default_soft_marks(mode, version="2.7.1+cu128") is False
+        assert bc.default_soft_marks(mode, version="2.13.0+cu130") is False
+        assert bc.default_soft_marks(mode, version="2.14.0+cu130") is True
+        assert bc.default_soft_marks(mode, version="2.15.1") is True
+
+
+def test_compile_blocks_takes_the_default_soft_marks_for_its_attn_mode(monkeypatch):
+    """compile_blocks(soft_marks=None) asks default_soft_marks with the model's attn_mode; an explicit value skips it."""
+    asked = []
+    monkeypatch.setattr(bc, "default_soft_marks", lambda mode, version=None: asked.append(mode) or True)
+    unet, net, _ = build("lora")
+    unet.attn_mode = "flash"
+    try:
+        compile_toy(unet, net, backend="eager")
+        assert asked == ["flash"]
+    finally:
+        bc.restore_blocks(unet)
+    compile_toy(unet, net, backend="eager", soft_marks=False)
+    try:
+        assert asked == ["flash"]  # not asked again
+    finally:
+        bc.restore_blocks(unet)
+
+
 def test_soft_marks_flag_reaches_compile_blocks(monkeypatch):
     """--anima_block_compile_soft_marks (2026-11-04): off by default; on, after_network_loaded asks compile_blocks for
     soft marks (maybe_mark_dynamic) whatever the attn_mode, off it leaves the choice to compile_blocks (None = soft

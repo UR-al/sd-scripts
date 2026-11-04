@@ -99,6 +99,20 @@ VAE_SPATIAL_DOWNSCALE = 8  # pixels -> latents (library/qwen_image_autoencoder_k
 _active = True  # pause() clears it: sampling / validation run the eager Block._forward
 _warned_oob: set = set()
 
+SOFT_MARKS_TORCH = (2, 14)  # from this torch the flash / xformers Block graphs also take soft marks
+
+
+def default_soft_marks(attn_mode: Optional[str], version: Optional[str] = None) -> bool:
+    """compile_blocks' soft_marks=None: soft (maybe_mark_dynamic) under attn_mode torch / SDPA, and under any attn_mode
+    from torch 2.14. torch 2.14 + flash-attn 2.8.4 put a 4096 <= L guard into the Block graph that the strict union band
+    (924..16384) refused with ConstraintViolationError at the first training step (2026-11-04); with soft marks dynamo
+    keeps the guard and compiles a second graph for L < 4096. torch 2.7.1 keeps the strict range for flash / xformers."""
+    from library.cuda_memory import torch_minor_version
+
+    if attn_mode in (None, "torch", "sdpa"):
+        return True
+    return torch_minor_version(version) >= SOFT_MARKS_TORCH
+
 
 @contextlib.contextmanager
 def pause():
@@ -345,14 +359,15 @@ def compile_blocks(
     is left eager: it only forwards to `self._forward`, i.e. to the compiled wrapper - compiled itself, its trace reached
     that wrapper's mark_dynamic ("Attempt to trace forbidden callable") at the first checkpointed call. Call AFTER the
     network's apply_to and weight loading (the compiled graph traces the patched Linear forwards). `bands`:
-    plan_bands() output ([]: static). `soft_marks`: None = soft under attn_mode "torch" (SDPA), strict otherwise.
+    plan_bands() output ([]: static). `soft_marks`: None = default_soft_marks() (soft under attn_mode "torch" / SDPA
+    and under any attn_mode from torch 2.14, strict otherwise).
     `skip_call()`: when it returns True the call runs the eager `_forward` (a mixed-timestep TSM chunk).
     `stream_fp32`: --anima_stream_fp32, a compile cache of its own."""
     if dynamic not in DYNAMIC_MODES:
         raise ValueError(f"dynamic must be one of {DYNAMIC_MODES}, got {dynamic!r}")
     bands = [tuple(int(v) for v in b) for b in bands] if dynamic != "static" else []
     if soft_marks is None:
-        soft_marks = getattr(anima, "attn_mode", "torch") in (None, "torch", "sdpa")
+        soft_marks = default_soft_marks(getattr(anima, "attn_mode", "torch"))
     limit = raise_recompile_limit(recompile_limit)
     if isolate_cache and backend == "inductor":
         cache_dir = isolate_inductor_cache(compile_signature(bands, backend, mode, dynamic, stream_fp32))

@@ -5,6 +5,7 @@ ftfy~=6.3.1
 opencv-python~=4.13.0.92
 einops~=0.8.2
 bitsandbytes~=0.49.2
+# triton matches the torch 2.7 profile; the torch 2.14 profile overrides it (backend/installer.py TORCH_PROFILES)
 triton~=3.3.1; platform_system == "Linux"
 triton-windows~=3.3.1.post21; platform_system == "Windows"
 lion-pytorch~=0.2.5
@@ -39,6 +40,7 @@ rich~=15.0.0
 sentencepiece~=0.2.2
 pytorch-wavelets==1.3.0
 # flash-attention is installed explicitly in the installer to avoid uv due to url normalization issues
+# (torch 2.7 profile below; the torch 2.14 profile uses sdbds 2.8.4 cu130 torch2.14.0 fullbackward, Windows Python 3.11 only)
 # https://github.com/sdbds/flash-attention-for-windows/releases/download/2.8.0.post2/flash_attn-2.8.0.post2+cu128torch2.7.1cxx11abiFALSEfullbackward-cp311-cp311-win_amd64.whl; platform_system == "Windows" and python_version == "3.11"
 # https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.0.post2/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiFALSE-cp310-cp310-linux_x86_64.whl; platform_system == "Linux" and platform_machine == "x86_64" and python_version == "3.10"
 # https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.0.post2/flash_attn-2.8.0.post2+cu12torch2.7cxx11abiFALSE-cp311-cp311-linux_x86_64.whl; platform_system == "Linux" and platform_machine == "x86_64" and python_version == "3.11"

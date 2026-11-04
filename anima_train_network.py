@@ -1892,10 +1892,11 @@ def setup_parser() -> argparse.ArgumentParser:
                         help="widen each dynamic band by this fraction on both sides (a token count outside every band runs"
                              " a static specialization of its own); 0 = the buckets' exact range")
     parser.add_argument("--anima_block_compile_soft_marks", action="store_true",
-                        help="mark the token axis with maybe_mark_dynamic (soft) under every attn_mode, not only SDPA:"
-                             " dynamo may then add guards and compile a second graph instead of failing. torch 2.14 +"
-                             " flash-attn 2.8.4 put a 4096 <= L guard in the Block graph, which the strict union band"
-                             " (924..16384) refuses with ConstraintViolationError (2026-11-04)")
+                        help="mark the token axis with maybe_mark_dynamic (soft) under every attn_mode on any torch:"
+                             " dynamo may then add guards and compile a second graph instead of failing. Without it the"
+                             " marks are soft under attn_mode torch (SDPA) and, from torch 2.14, under every attn_mode:"
+                             " torch 2.14 + flash-attn 2.8.4 put a 4096 <= L guard in the Block graph, which the strict"
+                             " union band (924..16384) refuses with ConstraintViolationError (2026-11-04)")
     parser.add_argument("--anima_block_compile_recompile_limit", type=int, default=128,
                         help="torch._dynamo.config.recompile_limit under --anima_block_compile: at least 2 (Block 0's"
                              " bf16 input vs the fp32 residual) x expert choices (TSM stage 1: n_core) x checkpointing"

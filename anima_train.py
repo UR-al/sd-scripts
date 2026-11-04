@@ -23,6 +23,7 @@ from accelerate.utils import set_seed
 from library import deepspeed_utils, anima_models, anima_train_utils, anima_utils, strategy_base, strategy_anima, sai_model_spec
 
 import library.train_util as train_util
+from library import cuda_memory
 
 from library.utils import setup_logging, add_logging_arguments
 
@@ -51,6 +52,7 @@ def train(args):
     deepspeed_utils.prepare_deepspeed_args(args)
     train_util.set_torch_cuda_reduced_precision(args)
     setup_logging(args, reset=True)
+    cuda_memory.default_expandable_segments()  # torch >= 2.14; before the accelerator touches CUDA
 
     # backward compatibility
     if not args.skip_cache_check:
