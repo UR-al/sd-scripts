@@ -1252,6 +1252,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             mode=args.anima_block_compile_mode,
             dynamic=args.anima_block_compile_dynamic,
             recompile_limit=int(args.anima_block_compile_recompile_limit),
+            soft_marks=True if getattr(args, "anima_block_compile_soft_marks", False) else None,
             skip_call=skip,
             stream_fp32=bool(getattr(args, "anima_stream_fp32", False)),
         )
@@ -1890,6 +1891,11 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--anima_block_compile_band_widen", type=float, default=0.0,
                         help="widen each dynamic band by this fraction on both sides (a token count outside every band runs"
                              " a static specialization of its own); 0 = the buckets' exact range")
+    parser.add_argument("--anima_block_compile_soft_marks", action="store_true",
+                        help="mark the token axis with maybe_mark_dynamic (soft) under every attn_mode, not only SDPA:"
+                             " dynamo may then add guards and compile a second graph instead of failing. torch 2.14 +"
+                             " flash-attn 2.8.4 put a 4096 <= L guard in the Block graph, which the strict union band"
+                             " (924..16384) refuses with ConstraintViolationError (2026-11-04)")
     parser.add_argument("--anima_block_compile_recompile_limit", type=int, default=128,
                         help="torch._dynamo.config.recompile_limit under --anima_block_compile: at least 2 (Block 0's"
                              " bf16 input vs the fp32 residual) x expert choices (TSM stage 1: n_core) x checkpointing"

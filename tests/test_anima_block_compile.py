@@ -1152,6 +1152,37 @@ def test_parser_defaults_and_runtime_switches():
         lycoris_fast.enable_compiled_rebuild(rebuild_before)
 
 
+def test_soft_marks_flag_reaches_compile_blocks(monkeypatch):
+    """--anima_block_compile_soft_marks (2026-11-04): off by default; on, after_network_loaded asks compile_blocks for
+    soft marks (maybe_mark_dynamic) whatever the attn_mode, off it leaves the choice to compile_blocks (None = soft
+    only under SDPA). torch 2.14 + flash-attn 2.8.4 guard 4096 <= L inside the Block graph, which the strict union
+    band refused (ConstraintViolationError at the first training step of a real run)."""
+    import anima_train_network as atn
+
+    parser = atn.setup_parser()
+    assert parser.parse_args([]).anima_block_compile_soft_marks is False
+    assert parser.parse_args(["--anima_block_compile_soft_marks"]).anima_block_compile_soft_marks is True
+
+    seen = []
+
+    def fake_compile_blocks(anima, **kw):
+        seen.append(kw.get("soft_marks", "missing"))
+        return types.SimpleNamespace(bands=kw["bands"], compiled_calls=0)
+
+    monkeypatch.setattr(bc, "compile_blocks", fake_compile_blocks)
+    monkeypatch.setattr(bc, "apply_activation_memory_budget", lambda *a, **k: None)
+    unet, net, _ = build("lora")
+    trainer = atn.AnimaNetworkTrainer()
+    trainer._lycoris_fix_on = True
+    trainer._lycoris_fixes = laf
+    bm = types.SimpleNamespace(resos=[(512, 512), (1024, 1024)])
+    trainer._train_dataset_group = types.SimpleNamespace(datasets=[types.SimpleNamespace(bucket_manager=bm)])
+    accel = types.SimpleNamespace(unwrap_model=lambda m: m, print=lambda *a, **k: None)
+    trainer.after_network_loaded(_trainer_args(), accel, net, [], unet)
+    trainer.after_network_loaded(_trainer_args(anima_block_compile_soft_marks=True), accel, net, [], unet)
+    assert seen == [None, True], seen
+
+
 def test_after_network_loaded_compiles_from_the_bucket_token_counts():
     """AnimaNetworkTrainer.after_network_loaded: the bands come from the training buckets (512^2, 768x512, 1024^2 ->
     union (1024, 4096)), skip_call is the fixed paths' mixed-timestep test, the Blocks run compiled afterwards; with the
