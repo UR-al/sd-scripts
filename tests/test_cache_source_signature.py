@@ -200,6 +200,118 @@ def test_anima38_cache_checks_the_qwen3_t5_signature(tmp_path, monkeypatch):
 
 
 # ======================================================================================================
+# Anima-3.8B: the Qwen3.5 part of *_anima38_te.npz (review 2026-11-05)
+# ======================================================================================================
+
+
+def _fake_qwen35_tokenizer(path, vocab="qwen35-vocab"):
+    path.mkdir(exist_ok=True)
+    (path / "tokenizer.json").write_text(json.dumps({"vocab": vocab}), encoding="utf-8")
+    (path / "tokenizer_config.json").write_text(json.dumps({"pad_token": "<|endoftext|>"}), encoding="utf-8")
+    return str(path)
+
+
+def test_qwen35_signature_follows_the_checkpoint_content(tmp_path):
+    """Other weights in a file of the same name, size and header - even with the old mtime - are another encoder."""
+    checkpoint = _fake_safetensors(tmp_path / "qwen35_4b.safetensors", payload=bytes(range(16)))
+    tokenizer = _fake_qwen35_tokenizer(tmp_path / "tok")
+    base = a38_strategy.qwen35_cache_signature(checkpoint, tokenizer_dir=tokenizer)
+    assert base == a38_strategy.qwen35_cache_signature(checkpoint, tokenizer_dir=tokenizer)  # deterministic
+    assert base.startswith(a38_strategy.CACHE_SCHEMA + "|")
+
+    stat = os.stat(checkpoint)
+    _fake_safetensors(tmp_path / "qwen35_4b.safetensors", payload=bytes(range(16, 32)))
+    os.utime(checkpoint, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    assert os.path.getsize(checkpoint) == stat.st_size and os.stat(checkpoint).st_mtime_ns == stat.st_mtime_ns
+    assert a38_strategy.qwen35_cache_signature(checkpoint, tokenizer_dir=tokenizer) != base
+
+    # the layers fed to the connector are part of it too
+    changed = a38_strategy.qwen35_cache_signature(checkpoint, tokenizer_dir=tokenizer)
+    assert a38_strategy.qwen35_cache_signature(checkpoint, layer_indices=(1, 2, 3, 4), tokenizer_dir=tokenizer) != changed
+
+
+class _CountingFile:
+    def __init__(self, handle, reads):
+        self._handle, self._reads = handle, reads
+
+    def read(self, n=-1):
+        data = self._handle.read(n)
+        self._reads.append(len(data))
+        return data
+
+    def __getattr__(self, name):
+        return getattr(self._handle, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self._handle.close()
+
+
+def test_qwen35_signature_samples_a_large_checkpoint(tmp_path, monkeypatch):
+    """Weights far from the header are seen too, and a big file is not read whole (a few MB of the 4.8 GB)."""
+    size = 32 << 20
+    checkpoint = tmp_path / "qwen35_4b.safetensors"
+    header = json.dumps({"w": {"dtype": "U8", "shape": [size - 1024], "data_offsets": [0, size - 1024]}}).encode("utf-8")
+    header += b" " * (1024 - 8 - len(header))
+    with open(checkpoint, "wb") as f:
+        f.write(struct.pack("<Q", len(header)) + header)
+        f.truncate(size)
+    tokenizer = _fake_qwen35_tokenizer(tmp_path / "tok")
+    base = a38_strategy.qwen35_cache_signature(str(checkpoint), tokenizer_dir=tokenizer)
+    stat = os.stat(checkpoint)
+    with open(checkpoint, "r+b") as f:  # the last bytes of the weights
+        f.seek(size - 16)
+        f.write(b"\x01" * 16)
+    os.utime(checkpoint, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    assert a38_strategy.qwen35_cache_signature(str(checkpoint), tokenizer_dir=tokenizer) != base
+
+    import builtins
+
+    reads = []
+    real_open = builtins.open
+
+    def counting_open(path, mode="r", *args, **kwargs):
+        handle = real_open(path, mode, *args, **kwargs)
+        return _CountingFile(handle, reads) if os.fspath(path) == str(checkpoint) else handle
+
+    monkeypatch.setattr(builtins, "open", counting_open)
+    a38_strategy.qwen35_cache_signature(str(checkpoint), tokenizer_dir=tokenizer)
+    monkeypatch.undo()
+    assert 0 < sum(reads) <= 8 << 20
+
+
+def test_qwen35_signature_follows_the_tokenizer_files_not_the_checkpoint_name(tmp_path, monkeypatch):
+    checkpoint = _fake_safetensors(tmp_path / "qwen35_4b.safetensors")
+    tokenizer = _fake_qwen35_tokenizer(tmp_path / "tok")
+    base = a38_strategy.qwen35_cache_signature(checkpoint, tokenizer_dir=tokenizer)
+
+    other = _fake_qwen35_tokenizer(tmp_path / "tok_other", vocab="other")
+    assert a38_strategy.qwen35_cache_signature(checkpoint, tokenizer_dir=other) != base
+    # resolved like Qwen35Tokenizer does: no directory given -> ANIMA38_QWEN35_TOKENIZER_DIR
+    monkeypatch.setenv("ANIMA38_QWEN35_TOKENIZER_DIR", tokenizer)
+    assert a38_strategy.qwen35_cache_signature(checkpoint) == base
+
+    moved = str(tmp_path / "renamed.safetensors")
+    os.replace(checkpoint, moved)  # same bytes, same mtime
+    assert a38_strategy.qwen35_cache_signature(moved, tokenizer_dir=tokenizer) == base
+
+
+def test_anima38_trainer_signs_caches_with_its_qwen35_and_tokenizer(tmp_path):
+    from library.anima38.trainer import Anima38TrainerMixin
+
+    checkpoint = _fake_safetensors(tmp_path / "qwen35_4b.safetensors")
+    tokenizer = _fake_qwen35_tokenizer(tmp_path / "tok")
+    args = SimpleNamespace(
+        cache_text_encoder_outputs=True, cache_text_encoder_outputs_to_disk=True, text_encoder_batch_size=1,
+        skip_cache_check=False, cache_text_encoder_outputs_dtype="auto", qwen35_path=checkpoint, qwen35_tokenizer_dir=tokenizer,
+    )
+    caching = Anima38TrainerMixin.get_text_encoder_outputs_caching_strategy(None, args)
+    assert caching.qwen35_signature == a38_strategy.qwen35_cache_signature(checkpoint, tokenizer_dir=tokenizer)
+
+
+# ======================================================================================================
 # latent caches: source image size + mtime_ns
 # ======================================================================================================
 

@@ -167,7 +167,7 @@ def train(args):
         logger.error(
             "No data found. Please verify the metadata file and train_data_dir option. / 画像がありません。メタデータおよびtrain_data_dirオプションを確認してください。"
         )
-        return
+        raise SystemExit(1)  # a launcher must see the failure (exit code 0 = finished)
 
     if cache_latents:
         assert (

@@ -284,7 +284,7 @@ def train(args):
         return
     if len(train_dataset_group) == 0:
         logger.error("No data found. Please verify train_data_dir / conditioning_data_dir / dataset_config.")
-        return
+        raise SystemExit(1)  # a launcher must see the failure (exit code 0 = finished)
 
     if cache_latents:
         assert train_dataset_group.is_latent_cacheable(), "when caching latents, color_aug/random_crop cannot be used"

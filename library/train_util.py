@@ -7334,6 +7334,7 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
     )
 
     lr_scheduler_kwargs = {}  # get custom lr_scheduler kwargs
+    requested_cycles = max(1, int(num_cycles or 1))
     if args.lr_scheduler_args is not None and len(args.lr_scheduler_args) > 0:
         for arg in args.lr_scheduler_args:
             key, value = arg.split("=")
@@ -7341,6 +7342,17 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
                 value = ast.literal_eval(value)
             except (ValueError, SyntaxError):
                 pass  # keep as plain string
+
+            # The GUI backend only estimates the step count, so for the custom restart schedulers it sends these two
+            # as fractions of the run (floats in [0, 1]); turn them into steps with the real count here. Integers stay
+            # absolute steps. round(..., 6) keeps 30 * 0.1 = 3.0000000000000004 from becoming 4 steps.
+            if key in ("first_cycle_max_steps", "warmup_steps") and isinstance(value, float) and 0.0 <= value <= 1.0:
+                fraction = value
+                if key == "first_cycle_max_steps":
+                    value = max(1, math.ceil(round(fraction * num_training_steps, 6)))
+                else:  # warmup per cycle, as the backend used to compute it
+                    value = int(round(fraction * num_training_steps, 6)) // requested_cycles
+                logger.info(f"[SCHEDULER] {key}={fraction} of {num_training_steps} steps -> {value}")
 
             # TODO temp fix for warmup and first cycle steps pending UI changes
             if key == 'first_cycle_max_steps' and float(args.validation_split) > 0.0:
@@ -9525,6 +9537,67 @@ class collator_class:
         dataset.set_current_epoch(self.current_epoch.value)
         dataset.set_current_step(self.current_step.value)
         return examples[0]
+
+
+class DataLoaderCycle:
+    """Endless iterator over a DataLoader that starts a new pass over it when a pass ends.
+
+    For the validation loader, instead of itertools.cycle: cycle stores every item of its first pass to replay it,
+    which for an accelerate-prepared DataLoader is every validation batch on the training device, referenced for the
+    whole run (review 2026-11-05). This stores nothing. Raises StopIteration on an empty loader, like cycle.
+
+    It also keeps an accelerate-prepared loader out of accelerate's GradientState between batches. A pass registers the
+    loader there when it starts and unregisters it only when the pass is resumed past its last batch; while registered
+    after the training loader, the loader's end_of_dataloader decides Accelerator's gradient sync. A validation pass left
+    suspended after its last batch made every later training micro-batch an optimizer step (gradient accumulation
+    off), and one stopped mid-pass (--max_validation_steps) hid the training loader's end of epoch. itertools.cycle
+    started only one pass, at the step-0 validation, before the training loader registered.
+    """
+
+    def __init__(self, iterable):
+        self._iterable = iterable
+        self._iterator = None
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self._next_item()
+        if getattr(self._iterable, "end_of_dataloader", False):
+            # accelerate: that was the pass's last batch; finishing the pass now runs the loader's end()
+            next(self._iterator, None)
+            self._iterator = None
+        # accelerate: a pass stopped before its last batch stays registered until it is resumed
+        gradient_state = getattr(self._iterable, "gradient_state", None)
+        remove_dataloader = getattr(gradient_state, "_remove_dataloader", None)
+        if callable(remove_dataloader):
+            remove_dataloader(self._iterable)
+        return item
+
+    def _next_item(self):
+        if self._iterator is not None:
+            try:
+                return next(self._iterator)
+            except StopIteration:
+                pass
+        self._iterator = iter(self._iterable)
+        return next(self._iterator)
+
+
+def dataloader_persistent_workers(persistent: bool, num_workers: int, refreshes_dataset: bool) -> bool:
+    """persistent_workers for a DataLoader whose dataset the main process may change between epochs.
+
+    --cache_aug_refresh_epochs regenerates augmentation variants in this process's dataset at epoch boundaries; a
+    persistent worker keeps the copy of the dataset it received at the first epoch, so the refreshed variants would never
+    reach training (review 2026-11-05). Workers are then started per epoch, at the cost of their start-up time.
+    """
+    if persistent and num_workers > 0 and refreshes_dataset:
+        logger.warning(
+            "--persistent_data_loader_workers is off for the training DataLoader: --cache_aug_refresh_epochs refreshes"
+            " the dataset between epochs, and persistent workers would keep their first copy of it"
+        )
+        return False
+    return persistent
 
 
 class LossRecorder:

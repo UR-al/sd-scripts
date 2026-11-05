@@ -59,7 +59,7 @@ class Anima38TrainerMixin:
             args.skip_cache_check,
             False,
             cache_dtype=getattr(args, "cache_text_encoder_outputs_dtype", "auto"),
-            qwen35_signature=strategy.qwen35_cache_signature(args.qwen35_path),
+            qwen35_signature=strategy.qwen35_cache_signature(args.qwen35_path, tokenizer_dir=args.qwen35_tokenizer_dir),
         )
 
     def cache_text_encoder_outputs_if_needed(self, args, accelerator, unet, vae, text_encoders, dataset, weight_dtype):

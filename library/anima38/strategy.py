@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -35,12 +36,14 @@ from library.strategy_anima import (
     AnimaTextEncoderOutputsCachingStrategy,
     AnimaTextEncodingStrategy,
     AnimaTokenizeStrategy,
+    _file_fingerprint,
+    _tokenizer_fingerprint,
 )
 from library.strategy_base import TextEncodingStrategy, TokenizeStrategy, caption_for_cache, variant_key
 
 from .captions import caption_digest, forge_prompt_text, npz_key
 from .qwen35 import LAYER_INDICES, clear_scan_graphs, load_qwen35_model, pad_token_batch
-from .tokenizer import Qwen35Tokenizer
+from .tokenizer import Qwen35Tokenizer, resolve_tokenizer_dir
 from .training import pack_semantic_layers
 
 logger = logging.getLogger(__name__)
@@ -54,11 +57,41 @@ CACHE_CAPTION_DIGEST_KEY = "anima38_cache_caption_sha1"  # digest of the PROCESS
 CACHE_SCHEMA = "anima38-te-v2"
 
 
-def qwen35_cache_signature(qwen35_path: str, layer_indices: Sequence[int] = LAYER_INDICES) -> str:
-    """Identifies the Qwen3.5 features in a cache file (checkpoint name + size, layers, schema). Metadata only."""
-    size = os.path.getsize(qwen35_path) if qwen35_path and os.path.exists(qwen35_path) else -1
+QWEN35_SAMPLE_CHUNKS = 4  # evenly spaced reads of the checkpoint (first and last bytes included) ...
+QWEN35_SAMPLE_BYTES = 1 << 20  # ... of 1 MiB each: 4 MiB of the 4.8 GB file, once per run
+
+
+def _sampled_content_digest(path: Optional[str], chunks: int = QWEN35_SAMPLE_CHUNKS, chunk_bytes: int = QWEN35_SAMPLE_BYTES) -> str:
+    """sha1 of ``chunks`` evenly spaced ``chunk_bytes`` reads of a file (the whole file when it is that small)."""
+    if not path or not os.path.isfile(path):
+        return "missing"
+    size = os.path.getsize(path)
+    digest = hashlib.sha1()
+    with open(path, "rb") as f:
+        if size <= chunks * chunk_bytes:
+            digest.update(f.read())
+        else:
+            for i in range(chunks):
+                f.seek((size - chunk_bytes) * i // (chunks - 1))
+                digest.update(f.read(chunk_bytes))
+    return digest.hexdigest()[:16]
+
+
+def qwen35_cache_signature(
+    qwen35_path: str, layer_indices: Sequence[int] = LAYER_INDICES, tokenizer_dir: Optional[str] = None
+) -> str:
+    """Identifies the Qwen3.5 features in a cache file: the checkpoint (safetensors header, size and mtime as
+    anima_te_signature fingerprints Qwen3, plus a few MB sampled from the weights, so other weights under the same name,
+    size and header still change it; not the file name: moving it keeps the caches), the tokenizer files - resolved
+    like Qwen35Tokenizer resolves ``tokenizer_dir`` -, the layers and the schema. Reads about 4 MB of the checkpoint
+    and the tokenizer files, once per run (review 2026-11-05; before, name + size only)."""
+    weights = f"{_file_fingerprint(qwen35_path, header_only=True)}.{_sampled_content_digest(qwen35_path)}"
+    try:
+        tokenizer = _tokenizer_fingerprint(resolve_tokenizer_dir(tokenizer_dir))
+    except FileNotFoundError:  # tokenization fails first in a real run; the signature only has to differ
+        tokenizer = "missing"
     layers = ",".join(str(int(index)) for index in layer_indices)
-    return f"{CACHE_SCHEMA}|{os.path.basename(str(qwen35_path))}|{size}|layers={layers}"
+    return f"{CACHE_SCHEMA}|qwen35={weights}|qwen35_tok={tokenizer}|layers={layers}"
 
 
 class Qwen35Provider:

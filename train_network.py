@@ -2447,7 +2447,7 @@ class NetworkTrainer:
             logger.error(
                 "No data found. Please verify arguments (train_data_dir must be the parent of folders with images) / 画像がありません。引数指定を確認してください（train_data_dirには画像があるフォルダではなく、画像があるフォルダの親フォルダを指定する必要があります）"
             )
-            return
+            raise SystemExit(1)  # a launcher must see the failure (exit code 0 = finished)
 
         if cache_latents:
             assert (
@@ -2752,13 +2752,21 @@ class NetworkTrainer:
         if hasattr(train_dataset_group, "attach_epoch_value"):
             train_dataset_group.attach_epoch_value(current_epoch)
 
+        # the epoch loop's refreshes (--cache_aug_refresh_epochs) write new variants into this process's dataset, which
+        # persistent workers would not see (review 2026-11-05)
+        refreshes_train_dataset = aug_refresh_epochs > 0 and (
+            (latents_aug_variants > 1 and cache_latents)
+            or (caption_aug_variants > 1 and getattr(args, "cache_text_encoder_outputs", False))
+        )
         train_dataloader = torch.utils.data.DataLoader(
             train_dataset_group,
             batch_size=1,
             shuffle=True,
             collate_fn=collator,
             num_workers=n_workers,
-            persistent_workers=args.persistent_data_loader_workers,
+            persistent_workers=train_util.dataloader_persistent_workers(
+                args.persistent_data_loader_workers, n_workers, refreshes_train_dataset
+            ),
             pin_memory=args.pin_data_loader_memory or args.pin_memory,
             generator=train_dataloader_generator,
         )
@@ -3115,7 +3123,7 @@ class NetworkTrainer:
 
         if val_dataset_group is not None:
             val_dataloader = accelerator.prepare(val_dataloader)
-            cyclic_val_dataloader = itertools.cycle(val_dataloader)
+            cyclic_val_dataloader = train_util.DataLoaderCycle(val_dataloader)  # not itertools.cycle: it keeps every batch
         else:
             val_dataloader, cyclic_val_dataloader = None, None
 

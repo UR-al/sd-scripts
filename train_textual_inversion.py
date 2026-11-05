@@ -364,7 +364,7 @@ class TextualInversionTrainer:
             return
         if len(train_dataset_group) == 0:
             accelerator.print("No data found. Please verify arguments / 画像がありません。引数指定を確認してください")
-            return
+            raise SystemExit(1)  # a launcher must see the failure (exit code 0 = finished)
 
         if cache_latents:
             assert (

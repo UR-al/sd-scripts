@@ -59,12 +59,17 @@ jobs:
           tests/test_anima_speedups.py
           tests/test_anima_stream_fp32.py
           tests/test_attention_host_seqlens.py
+          tests/test_aug_refresh_workers.py
           tests/test_cache_source_signature.py
           tests/test_caption_lines_and_alpha.py
           tests/test_caption_processing_order.py
           tests/test_config_validation.py
           tests/test_cuda_memory.py
+          tests/test_custom_scheduler_fraction_args.py
           tests/test_dora_lr.py
+          tests/test_empty_dataset_exit.py
+          tests/test_latent_cache_aug_per_resolution.py
+          tests/test_latent_npz_selective_read.py
           tests/test_lycoris_algo_fixes.py
           tests/test_lycoris_stock_flag.py
           tests/test_micro_batch.py
@@ -78,3 +83,4 @@ jobs:
           tests/test_tsm_lokr.py
           tests/test_tsm_offload.py
           tests/test_unsloth_checkpoint_rng.py
+          tests/test_val_dataloader_cycle.py

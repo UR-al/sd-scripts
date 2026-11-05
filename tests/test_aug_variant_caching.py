@@ -1062,14 +1062,16 @@ class TestBackwardCompatibility:
 # 11. Integration: fake VAE variant caching end-to-end
 # ============================================================================
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 class TestVariantCachingEndToEnd:
-    """End-to-end test: fake VAE encode -> variant caching -> load round-trip on CUDA."""
+    """End-to-end test: fake VAE encode -> variant caching -> load round-trip, on CPU and, when available, CUDA.
 
-    @pytest.fixture(autouse=True)
-    def setup(self, tmp_path):
+    It ran on CUDA only, so CPU runs never saw it go stale when the aug metadata moved to per-resolution keys.
+    """
+
+    @pytest.fixture(autouse=True, params=["cpu"] + (["cuda"] if torch.cuda.is_available() else []))
+    def setup(self, tmp_path, request):
         self.tmp_path = tmp_path
-        self.device = torch.device("cuda")
+        self.device = torch.device(request.param)
         from PIL import Image
         img = Image.fromarray(np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8))
         self.img_path = str(tmp_path / "test.png")
@@ -1109,10 +1111,11 @@ class TestVariantCachingEndToEnd:
         assert "latents_v1_8x8" in npz
         assert "latents_v2_8x8" in npz
         assert "latents_v3_8x8" in npz
-        assert "aug_variants" in npz
-        assert "aug_config_hash" in npz
-        assert int(npz["aug_variants"]) == 4
-        assert str(npz["aug_config_hash"].tolist()) == config_hash
+        # variant count and aug hash are per resolution; the old file-wide pair is not written any more
+        assert int(npz["aug_variants_8x8"]) == 4
+        assert str(npz["aug_config_hash_8x8"].tolist()) == config_hash
+        assert "aug_variants" not in npz
+        assert "aug_config_hash" not in npz
 
         # Load each variant
         for k in range(4):

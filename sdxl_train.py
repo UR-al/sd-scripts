@@ -393,7 +393,7 @@ def train(args):
         logger.error(
             "No data found. Please verify the metadata file and train_data_dir option. / 画像がありません。メタデータおよびtrain_data_dirオプションを確認してください。"
         )
-        return
+        raise SystemExit(1)  # a launcher must see the failure (exit code 0 = finished)
 
     if cache_latents:
         assert (
@@ -677,7 +677,7 @@ def train(args):
             persistent_workers=args.persistent_data_loader_workers,
         )
         val_dataloader = accelerator.prepare(val_dataloader)
-        cyclic_val_dataloader = itertools.cycle(val_dataloader)
+        cyclic_val_dataloader = train_util.DataLoaderCycle(val_dataloader)  # not itertools.cycle: it keeps every batch
     else:
         val_dataloader, cyclic_val_dataloader = None, None
 

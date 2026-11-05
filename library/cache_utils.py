@@ -115,6 +115,64 @@ def _decode_bf16(array: np.ndarray) -> np.ndarray:
     return torch.from_numpy(raw_bits).view(dtype=torch.bfloat16).float().numpy()
 
 
+class NpzReader:
+    """Read-only view of an NPZ cache that decompresses only the entries it is asked for.
+
+    ``load_npz`` decodes every array of the file; one latent cache holds all resolutions and augmentation variants of
+    an image, so a reader that needs one of them should open the file with ``open_npz`` instead. ``files``, ``in`` and
+    ``keys()`` list the entries without reading them; ``reader[key]`` reads one, decoded exactly as ``load_npz``
+    returns it (BF16 entries as float32). The dtype metadata entry is hidden, as in ``load_npz``. Close it (or use it
+    as a context manager) before the file is rewritten.
+    """
+
+    def __init__(self, path: str):
+        self._archive = np.load(path, allow_pickle=False)
+        try:
+            names = list(self._archive.files)
+            self._dtypes: Dict[str, str] = {}
+            if CACHE_DTYPE_METADATA_KEY in names:
+                self._dtypes = json.loads(str(self._archive[CACHE_DTYPE_METADATA_KEY].tolist()))
+        except BaseException:
+            self._archive.close()
+            raise
+        self.files = [name for name in names if name != CACHE_DTYPE_METADATA_KEY]
+        self._names = set(self.files)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._names
+
+    def __getitem__(self, key: str) -> np.ndarray:
+        if key not in self._names:
+            raise KeyError(f"{key} is not a file in the archive")
+        value = self._archive[key]
+        if self._dtypes.get(key) == "bf16":
+            value = _decode_bf16(value)
+        return value
+
+    def __iter__(self):
+        return iter(self.files)
+
+    def __len__(self) -> int:
+        return len(self.files)
+
+    def keys(self):
+        return list(self.files)
+
+    def close(self) -> None:
+        self._archive.close()
+
+    def __enter__(self) -> "NpzReader":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
+
+
+def open_npz(path: str) -> NpzReader:
+    """Open an NPZ cache for selective reading (see ``NpzReader``); ``with open_npz(path) as npz: npz[key]``."""
+    return NpzReader(path)
+
+
 def load_npz(path: str, return_dtypes: bool = False) -> Dict[str, np.ndarray]:
     """Load compressed or uncompressed NPZ and decode cache BF16 entries.
 

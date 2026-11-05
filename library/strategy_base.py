@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from transformers import CLIPTokenizer, CLIPTextModel, CLIPTextModelWithProjection
 from library.offline_utils import safe_from_pretrained
-from library.cache_utils import load_npz, normalize_cache_dtype, save_npz
+from library.cache_utils import load_npz, normalize_cache_dtype, open_npz, save_npz
 
 
 # TODO remove circular import by moving ImageInfo to a separate file
@@ -580,6 +580,27 @@ class TextEncoderOutputsCachingStrategy:
 LATENT_SOURCE_STAT_KEY = "source_stat"
 LATENT_SOURCE_NAME_KEY = "source_name"
 
+# Augmentation variants of a latent cache, per resolution (review 2026-11-05): ``aug_variants`` + key_reso_suffix is
+# the variant count K of that resolution and ``aug_config_hash`` + key_reso_suffix the augmentation config its variants
+# were built with. Caches written before kept ONE pair for the whole file, replaced by whichever resolution was written
+# last, so another resolution passed the check under a config it was not built with. A resolution without its own pair
+# is not trusted with variants and is rebuilt once; the file-wide pair is dropped on the next write.
+LATENT_AUG_VARIANTS_KEY = "aug_variants"
+LATENT_AUG_HASH_KEY = "aug_config_hash"
+
+
+def _latents_reso_has_variants(npz, key_reso_suffix: str) -> bool:
+    """Whether a latent cache holds augmentation variants at this resolution, so that its variant 0 is the unflipped
+    canonical and flip comes only from the variants.
+
+    The file-wide count of older caches counts only for a resolution with variant entries of its own: it described
+    whichever resolution was cached with variants last, and the old writer kept it when another resolution was later
+    cached without variants, whose flipped latents must still be used (review 2026-11-05).
+    """
+    if LATENT_AUG_VARIANTS_KEY + key_reso_suffix in npz:
+        return True
+    return LATENT_AUG_VARIANTS_KEY in npz and variant_key("latents", 1) + key_reso_suffix in npz
+
 
 def _latent_source_stat(path: str) -> Optional[np.ndarray]:
     try:
@@ -611,6 +632,7 @@ class LatentsCachingStrategy:
 
     _warned_fallback_to_old_npz = False  # to avoid spamming logs about fallback
     _logged_source_changed = False  # first image edited since its latents were cached
+    _logged_file_wide_aug_hash = False  # first variant cache with the old file-wide aug_variants / aug_config_hash
 
     def __init__(
         self,
@@ -724,46 +746,75 @@ class LatentsCachingStrategy:
         key_reso_suffix = f"_{expected_latents_size[0]}x{expected_latents_size[1]}" if multi_resolution else ""
 
         try:
-            npz = load_npz(npz_path)
-
-            # In old SD/SDXL npz files, if the actual latents shape does not match the expected shape, it doesn't raise an error as long as "latents" key exists (backward compatibility)
-            # In non-SD/SDXL npz files (multi-resolution support), the latents key always has the resolution suffix, and no latents key without suffix exists, so it raises an error if the expected resolution suffix key is not found (this doesn't change the behavior for non-SD/SDXL npz files).
-            if "latents" + key_reso_suffix not in npz and "latents" not in npz:
-                return False
-            if flip_aug and num_aug_variants <= 0 and ("latents_flipped" + key_reso_suffix not in npz and "latents_flipped" not in npz):
-                return False
-            if apply_alpha_mask and ("alpha_mask" + key_reso_suffix not in npz and "alpha_mask" not in npz):
-                return False
-
-            stat_key = LATENT_SOURCE_STAT_KEY + key_reso_suffix
-            if stat_key in npz and LATENT_SOURCE_NAME_KEY in npz:
-                source_path = os.path.join(os.path.dirname(npz_path), str(npz[LATENT_SOURCE_NAME_KEY].tolist()))
-                current = _latent_source_stat(source_path)
-                if current is not None and np.asarray(npz[stat_key]).tolist() != current.tolist():
-                    if not self._logged_source_changed:
-                        self._logged_source_changed = True
-                        logger.info(f"image changed since its latents were cached, rebuilding (first: {npz_path})")
-                    return False
-
-            if num_aug_variants > 0:
-                # variant caches must carry metadata, enough variants, a matching
-                # augmentation config hash, and all per-variant keys
-                if "aug_variants" not in npz or "aug_config_hash" not in npz:
-                    return False
-                if int(npz["aug_variants"]) < num_aug_variants:
-                    return False
-                if aug_config_hash is not None and str(npz["aug_config_hash"].tolist()) != aug_config_hash:
-                    return False
-                for k in range(1, num_aug_variants):
-                    if variant_key("latents", k) + key_reso_suffix not in npz:
-                        return False
-                    if variant_key("crop_ltrb", k) + key_reso_suffix not in npz:
-                        return False
-                    if apply_alpha_mask and variant_key("alpha_mask", k) + key_reso_suffix not in npz:
-                        return False
+            # the key list and the small metadata entries only: the file holds every resolution and variant of the image
+            with open_npz(npz_path) as npz:
+                return self._disk_cached_latents_match(
+                    npz, npz_path, key_reso_suffix, flip_aug, apply_alpha_mask, num_aug_variants, aug_config_hash
+                )
         except Exception as e:
             logger.error(f"Error loading file: {npz_path}")
             raise e
+
+    def _disk_cached_latents_match(
+        self,
+        npz,
+        npz_path: str,
+        key_reso_suffix: str,
+        flip_aug: bool,
+        apply_alpha_mask: bool,
+        num_aug_variants: int,
+        aug_config_hash: Optional[str],
+    ) -> bool:
+        """The checks of _default_is_disk_cached_latents_expected on an open cache (``in`` and small entries only)."""
+        # In old SD/SDXL npz files, if the actual latents shape does not match the expected shape, it doesn't raise an error as long as "latents" key exists (backward compatibility)
+        # In non-SD/SDXL npz files (multi-resolution support), the latents key always has the resolution suffix, and no latents key without suffix exists, so it raises an error if the expected resolution suffix key is not found (this doesn't change the behavior for non-SD/SDXL npz files).
+        if "latents" + key_reso_suffix not in npz and "latents" not in npz:
+            return False
+        if flip_aug and num_aug_variants <= 0 and ("latents_flipped" + key_reso_suffix not in npz and "latents_flipped" not in npz):
+            return False
+        if flip_aug and num_aug_variants <= 0:
+            # the loader takes variant 0 of a variant cache as unflipped and never uses flipped latents next to it (the
+            # old writer kept them when it later cached variants at that resolution): rebuild it as a flip cache
+            load_suffix = key_reso_suffix if "latents" + key_reso_suffix in npz else ""  # the loader's fallback
+            if _latents_reso_has_variants(npz, load_suffix):
+                return False
+        if apply_alpha_mask and ("alpha_mask" + key_reso_suffix not in npz and "alpha_mask" not in npz):
+            return False
+
+        stat_key = LATENT_SOURCE_STAT_KEY + key_reso_suffix
+        if stat_key in npz and LATENT_SOURCE_NAME_KEY in npz:
+            source_path = os.path.join(os.path.dirname(npz_path), str(npz[LATENT_SOURCE_NAME_KEY].tolist()))
+            current = _latent_source_stat(source_path)
+            if current is not None and np.asarray(npz[stat_key]).tolist() != current.tolist():
+                if not self._logged_source_changed:
+                    self._logged_source_changed = True
+                    logger.info(f"image changed since its latents were cached, rebuilding (first: {npz_path})")
+                return False
+
+        if num_aug_variants > 0:
+            # variant caches must carry metadata, enough variants, a matching
+            # augmentation config hash, and all per-variant keys - of this resolution (LATENT_AUG_VARIANTS_KEY)
+            count_key = LATENT_AUG_VARIANTS_KEY + key_reso_suffix
+            hash_key = LATENT_AUG_HASH_KEY + key_reso_suffix
+            if count_key not in npz or hash_key not in npz:
+                if key_reso_suffix and LATENT_AUG_HASH_KEY in npz and not self._logged_file_wide_aug_hash:
+                    self._logged_file_wide_aug_hash = True
+                    logger.info(
+                        "latent augmentation variants cached with one config hash for all resolutions of an image are"
+                        f" rebuilt once, per resolution (first: {npz_path})"
+                    )
+                return False
+            if int(npz[count_key]) < num_aug_variants:
+                return False
+            if aug_config_hash is not None and str(npz[hash_key].tolist()) != aug_config_hash:
+                return False
+            for k in range(1, num_aug_variants):
+                if variant_key("latents", k) + key_reso_suffix not in npz:
+                    return False
+                if variant_key("crop_ltrb", k) + key_reso_suffix not in npz:
+                    return False
+                if apply_alpha_mask and variant_key("alpha_mask", k) + key_reso_suffix not in npz:
+                    return False
 
         return True
 
@@ -1007,7 +1058,14 @@ class LatentsCachingStrategy:
             expected_latents_size = (bucket_reso[1] // latents_stride, bucket_reso[0] // latents_stride)  # bucket_reso is (W, H)
             key_reso_suffix = f"_{expected_latents_size[0]}x{expected_latents_size[1]}"  # e.g. "_32x64", HxW
 
-        npz = load_npz(npz_path)
+        # only this resolution / variant is decompressed: the file holds every resolution and variant of the image
+        with open_npz(npz_path) as npz:
+            return self._read_latents_entry(npz, npz_path, key_reso_suffix, variant)
+
+    def _read_latents_entry(
+        self, npz, npz_path: str, key_reso_suffix: str, variant: int
+    ) -> Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]], Optional[np.ndarray], Optional[np.ndarray], Optional[bool]]:
+        """The reads of _default_load_latents_from_disk on an open cache."""
         latents_key = variant_key("latents", variant) + key_reso_suffix
         if latents_key not in npz:
             if variant > 0:
@@ -1036,9 +1094,9 @@ class LatentsCachingStrategy:
             variant_flipped = bool(npz[flipped_key].tolist()) if flipped_key in npz else False
             flipped_latents = None
         else:
-            if "aug_variants" in npz:
-                # variant cache: flip is baked into the variants; the canonical variant is
-                # unflipped and no separate flipped latents are stored for it
+            if _latents_reso_has_variants(npz, key_reso_suffix):
+                # variant cache: flip is baked into the variants; the canonical variant is unflipped and no separate
+                # flipped latents are stored for it
                 variant_flipped = False
             flipped_latents = npz["latents_flipped" + key_reso_suffix] if "latents_flipped" + key_reso_suffix in npz else None
 
@@ -1072,7 +1130,8 @@ class LatentsCachingStrategy:
             aug_variants (Optional[List[Dict[str, Any]]]): augmentation variants 1..K-1, each a dict with
                 keys ``latents`` (tensor), ``crop_ltrb``, ``flipped`` (bool) and optional ``alpha_mask``.
                 Flip is baked into the variant latents (pixels are flipped before encoding).
-            aug_config_hash (Optional[str]): augmentation config hash for cache invalidation
+            aug_config_hash (Optional[str]): augmentation config hash for cache invalidation (stored with the variant
+                count per resolution, see LATENT_AUG_VARIANTS_KEY)
             source_path (Optional[str]): the image the latents were encoded from; its size and mtime are stored so an
                 image edited in place invalidates the cache
             source_stat (Optional[np.ndarray]): that image's stat taken before its pixels were read (default: now)
@@ -1094,6 +1153,13 @@ class LatentsCachingStrategy:
                 # (flipped latents, alpha mask, variants) instead of passing it off under the new stat
                 for key in [k for k in kwargs if k.endswith(key_reso_suffix)]:
                     del kwargs[key]
+            # this resolution's variant count / config hash describe what is written now (set below, or none for a
+            # cache without variants); the file-wide pair of older caches described whichever resolution came last
+            kwargs.pop(LATENT_AUG_VARIANTS_KEY + key_reso_suffix, None)
+            kwargs.pop(LATENT_AUG_HASH_KEY + key_reso_suffix, None)
+            if key_reso_suffix:
+                kwargs.pop(LATENT_AUG_VARIANTS_KEY, None)
+                kwargs.pop(LATENT_AUG_HASH_KEY, None)
 
         # TODO float() is needed if vae is in bfloat16. Remove it if vae is float16.
         kwargs["latents" + key_reso_suffix] = latents_tensor.float().cpu().numpy()
@@ -1112,9 +1178,9 @@ class LatentsCachingStrategy:
                 kwargs[variant_key("flipped", k) + key_reso_suffix] = np.array(bool(var.get("flipped", False)))
                 if var.get("alpha_mask") is not None:
                     kwargs[variant_key("alpha_mask", k) + key_reso_suffix] = var["alpha_mask"].float().cpu().numpy()
-            kwargs["aug_variants"] = np.array(len(aug_variants) + 1)
+            kwargs[LATENT_AUG_VARIANTS_KEY + key_reso_suffix] = np.array(len(aug_variants) + 1)
         if aug_config_hash is not None:
-            kwargs["aug_config_hash"] = np.array(aug_config_hash)
+            kwargs[LATENT_AUG_HASH_KEY + key_reso_suffix] = np.array(aug_config_hash)
         if source_stat is not None and source_path:
             kwargs[LATENT_SOURCE_STAT_KEY + key_reso_suffix] = source_stat
             try:
