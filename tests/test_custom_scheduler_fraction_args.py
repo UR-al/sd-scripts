@@ -5,8 +5,10 @@ size, resolution pools and validation split). For default schedulers it already 
 which get_scheduler_fix turns into steps. The custom restart schedulers (LoraEasyCustomOptimizer.*WarmRestarts) take
 warmup_steps and first_cycle_max_steps as constructor arguments in steps, so the backend now sends those as floats in
 [0, 1] and get_scheduler_fix converts them with the real step count:
-- first_cycle_max_steps = ceil(fraction * num_training_steps)
-- warmup_steps = int(fraction * num_training_steps) // lr_scheduler_num_cycles (per cycle, as the backend used to do)
+- first_cycle_max_steps = max(1, ceil(round(fraction * num_training_steps, 6)))
+- warmup_steps = train_util.fraction_to_steps(fraction, num_training_steps) // lr_scheduler_num_cycles, i.e. the floor
+  after rounding away float noise, per cycle as the backend used to do (a default scheduler's lr_warmup_steps ratio
+  uses the same helper)
 Integers stay absolute steps, so hand-written TOMLs behave as before. CPU only.
 """
 
@@ -70,10 +72,27 @@ def test_fractions_with_several_cycles_are_per_cycle():
 
 @pytest.mark.parametrize("cycles,total", [(10, 30), (10, 1000), (7, 700), (3, 3), (4, 1001)])
 def test_cycle_fraction_does_not_overshoot_from_float_rounding(cycles, total):
-    # 1/10 is stored as 0.1000000000000000055..., so 30 * 0.1 = 3.0000000000000004; a plain ceil would give 4
+    # 1 / cycles of the run is one cycle's length (ceil of the exact quotient); these products come out exact
+    # (30 * 0.1 == 3.0), the float-noise cases are in the next two tests
     _, first_cycle = group_of(COSINE, [f"first_cycle_max_steps={1 / cycles!r}", "min_lr=1e-6", "gamma=0.9"],
                               max_train_steps=total, num_cycles=cycles)
     assert first_cycle == -(-total // cycles)
+
+
+@pytest.mark.parametrize("fraction,total,expected", [(0.07, 100, 7), (0.035, 200, 7), (0.14, 100, 14)])
+def test_cycle_fraction_float_noise_does_not_add_a_step(fraction, total, expected):
+    # 0.07 * 100 = 7.000000000000001 and 0.14 * 100 = 14.000000000000002; a plain ceil would give 8 and 15
+    _, first_cycle = group_of(COSINE, [f"first_cycle_max_steps={fraction!r}", "min_lr=1e-6", "gamma=0.9"],
+                              max_train_steps=total)
+    assert first_cycle == expected
+
+
+@pytest.mark.parametrize("fraction,expected", [(0.29, 29), (0.57, 57)])
+def test_warmup_fraction_float_noise_does_not_lose_a_step(fraction, expected):
+    # 0.29 * 100 = 28.999999999999996 and 0.57 * 100 = 56.99999999999999; a plain int() would give 28 and 56
+    warmup, first_cycle = group_of(COSINE, [f"warmup_steps={fraction!r}", "first_cycle_max_steps=1.0", "min_lr=1e-6",
+                                            "gamma=0.9"], max_train_steps=100)
+    assert (warmup, first_cycle) == (expected, 100)
 
 
 def test_num_processes_scale_like_the_default_warmup():

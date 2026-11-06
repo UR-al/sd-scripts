@@ -80,7 +80,9 @@ jobs:
           tests/test_requirements_pins.py
           tests/test_tier_timing.py
           tests/test_timestep_presets.py
+          tests/test_token_warmup_fraction.py
           tests/test_tsm_lokr.py
           tests/test_tsm_offload.py
           tests/test_unsloth_checkpoint_rng.py
           tests/test_val_dataloader_cycle.py
+          tests/test_warmup_fraction_steps.py

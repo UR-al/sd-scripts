@@ -1131,7 +1131,8 @@ class BaseDataset(torch.utils.data.Dataset):
                         flex_tokens = tokens[subset.keep_tokens :]
 
                 if subset.token_warmup_step < 1:  # 初回に上書きする
-                    subset.token_warmup_step = math.floor(subset.token_warmup_step * self.max_train_steps)
+                    # a ratio of the run; fraction_to_steps keeps 0.29 * 100 = 28.999999999999996 from becoming 28
+                    subset.token_warmup_step = fraction_to_steps(subset.token_warmup_step, self.max_train_steps)
                 if subset.token_warmup_step and self.current_step < subset.token_warmup_step:
                     tokens_len = (
                         math.floor(
@@ -7276,6 +7277,12 @@ class ZeroLRWarmupScheduler(torch.optim.lr_scheduler._LRScheduler):
         return self._last_lr
 
 
+def fraction_to_steps(fraction: float, total_steps: int) -> int:
+    """Turn a fraction of the run into a step count: the floor of fraction * total_steps after rounding away float
+    noise, so 0.29 * 100 = 28.999999999999996 gives 29, while a real 0.105 * 100 = 10.5 still gives 10 as int() did."""
+    return int(round(fraction * total_steps, 6))
+
+
 # Modified version of get_scheduler() function from diffusers.optimizer.get_scheduler
 # Add some checking and features to the original function.
 
@@ -7295,7 +7302,7 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
     name = args.lr_scheduler
     num_training_steps = args.max_train_steps * num_processes  # * args.gradient_accumulation_steps
     num_warmup_steps: Optional[int] = (
-        int(args.lr_warmup_steps * num_training_steps) if isinstance(args.lr_warmup_steps, float) else args.lr_warmup_steps
+        fraction_to_steps(args.lr_warmup_steps, num_training_steps) if isinstance(args.lr_warmup_steps, float) else args.lr_warmup_steps
     )
 
     # zero_lr_warmup: if enabled, set LR to zero during warmup instead of gradually increasing
@@ -7304,7 +7311,7 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
     temp_lr_decay_steps = parse_string_to_type(args.lr_decay_steps) if args.lr_decay_steps is not None else args.lr_decay_steps or 0
 
     num_decay_steps: Optional[int] = (
-        int(temp_lr_decay_steps * num_training_steps) if isinstance(temp_lr_decay_steps, float) else temp_lr_decay_steps
+        fraction_to_steps(temp_lr_decay_steps, num_training_steps) if isinstance(temp_lr_decay_steps, float) else temp_lr_decay_steps
     )
 
     num_stable_steps = num_training_steps - num_warmup_steps - num_decay_steps
@@ -7345,13 +7352,13 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
 
             # The GUI backend only estimates the step count, so for the custom restart schedulers it sends these two
             # as fractions of the run (floats in [0, 1]); turn them into steps with the real count here. Integers stay
-            # absolute steps. round(..., 6) keeps 30 * 0.1 = 3.0000000000000004 from becoming 4 steps.
+            # absolute steps. round(..., 6) keeps 0.07 * 100 = 7.000000000000001 from becoming 8 steps.
             if key in ("first_cycle_max_steps", "warmup_steps") and isinstance(value, float) and 0.0 <= value <= 1.0:
                 fraction = value
                 if key == "first_cycle_max_steps":
                     value = max(1, math.ceil(round(fraction * num_training_steps, 6)))
                 else:  # warmup per cycle, as the backend used to compute it
-                    value = int(round(fraction * num_training_steps, 6)) // requested_cycles
+                    value = fraction_to_steps(fraction, num_training_steps) // requested_cycles
                 logger.info(f"[SCHEDULER] {key}={fraction} of {num_training_steps} steps -> {value}")
 
             # TODO temp fix for warmup and first cycle steps pending UI changes
