@@ -292,6 +292,33 @@ def _plain_module(module: nn.Module) -> bool:
     return "forward" not in module.__dict__ and not module._forward_hooks and not module._forward_pre_hooks
 
 
+# ComfyUI (comfy/ldm/anima/model.py, Anima.preprocess_text_embeds) and Forge Neo zero-pad the LLM adapter output to this
+# many tokens and never cut it; --anima_crossattn_like_inference makes training and samples do the same.
+INFERENCE_CROSSATTN_MIN_TOKENS = 512
+
+
+def fit_crossattn_like_inference(
+    context: torch.Tensor, target_attention_mask: Optional[torch.Tensor], min_tokens: int = INFERENCE_CROSSATTN_MIN_TOKENS
+) -> torch.Tensor:
+    """The cross-attention context at the length inference gives it: max(min_tokens, longest real T5 sequence in the batch).
+
+    The trainer tokenizes T5 to --t5_max_token_length (620 in config_anima29), so every caption reached the DiT with zeros up
+    to 620, while ComfyUI / Forge Neo pad to 512. The zero rows are not masked out of cross-attention: their keys still take
+    softmax weight, so the zero count changes the output. Tokens are right-padded (real ones first, zero rows after, see
+    _preprocess_text_embeds), so cutting the tail only drops zero rows. In a batch, a caption shorter than another one over
+    min_tokens keeps the longer one's padding (inference has no batch-mates); at batch 1 the length matches inference exactly.
+    """
+    if target_attention_mask is None:
+        return context
+    longest = int(target_attention_mask.sum(dim=-1).max().item())
+    length = max(min_tokens, longest)
+    if context.shape[1] > length:
+        return context[:, :length]
+    if context.shape[1] < length:
+        return torch.nn.functional.pad(context, (0, 0, 0, length - context.shape[1]))
+    return context
+
+
 # Basic building blocks
 class RMSNorm(torch.nn.Module):
     """RMS Normalization for DiT blocks."""
@@ -1242,6 +1269,7 @@ class Anima(nn.Module):
         # --anima_block_compile (library/anima_block_compile.py): the Blocks see the token grid as (B, 1, L, 1, D)
         self._block_compile = False
         self.stream_fp32 = False  # --anima_stream_fp32, see enable_stream_fp32
+        self.crossattn_like_inference = False  # --anima_crossattn_like_inference, see fit_crossattn_like_inference
 
         self.build_patch_embed()
         self.build_pos_embed()
@@ -1492,6 +1520,8 @@ class Anima(nn.Module):
             )
             if t5_attn_mask is not None:
                 crossattn_emb[~t5_attn_mask.bool()] = 0
+                if self.crossattn_like_inference:
+                    crossattn_emb = fit_crossattn_like_inference(crossattn_emb, t5_attn_mask)
 
         if self.stream_fp32:  # iLECO, ADDifT and the adaptive sampler may pass the training dtype
             x_B_C_T_H_W, timesteps_B_T = x_B_C_T_H_W.float(), timesteps_B_T.float()
@@ -1607,6 +1637,8 @@ class Anima(nn.Module):
                 source_attention_mask=source_attention_mask,
             )
             context[~target_attention_mask.bool()] = 0  # zero out padding tokens
+            if self.crossattn_like_inference:
+                context = fit_crossattn_like_inference(context, target_attention_mask)
             return context
         else:
             return source_hidden_states

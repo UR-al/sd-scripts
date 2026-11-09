@@ -316,8 +316,14 @@ def do_sample(
     guidance_scale: float = 1.0,
     flow_shift: float = 3.0,
     neg_crossattn_emb: Optional[torch.Tensor] = None,
+    like_inference: bool = False,
 ) -> torch.Tensor:
     """Generate a sample using Euler discrete sampling for rectified flow.
+
+    like_inference (--anima_sample_like_inference): step the way ComfyUI's euler sampler does (Forge Neo the same) - sigmas,
+    the latent between steps and the update in fp32, the model fed the latent in `dtype` and the timestep in fp32 when the
+    DiT keeps its stream in fp32 (Anima's t_embedder makes its sinusoid in fp32 there). Off: the original trainer sampler,
+    which rounds the sigma table and the latent to `dtype` (bf16) at every step.
 
     Args:
         height, width: Output image dimensions
@@ -330,10 +336,15 @@ def do_sample(
         guidance_scale: CFG scale (1.0 = no guidance)
         flow_shift: Flow shift parameter for rectified flow
         neg_crossattn_emb: Negative cross-attention embeddings for CFG
+        like_inference: fp32 sampler state as ComfyUI / Forge Neo keep it (see above)
 
     Returns:
         Denoised latents
     """
+    if like_inference:
+        return _do_sample_like_inference(
+            height, width, seed, dit, crossattn_emb, steps, dtype, device, guidance_scale, flow_shift, neg_crossattn_emb
+        )
     # Latent shape: (1, 16, 1, H/8, W/8) for single image
     latent_h = height // 8
     latent_w = width // 8
@@ -382,6 +393,141 @@ def do_sample(
         x = x.to(dtype)
 
     return x
+
+
+def comfy_simple_flow_sigmas(steps: int, flow_shift: float) -> torch.Tensor:
+    """ComfyUI's "simple" schedule for a flow model (Anima: ModelSamplingDiscreteFlow, multiplier 1.0): the shifted table
+    sigma(k / 1000) for k = 1..1000 (comfy/model_sampling.py set_parameters, time_snr_shift), indexed the way
+    comfy/samplers.py simple_scheduler does it, then 0. The timestep is truncated to the 1/1000 grid, so this equals the
+    shifted linspace only when 1000 % steps == 0 (20, 25, 40, 50 steps). fp32, on the CPU."""
+    t = torch.arange(1, 1001, 1) / 1000
+    shift = float(flow_shift)
+    table = t if shift == 1.0 else shift * t / (1 + (shift - 1) * t)
+    ss = len(table) / steps
+    return torch.FloatTensor([float(table[-(1 + int(x * ss))]) for x in range(steps)] + [0.0])
+
+
+def _model_input_dtype(dit, dtype: torch.dtype) -> torch.dtype:
+    """The dtype ComfyUI / Forge Neo feed the DiT: its weights' compute dtype (comfy/model_base.py _apply_model casts xc to
+    it). With --anima_stream_fp32 `dit.dtype` (its first parameter, the x_embedder) is fp32 while the Block Linears and the
+    LLM adapter stay bf16, so the first low-precision parameter tells the compute dtype; all-fp32 models keep `dtype`."""
+    parameters = getattr(dit, "parameters", None)
+    if parameters is None:  # a wrapper (e.g. library/anima38 ConditionedDiT) without parameters
+        return dtype
+    return next((p.dtype for p in parameters() if p.dtype in (torch.bfloat16, torch.float16)), dtype)
+
+
+def _do_sample_like_inference(
+    height, width, seed, dit, crossattn_emb, steps, dtype, device, guidance_scale, flow_shift, neg_crossattn_emb
+) -> torch.Tensor:
+    """do_sample(like_inference=True): ComfyUI's euler with the "simple" scheduler, step for step.
+
+    - noise: CPU randn in fp32 from torch.manual_seed(seed), the same draw as ComfyUI's comfy/sample.py prepare_noise and
+      as the original sampler; the latent stays fp32 between steps (k-diffusion sample_euler);
+    - sigmas: comfy_simple_flow_sigmas;
+    - the DiT gets x in its compute dtype (_model_input_dtype) and the timestep in fp32 (model_base._apply_model passes
+      t.float(); Anima builds the sinusoid from it) whenever the stream is fp32 or autocast is on - sampling runs under
+      accelerator.autocast(), where t_embedder's Linears take the fp32 sinusoid; without either, the model dtype, so a
+      bf16 Linear does not get an fp32 input;
+    - CFG on the denoised predictions (CONST.calculate_denoised x - v * sigma, samplers.cfg_function), then the euler
+      derivative (x - denoised) / sigma, all in fp32.
+    Returns the fp32 latent (decode it with fp32_unnormalize=True, as ComfyUI's latent format un-normalizes in fp32)."""
+    latent_h = height // 8
+    latent_w = width // 8
+    generator = torch.manual_seed(seed) if seed is not None else None
+    x = torch.randn((1, 16, 1, latent_h, latent_w), dtype=torch.float32, generator=generator, device="cpu").to(device)
+    sigmas = comfy_simple_flow_sigmas(steps, flow_shift).to(device)
+
+    x_dtype = _model_input_dtype(dit, dtype)
+    autocast_on = torch.is_autocast_enabled(device.type) if isinstance(device, torch.device) else torch.is_autocast_enabled()
+    t_dtype = torch.float32 if (getattr(dit, "stream_fp32", False) or autocast_on) else x_dtype
+    padding_mask = torch.zeros(1, 1, latent_h, latent_w, dtype=x_dtype, device=device)
+    use_cfg = guidance_scale > 1.0 and neg_crossattn_emb is not None
+
+    for i in tqdm(range(steps), desc="Sampling"):
+        sigma = sigmas[i]
+        t = sigma.unsqueeze(0).to(t_dtype)
+        x_in = x.to(x_dtype)
+        denoised = x - dit(x_in, t, crossattn_emb, padding_mask=padding_mask).float() * sigma
+        if use_cfg:
+            uncond = x - dit(x_in, t, neg_crossattn_emb, padding_mask=padding_mask).float() * sigma
+            denoised = uncond + (denoised - uncond) * guidance_scale
+        x = x + (x - denoised) / sigma * (sigmas[i + 1] - sigma)
+
+    return x
+
+
+# ComfyUI's prompt-weight parser (comfy/sd1_clip.py parse_parentheses, token_weights, escape_important, unescape_important),
+# which Forge Neo's backend/text_processing/_comfy.py uses too: only \( and \) are escapes; [ ] are plain text there.
+def _comfy_parse_parentheses(string: str) -> list:
+    result, current_item, nesting_level = [], "", 0
+    for char in string:
+        if char == "(":
+            if nesting_level == 0:
+                if current_item:
+                    result.append(current_item)
+                current_item = "("
+            else:
+                current_item += char
+            nesting_level += 1
+        elif char == ")":
+            nesting_level -= 1
+            if nesting_level == 0:
+                result.append(current_item + ")")
+                current_item = ""
+            else:
+                current_item += char
+        else:
+            current_item += char
+    if current_item:
+        result.append(current_item)
+    return result
+
+
+def _comfy_token_weights(string: str, current_weight: float) -> list:
+    out = []
+    for x in _comfy_parse_parentheses(string):
+        weight = current_weight
+        if len(x) >= 2 and x[-1] == ")" and x[0] == "(":
+            x = x[1:-1]
+            xx = x.rfind(":")
+            weight *= 1.1
+            if xx > 0:
+                try:
+                    weight = float(x[xx + 1 :])
+                    x = x[:xx]
+                except ValueError:
+                    pass
+            out += _comfy_token_weights(x, weight)
+        else:
+            out += [(x, current_weight)]
+    return out
+
+
+def comfy_prompt_segments(text: str) -> list:
+    """(text, weight) segments as ComfyUI tokenizes them, escapes restored."""
+    escaped = text.replace("\\)", "\0\1").replace("\\(", "\0\2")
+    return [(segment.replace("\0\1", ")").replace("\0\2", "("), weight) for segment, weight in _comfy_token_weights(escaped, 1.0)]
+
+
+def process_prompt_escapes_like_inference(text: str) -> str:
+    """A sample prompt's text as ComfyUI / Forge Neo pass it to the tokenizers: emphasis brackets and ":weight" removed,
+    \\( \\) turned into plain brackets, \\[ \\] left as they are. The weights themselves are not applied to samples (warned in
+    _sample_image_inference)."""
+    return "".join(segment for segment, _ in comfy_prompt_segments(text))
+
+
+def prompt_has_emphasis(text: str) -> bool:
+    """Any segment ComfyUI would weight other than 1.0 ((x) is 1.1, (x:w) is w)."""
+    return any(weight != 1.0 for _, weight in comfy_prompt_segments(text))
+
+
+def sample_prompt_text(text: str, args) -> str:
+    """The text a sample prompt is encoded from: unchanged, or with --anima_sample_like_inference its escapes processed the
+    way ComfyUI / Forge Neo do. Used both where the sample prompts' TE outputs are cached and where they are looked up."""
+    if text and getattr(args, "anima_sample_like_inference", False):
+        return process_prompt_escapes_like_inference(text)
+    return text
 
 
 def sample_merge_cache(accelerator: Accelerator, args: argparse.Namespace, dit):
@@ -519,6 +665,14 @@ def _sample_image_inference(
         if negative_prompt:
             negative_prompt = negative_prompt.replace(prompt_replacement[0], prompt_replacement[1])
 
+    like_inference = bool(getattr(args, "anima_sample_like_inference", False))
+    if like_inference:
+        for text in (prompt, negative_prompt):
+            if text and prompt_has_emphasis(text):
+                logger.warning(f"  sample prompt has (text) / (text:weight) emphasis, which ComfyUI / Forge apply but samples do not: {text[:80]}")
+    prompt = sample_prompt_text(prompt, args)  # same text as the cached TE outputs (see anima_train_network)
+    negative_prompt = sample_prompt_text(negative_prompt, args)
+
     if seed is not None:
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)  # seed all CUDA devices for multi-GPU
@@ -568,6 +722,8 @@ def _sample_image_inference(
             source_attention_mask=attn_mask,
         )
         crossattn_emb[~t5_attn_mask.bool()] = 0
+        if getattr(dit, "crossattn_like_inference", False):  # samples build the context here, outside Anima.forward
+            crossattn_emb = anima_models.fit_crossattn_like_inference(crossattn_emb, t5_attn_mask)
     else:
         crossattn_emb = prompt_embeds
 
@@ -596,13 +752,16 @@ def _sample_image_inference(
                     source_attention_mask=neg_am,
                 )
                 neg_crossattn_emb[~neg_t5_am.bool()] = 0
+                if getattr(dit, "crossattn_like_inference", False):
+                    neg_crossattn_emb = anima_models.fit_crossattn_like_inference(neg_crossattn_emb, neg_t5_am)
             else:
                 neg_crossattn_emb = neg_pe
 
     # Generate sample
     clean_memory_on_device(accelerator.device)
     latents = do_sample(
-        height, width, seed, dit, crossattn_emb, sample_steps, dit.dtype, accelerator.device, scale, flow_shift, neg_crossattn_emb
+        height, width, seed, dit, crossattn_emb, sample_steps, dit.dtype, accelerator.device, scale, flow_shift, neg_crossattn_emb,
+        like_inference=like_inference,
     )
 
     # Decode latents
@@ -611,7 +770,7 @@ def _sample_image_inference(
     clean_memory_on_device(accelerator.device)
     org_vae_device = vae.device
     vae.to(accelerator.device)
-    decoded = vae.decode_to_pixels(latents)
+    decoded = vae.decode_to_pixels(latents, fp32_unnormalize=True) if like_inference else vae.decode_to_pixels(latents)
     vae.to(org_vae_device)
     clean_memory_on_device(accelerator.device)
 

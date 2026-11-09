@@ -241,6 +241,28 @@ def _rope_of(args: tuple, kwargs: dict):
     return args[_ROPE_ARG_INDEX] if len(args) > _ROPE_ARG_INDEX else None
 
 
+_CROSSATTN_ARG_INDEX = 1  # Block._forward(x, emb, crossattn_emb, ...) after binding
+INFERENCE_CROSSATTN_MIN_TOKENS = 512  # = anima_models.INFERENCE_CROSSATTN_MIN_TOKENS (no import: anima_models is the caller)
+
+
+def _crossattn_of(args: tuple, kwargs: dict):
+    if "crossattn_emb" in kwargs:
+        return kwargs["crossattn_emb"]
+    return args[_CROSSATTN_ARG_INDEX] if len(args) > _CROSSATTN_ARG_INDEX else None
+
+
+def _mark_long_crossattn_dynamic(anima: torch.nn.Module, args: tuple, kwargs: dict) -> None:
+    """--anima_crossattn_like_inference: the context is 512 rows for most captions, the caption's own length above that
+    (anima_models.fit_crossattn_like_inference). torch.compile runs with dynamic=False, so every new long length would be
+    a recompile of its own; the 512 graph stays static and the first long caption compiles one graph whose context length
+    is dynamic (soft mark), shared by every later long caption. Off: the context is always --t5_max_token_length rows."""
+    if not getattr(anima, "crossattn_like_inference", False):
+        return
+    context = _crossattn_of(args, kwargs)
+    if isinstance(context, torch.Tensor) and context.dim() == 3 and context.shape[1] != INFERENCE_CROSSATTN_MIN_TOKENS:
+        torch._dynamo.maybe_mark_dynamic(context, 1)
+
+
 def _mark_dynamic(x: torch.Tensor, rope, bands: Sequence[Tuple[int, int]], soft: bool) -> None:
     """Mark the token axis (dim 2 of the fake-5D x, dim 0 of each RoPE table) dynamic for the band containing it."""
     seq = int(x.shape[2])
@@ -424,6 +446,7 @@ def compile_blocks(
                 return orig(x, *args, **kw)
             if bands and x.dim() == 5:
                 _mark_dynamic(x, _rope_of(args, kw), bands, soft_marks)
+            _mark_long_crossattn_dynamic(anima, args, kw)
             state.compiled_calls += 1
             dev = x.device.type
             # Autocast OFF around the compiled call, the state handed to the graph as arguments: AOTAutograd traces the

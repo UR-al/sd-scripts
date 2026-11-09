@@ -42,6 +42,14 @@ class ConditionedDiT:
     def __init__(self, dit):
         self.dit = dit
 
+    # read by do_sample(like_inference=True): the wrapped DiT's compute dtype and stream
+    def parameters(self):
+        return self.dit.parameters()
+
+    @property
+    def stream_fp32(self):
+        return getattr(self.dit, "stream_fp32", False)
+
     def __call__(self, x, t, conditioning, padding_mask=None):
         if not isinstance(conditioning, DiTConditioning):
             return self.dit(x, t, conditioning, padding_mask=padding_mask)
@@ -193,6 +201,10 @@ def sample_image_inference(
         prompt = prompt.replace(prompt_replacement[0], prompt_replacement[1])
         if negative_prompt:
             negative_prompt = negative_prompt.replace(prompt_replacement[0], prompt_replacement[1])
+    # --anima_sample_like_inference: the cache (anima_train_network) is keyed by the processed text
+    like_inference = bool(getattr(args, "anima_sample_like_inference", False))
+    prompt = anima_train_utils.sample_prompt_text(prompt, args)
+    negative_prompt = anima_train_utils.sample_prompt_text(negative_prompt, args)
 
     if seed is not None:
         torch.manual_seed(seed)
@@ -227,7 +239,8 @@ def sample_image_inference(
 
     clean_memory_on_device(device)
     latents = anima_train_utils.do_sample(
-        height, width, seed, ConditionedDiT(dit), positive, sample_steps, dtype, device, scale, flow_shift, negative
+        height, width, seed, ConditionedDiT(dit), positive, sample_steps, dtype, device, scale, flow_shift, negative,
+        like_inference=like_inference,
     )
     if not decode:
         return latents
@@ -237,7 +250,7 @@ def sample_image_inference(
     clean_memory_on_device(device)
     org_vae_device = vae.device
     vae.to(device)
-    decoded = vae.decode_to_pixels(latents)
+    decoded = vae.decode_to_pixels(latents, fp32_unnormalize=True) if like_inference else vae.decode_to_pixels(latents)
     vae.to(org_vae_device)
     clean_memory_on_device(device)
 

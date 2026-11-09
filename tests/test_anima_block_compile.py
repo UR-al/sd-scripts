@@ -946,6 +946,45 @@ def test_resolution_sweep_inside_the_union_band_shares_the_graphs(preset):
     assert bc._warned_oob == {4}
 
 
+def test_crossattn_like_inference_long_captions_share_one_graph():
+    """--anima_crossattn_like_inference: the context is 512 rows or the caption's own length above that. The 512 graph
+    stays static; the first longer context compiles one graph with a dynamic context length that later long captions
+    reuse (without the switch each new context length would be a recompile under dynamic=False)."""
+    unet, net, _ = build("lora")
+    unet.crossattn_like_inference = True
+    backend, calls = counting_backend("eager")
+    compile_toy(unet, net, backend=backend)
+    for text_len in (512, 512):
+        x, t, ctx, pad = inputs(latent_hw=(8, 8), t=[0.3], text_len=text_len)
+        step(unet, net, x, t, ctx, pad, backward=False)
+    static = len(calls)
+    x, t, ctx, pad = inputs(latent_hw=(8, 8), t=[0.3], text_len=540)
+    step(unet, net, x, t, ctx, pad, backward=False)
+    long_graphs = len(calls) - static
+    assert long_graphs >= 1
+    for text_len in (577, 600, 631):
+        x, t, ctx, pad = inputs(latent_hw=(8, 8), t=[0.3], text_len=text_len)
+        step(unet, net, x, t, ctx, pad, backward=False)
+        assert len(calls) == static + long_graphs, f"context {text_len}: recompiled"
+    x, t, ctx, pad = inputs(latent_hw=(8, 8), t=[0.3], text_len=512)
+    step(unet, net, x, t, ctx, pad, backward=False)
+    assert len(calls) == static + long_graphs, "512 recompiled"
+
+
+def test_crossattn_lengths_recompile_without_the_switch():
+    """Control for the test above: without --anima_crossattn_like_inference no context is marked (the trainer's context
+    is always --t5_max_token_length rows, so it never needed it)."""
+    unet, net, _ = build("lora")
+    backend, calls = counting_backend("eager")
+    compile_toy(unet, net, backend=backend)
+    x, t, ctx, pad = inputs(latent_hw=(8, 8), t=[0.3], text_len=540)
+    step(unet, net, x, t, ctx, pad, backward=False)
+    first = len(calls)
+    x, t, ctx, pad = inputs(latent_hw=(8, 8), t=[0.3], text_len=600)
+    step(unet, net, x, t, ctx, pad, backward=False)
+    assert len(calls) > first
+
+
 def test_static_plan_compiles_per_token_count():
     """dynamic=static (no marks): every distinct token count compiles its own graphs."""
     unet, net, _ = build("lora")

@@ -1176,15 +1176,23 @@ class AutoencoderKLQwenImage(nn.Module):  # ModelMixin, ConfigMixin, FromOrigina
             return (decoded,)
         return {"sample": decoded}
 
-    def decode_to_pixels(self, latents: torch.Tensor) -> torch.Tensor:
+    def decode_to_pixels(self, latents: torch.Tensor, fp32_unnormalize: bool = False) -> torch.Tensor:
+        """fp32_unnormalize (--anima_sample_like_inference): latents * std + mean in fp32 and only then cast to the VAE
+        dtype, as ComfyUI's latent format does before its VAE decode. Off: cast first, un-normalize in the VAE dtype."""
         is_4d = latents.dim() == 4
         if is_4d:
             latents = latents.unsqueeze(2)  # [B, C, H, W] -> [B, C, 1, H, W]
 
-        latents = latents.to(self.dtype)
-        latents_mean = torch.tensor(self.latents_mean).view(1, self.z_dim, 1, 1, 1).to(latents.device, latents.dtype)
-        latents_std = 1.0 / torch.tensor(self.latents_std).view(1, self.z_dim, 1, 1, 1).to(latents.device, latents.dtype)
-        latents = latents / latents_std + latents_mean
+        if fp32_unnormalize:
+            latents = latents.float()
+            mean = torch.tensor(self.latents_mean, dtype=torch.float32).view(1, self.z_dim, 1, 1, 1).to(latents.device)
+            std = torch.tensor(self.latents_std, dtype=torch.float32).view(1, self.z_dim, 1, 1, 1).to(latents.device)
+            latents = (latents * std + mean).to(self.dtype)
+        else:
+            latents = latents.to(self.dtype)
+            latents_mean = torch.tensor(self.latents_mean).view(1, self.z_dim, 1, 1, 1).to(latents.device, latents.dtype)
+            latents_std = 1.0 / torch.tensor(self.latents_std).view(1, self.z_dim, 1, 1, 1).to(latents.device, latents.dtype)
+            latents = latents / latents_std + latents_mean
 
         image = self.decode(latents, return_dict=False)[0]  # -1 to 1
         if is_4d:
