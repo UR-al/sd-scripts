@@ -13,7 +13,7 @@ import torch.nn.functional as F
 
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
-from library import custom_offloading_utils, attention
+from library import custom_offloading_utils, attention, lycoris_fast
 from library.elementwise_compile import ElementwiseChains
 
 
@@ -144,6 +144,111 @@ class UnslothOffloadedGradientCheckpointer(torch.autograd.Function):
 def unsloth_checkpoint(function, *args):
     """Wrapper for UnslothOffloadedGradientCheckpointer."""
     return UnslothOffloadedGradientCheckpointer.apply(function, *args)
+
+
+# ---- no-grad first pass on the device (--anima_ckpt_nograd_merged, --anima_ckpt_reuse_attn; 2026-11-14, off by default) --
+# torch_checkpoint(use_reentrant=False) runs a checkpointed Block's forward twice in GRAD mode (the first pass records the
+# autograd graph and drops its saved tensors, the recompute in backward fills them again) and then the backward. Measured
+# 2026-11-14 on Anima 2.9B (LoKr factor 4 + DoRA, fp16, per-block compile, batch 1 x accumulation 10): a 2048-tier
+# micro-step ~3.9 s, 1536 ~1.9 s, and the merged LoKr+DoRA weights (2.77B elements) rebuilt on both passes.
+# CKPT_NOGRAD_MERGED: Block.forward's plain checkpoint (no offload) becomes NoGradFirstPassCheckpointer - the Unsloth
+#   checkpointer without the CPU copy: the first pass under no_grad (no graph, nothing saved), the Block input kept on the
+#   device, and the recompute + backward inside this node's backward. Same ops on the same values in both passes, the
+#   forward's RNG states replayed for the recompute and the forward's autocast state re-entered for it (the inner backward
+#   runs in the engine's own state, as the Block's nodes did), so outputs and gradients are the plain checkpoint's - with
+#   one exception: a tensor that enters several Blocks from outside (emb / adaln_lora from t_embedder, and crossattn_emb,
+#   which the trainer marks requires_grad under gradient checkpointing) gets one gradient per Block from this node, the
+#   Block's uses summed first in that tensor's dtype (fp16 / bf16 for crossattn_emb), where the plain checkpoint sums
+#   every use flat. Rounding-level, and it only reaches trained weights when t_embedder, llm_adapter or the text encoder
+#   is trained (the trainer warns at start-up for each of the three); the Blocks' LoKr / DoRA gradients are
+#   bit-identical. In the first pass the Block's attention / MLP LoKr modules read a merged weight built once per
+#   optimizer step (lycoris_fast "checkpoint merged-weight cache"); the adaLN modulation Linears run outside autocast,
+#   i.e. LyCORIS's stock forward, and are not cached.
+# CKPT_REUSE_ATTN (needs CKPT_NOGRAD_MERGED): the first pass keeps the self-attention's flash output and softmax_lse, the
+#   recompute returns them instead of running the flash forward kernel again (library/attention.py _FlashReuse). They are
+#   dropped as soon as the Block's backward has run (2048 tier: ~68 MB per checkpointed Block until then).
+# Both off (the defaults): Block.forward and Block._forward run exactly as before.
+CKPT_NOGRAD_MERGED = False
+CKPT_REUSE_ATTN = False
+# A list switches the check on (tests, the GPU harness): each backward appends max |recompute output - first-pass output|
+# of its Block, 0.0 when the two passes agree bit for bit. Costs a copy of the output and a host sync per Block.
+CKPT_RECOMPUTE_DIFFS: Optional[list] = None
+
+
+def _ckpt_cached_lokrs(block: nn.Module) -> list:
+    """The Block's LoKr modules that the first pass serves from the merged-weight cache: those on the attention and MLP
+    Linears. Found once per Block and kept (the network is applied before the first training forward); an empty result
+    is looked up again on the next call, so a Block seen before its network was applied is not left without a cache."""
+    lokrs = block.__dict__.get("_ckpt_lokrs")
+    if not lokrs:
+        linears = [m for name, m in block.named_modules()
+                   if isinstance(m, nn.Linear) and not name.startswith("adaln_modulation")]
+        lokrs = block.__dict__["_ckpt_lokrs"] = lycoris_fast.ckpt_merged_modules(block, linears)
+    return lokrs
+
+
+class NoGradFirstPassCheckpointer(torch.autograd.Function):
+    """Gradient checkpoint of one Block with a no-grad first pass on the device (see the section comment above).
+
+    forward(forward_function, block, hidden_states, *args): hidden_states must require grad (Block.forward checks; the
+    trainer marks the noisy input when checkpointing), the other tensor arguments get gradients when they require them.
+    """
+
+    @staticmethod
+    def forward(ctx, forward_function, block, hidden_states, *args):
+        device_type = hidden_states.device.type
+        # what the recompute must see again: autocast (the engine runs backward without it) and the RNG streams
+        ctx.autocast = (device_type, torch.is_autocast_enabled(device_type), torch.get_autocast_dtype(device_type),
+                        torch.is_autocast_enabled("cpu"), torch.get_autocast_dtype("cpu"))
+        ctx.cpu_rng_state = torch.get_rng_state()
+        ctx.cuda_rng_devices = _cuda_rng_devices(hidden_states, *args)
+        ctx.cuda_rng_states = [torch.cuda.get_rng_state(d) for d in ctx.cuda_rng_devices]
+        ctx.lokrs = _ckpt_cached_lokrs(block)
+        ctx.merged_keys = lycoris_fast.ckpt_merged_refresh(ctx.lokrs, ctx.autocast[2]) if ctx.autocast[1] else None
+        stash = [] if CKPT_REUSE_ATTN else None
+        kwargs = {} if stash is None else {"attn_stash": stash}
+        with torch.no_grad(), lycoris_fast.ckpt_pass(1 if ctx.merged_keys is not None else 0):
+            output = forward_function(hidden_states, *args, **kwargs)
+        ctx.attn_reuse = tuple(stash) if stash else None  # (out, softmax_lse) of the self-attention, or nothing stored
+        ctx.save_for_backward(hidden_states)
+        ctx.forward_function = forward_function
+        ctx.args = args  # like the Unsloth checkpointer: the caller's loop holds these anyway
+        if CKPT_RECOMPUTE_DIFFS is not None:
+            ctx.first_output = output.detach().clone()
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (hidden_states,) = ctx.saved_tensors
+        inputs = detach_variable((hidden_states,) + ctx.args)  # detached, each with its own requires_grad
+        device_type, enabled, dtype, cpu_enabled, cpu_dtype = ctx.autocast
+        # The cached weights (and with them the stored attention output) are only valid for the parameters the first pass
+        # read. Nothing changes them between a forward and its backward in the trainer; if something did, recompute plainly.
+        current = ctx.merged_keys is None or lycoris_fast.ckpt_merged_current(ctx.lokrs, ctx.merged_keys, dtype)
+        reuse, ctx.attn_reuse = (ctx.attn_reuse if current else None), None  # from here the recompute graph holds them
+        kwargs = {} if reuse is None else {"attn_reuse": reuse}
+        # Replay the forward's RNG states; fork_rng gives the caller its own back, so backward draws no random numbers
+        with torch.random.fork_rng(devices=ctx.cuda_rng_devices):
+            torch.set_rng_state(ctx.cpu_rng_state)
+            for device, state in zip(ctx.cuda_rng_devices, ctx.cuda_rng_states):
+                torch.cuda.set_rng_state(state, device)
+            with torch.enable_grad(), torch.autocast(device_type, dtype=dtype, enabled=enabled), \
+                    torch.autocast("cpu", dtype=cpu_dtype, enabled=cpu_enabled), \
+                    lycoris_fast.ckpt_pass(2 if current and ctx.merged_keys is not None else 0):
+                output = ctx.forward_function(*inputs, **kwargs)
+        del reuse, kwargs
+        if CKPT_RECOMPUTE_DIFFS is not None:
+            CKPT_RECOMPUTE_DIFFS.append(float((output.detach().float() - ctx.first_output.float()).abs().max()))
+            ctx.first_output = None
+        if output.requires_grad:  # nothing trainable inside and no grad-bearing input reaches the output otherwise
+            torch.autograd.backward(output, grad_output)
+        return (None, None) + tuple(inp.grad if isinstance(inp, torch.Tensor) else None for inp in inputs)
+
+
+@torch._disable_dynamo
+def nograd_checkpoint(function, block, *args):
+    """Wrapper for NoGradFirstPassCheckpointer."""
+    return NoGradFirstPassCheckpointer.apply(function, block, *args)
 
 
 from .utils import setup_logging
@@ -468,7 +573,10 @@ class Attention(nn.Module):
         attn_params: attention.AttentionParams,
         context: Optional[torch.Tensor] = None,
         rope_cos_sin: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        stash: Optional[list] = None,
+        reuse: Optional[tuple] = None,
     ) -> torch.Tensor:
+        # stash / reuse: --anima_ckpt_reuse_attn (library/attention.py ckpt_stash / ckpt_reuse); None = the plain call
         q, k, v = self.compute_qkv(x, context, rope_cos_sin=rope_cos_sin)
         if q.dtype != v.dtype:
             if self.stream_fp32 or (
@@ -481,7 +589,10 @@ class Attention(nn.Module):
         # return self.compute_attention(q, k, v)
         qkv = [q, k, v]
         del q, k, v
-        result = attention.attention(qkv, attn_params=attn_params)
+        if stash is None and reuse is None:
+            result = attention.attention(qkv, attn_params=attn_params)
+        else:  # a checkpointed Block's self-attention under --anima_ckpt_reuse_attn
+            result = attention.attention(qkv, attn_params=attn_params, ckpt_stash=stash, ckpt_reuse=reuse)
         return self.output_dropout(self.output_proj(result))
 
 
@@ -1012,6 +1123,8 @@ class Block(nn.Module):
         mods_self_attn_B_T_3D: torch.Tensor,
         mods_cross_attn_B_T_3D: torch.Tensor,
         mods_mlp_B_T_3D: torch.Tensor,
+        attn_stash: Optional[list] = None,
+        attn_reuse: Optional[tuple] = None,
     ) -> torch.Tensor:
         """_forward with the precomputed modulations as three flat tensor arguments: the checkpoint wrappers
         (UnslothOffloadedGradientCheckpointer in particular) give gradients only to tensors passed directly."""
@@ -1025,6 +1138,8 @@ class Block(nn.Module):
             adaln_lora_B_T_3D,
             extra_per_block_pos_emb,
             (mods_self_attn_B_T_3D, mods_cross_attn_B_T_3D, mods_mlp_B_T_3D),
+            attn_stash=attn_stash,
+            attn_reuse=attn_reuse,
         )
 
     def _forward(
@@ -1038,7 +1153,11 @@ class Block(nn.Module):
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
         adaln_mods: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        attn_stash: Optional[list] = None,
+        attn_reuse: Optional[tuple] = None,
     ) -> torch.Tensor:
+        # attn_stash / attn_reuse: only NoGradFirstPassCheckpointer passes them (--anima_ckpt_reuse_attn): the first pass
+        # fills the list with the self-attention's flash output and softmax_lse, the recompute gets them back as a tuple
         if use_fp32:
             # Cast to float32 for better numerical stability in residual connections. Each module will cast back to float16 by enclosing autocast context.
             x_B_T_H_W_D = x_B_T_H_W_D.float()
@@ -1079,12 +1198,22 @@ class Block(nn.Module):
         # 1. Self-attention
         normalized_x = _adaln_fn(x_B_T_H_W_D, self.layer_norm_self_attn, scale_self_attn_B_T_1_1_D, shift_self_attn_B_T_1_1_D)
         x_flat = normalized_x.flatten(1, 3)
-        result = self.self_attn(
-            x_flat,
-            attn_params,
-            x_flat,
-            rope_cos_sin=rope_cos_sin,
-        ).unflatten(1, (T, H, W))
+        if attn_stash is None and attn_reuse is None:
+            result = self.self_attn(
+                x_flat,
+                attn_params,
+                x_flat,
+                rope_cos_sin=rope_cos_sin,
+            ).unflatten(1, (T, H, W))
+        else:  # --anima_ckpt_reuse_attn: the first pass stores the flash output, the recompute gets it back
+            result = self.self_attn(
+                x_flat,
+                attn_params,
+                x_flat,
+                rope_cos_sin=rope_cos_sin,
+                stash=attn_stash,
+                reuse=attn_reuse,
+            ).unflatten(1, (T, H, W))
         x_B_T_H_W_D = fn["gated_residual"](x_B_T_H_W_D, gate_self_attn_B_T_1_1_D, result)
 
         # 2. Cross-attention
@@ -1160,6 +1289,21 @@ class Block(nn.Module):
                     extra_per_block_pos_emb,
                     *mods,
                     use_reentrant=False,
+                )
+            elif CKPT_NOGRAD_MERGED and x_B_T_H_W_D.requires_grad:
+                # --anima_ckpt_nograd_merged: no offload, the first pass under no_grad (NoGradFirstPassCheckpointer)
+                return nograd_checkpoint(
+                    forward_fn,
+                    self,
+                    x_B_T_H_W_D,
+                    emb_B_T_D,
+                    crossattn_emb,
+                    attn_params,
+                    use_fp32,
+                    rope_cos_sin,
+                    adaln_lora_B_T_3D,
+                    extra_per_block_pos_emb,
+                    *mods,
                 )
             else:
                 # Standard gradient checkpointing (no offload)
@@ -1577,10 +1721,11 @@ class Anima(nn.Module):
             adaln_mods = None
             if hoist_adaln and block.training and block.gradient_checkpointing:  # Block.forward's checkpoint condition
                 emb_in, lora_in = t_embedding_B_T_D, adaln_lora_B_T_3D
-                if block.unsloth_offload_checkpointing:
+                if block.unsloth_offload_checkpointing or (CKPT_NOGRAD_MERGED and not block.cpu_offload_checkpointing):
                     # UnslothOffloadedGradientCheckpointer.backward sums the Block's three modulation gradients into its
                     # emb / adaln_lora inputs before they join the sum over Blocks; a view per Block keeps that order
                     # (bit-identical grads when t_embedder trains). torch_checkpoint(use_reentrant=False) sums flat.
+                    # NoGradFirstPassCheckpointer (--anima_ckpt_nograd_merged) sums per Block like the Unsloth one.
                     emb_in, lora_in = _per_block_grad_sum(emb_in), _per_block_grad_sum(lora_in)
                 adaln_mods = block.compute_adaln_modulations(emb_in, lora_in, use_fp32)
             x_B_T_H_W_D = block(

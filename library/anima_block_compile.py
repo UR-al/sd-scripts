@@ -74,6 +74,12 @@
 # LoKr / LoRA: 1) x checkpointing regimes (GC: no-grad forward + grad forward + backward; the un-checkpointed tiers:
 # forward + backward) x bands (1 with --anima_block_compile_dynamic union). The recompile limit is raised accordingly.
 # All Blocks share the entries (dynamo keys on the code object; the parameters are graph inputs).
+# --anima_ckpt_nograd_merged (2026-11-14, anima_models.NoGradFirstPassCheckpointer) replaces the plain checkpoint's
+# "grad forward twice" by a no-grad forward that reads the cached merged LoKr weights (graph inputs; lycoris_fast._CKPT_PASS
+# == 1) and a grad forward for the recompute (_CKPT_PASS == 2): two more entries per Block dtype regime next to the plain
+# grad graph the un-checkpointed tiers keep using. With --anima_ckpt_reuse_attn the first-pass graph returns the
+# self-attention output and softmax_lse (a list argument it appends to) and the recompute graph takes them as inputs,
+# their token axis marked like x's (_mark_dynamic).
 #
 # The design follows sorryhyun/anima_lora (library/anima/models.py compile_blocks / _make_dynamic_seq_forward,
 # library/datasets/buckets.py cluster_token_bands / band_for_seq, library/runtime/harness.py isolate_compile_cache),
@@ -263,8 +269,10 @@ def _mark_long_crossattn_dynamic(anima: torch.nn.Module, args: tuple, kwargs: di
         torch._dynamo.maybe_mark_dynamic(context, 1)
 
 
-def _mark_dynamic(x: torch.Tensor, rope, bands: Sequence[Tuple[int, int]], soft: bool) -> None:
-    """Mark the token axis (dim 2 of the fake-5D x, dim 0 of each RoPE table) dynamic for the band containing it."""
+def _mark_dynamic(x: torch.Tensor, rope, bands: Sequence[Tuple[int, int]], soft: bool, attn_reuse=None) -> None:
+    """Mark the token axis (dim 2 of the fake-5D x, dim 0 of each RoPE table) dynamic for the band containing it.
+    attn_reuse: --anima_ckpt_reuse_attn's stored self-attention (out (B, L, heads, head_dim), softmax_lse (B, heads, L))
+    handed to a recompute: their token axis is marked the same way, or every token count would compile its own graph."""
     seq = int(x.shape[2])
     band = band_for_seq(bands, seq)
     if band is None:
@@ -278,12 +286,18 @@ def _mark_dynamic(x: torch.Tensor, rope, bands: Sequence[Tuple[int, int]], soft:
         if rope is not None:
             torch._dynamo.maybe_mark_dynamic(rope[0], 0)
             torch._dynamo.maybe_mark_dynamic(rope[1], 0)
+        if attn_reuse is not None:
+            torch._dynamo.maybe_mark_dynamic(attn_reuse[0], 1)
+            torch._dynamo.maybe_mark_dynamic(attn_reuse[1], 2)
     else:
         lo, hi = band
         torch._dynamo.mark_dynamic(x, 2, min=lo, max=hi)
         if rope is not None:
             torch._dynamo.mark_dynamic(rope[0], 0, min=lo, max=hi)
             torch._dynamo.mark_dynamic(rope[1], 0, min=lo, max=hi)
+        if attn_reuse is not None:
+            torch._dynamo.mark_dynamic(attn_reuse[0], 1, min=lo, max=hi)
+            torch._dynamo.mark_dynamic(attn_reuse[1], 2, min=lo, max=hi)
 
 
 class CompiledBlocks:
@@ -445,7 +459,7 @@ def compile_blocks(
                 state.eager_calls += 1
                 return orig(x, *args, **kw)
             if bands and x.dim() == 5:
-                _mark_dynamic(x, _rope_of(args, kw), bands, soft_marks)
+                _mark_dynamic(x, _rope_of(args, kw), bands, soft_marks, kw.get("attn_reuse"))
             _mark_long_crossattn_dynamic(anima, args, kw)
             state.compiled_calls += 1
             dev = x.device.type

@@ -145,6 +145,9 @@ class Anima38TrainerMixin:
             self.sample_prompts_te_outputs,
             negative_mode=args.anima38_sample_negative,
         )
+        # this override replaces AnimaNetworkTrainer.sample_images (another sampler); what that one does after a sample
+        # round (--anima_ckpt_nograd_merged: the merged-weight cache is invalidated) lives in after_sample_images
+        self.after_sample_images()
 
     def update_metadata(self, metadata, args):
         super().update_metadata(metadata, args)

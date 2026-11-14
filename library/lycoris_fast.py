@@ -14,6 +14,10 @@
 #    LoKr+DoRA weight once per sampling round instead of on every call. Bit-identical to the per-call rebuild under
 #    autocast. While cached, each base weight waits in CPU RAM (or stays there with RamTorch), so the cache takes the
 #    base weights' place in VRAM instead of adding to it.
+# 3) Checkpointed Blocks (--anima_ckpt_nograd_merged, 2026-11-14; off by default): the no-grad first pass of
+#    anima_models.nograd_checkpoint reads each merged weight from a per-module tensor built once per optimizer step (the
+#    adapter only changes there; with gradient accumulation 10 that is one rebuild instead of ten), see the "checkpoint
+#    merged-weight cache" section below. The grad-mode recompute keeps rebuilding (it needs the LoKr gradients).
 #
 # The class-level patch only lives in the process that calls install_fast_lokr_forward (moss_train_network.py,
 # anima_train_network.py).
@@ -99,6 +103,144 @@ def enable_compiled_rebuild(enabled: bool = True) -> None:
     _REBUILD.enable(enabled)
 
 
+# ---- checkpoint merged-weight cache (--anima_ckpt_nograd_merged, 2026-11-14) -------------------------------------------
+# A checkpointed Block runs its forward twice per micro-step (first pass + recompute) and the merged LoKr+DoRA weight was
+# rebuilt on both (2.77B elements over Anima 2.9B's adapted Linears). With gradient accumulation the adapter only changes
+# at the optimizer step, so the no-grad first pass of anima_models.nograd_checkpoint reads a per-module tensor instead:
+# * built by the same rebuild function, inputs and output dtype as _fast_forward (ckpt_merged_refresh), in place into a
+#   tensor that lives for the run (a compiled Block graph takes it as an input: no recompile, no new allocations);
+# * rebuilt when its inputs changed, by two independent checks:
+#   - ckpt_merged_invalidate(): the trainer calls it from a global optimizer-step hook (every optimizer.step() of the
+#     process), after each optimizer step of its loop (weight noise and max-norm scaling run before that call) and after
+#     sample images. This one is load-bearing: optimizers that write through `p.data` (LoraEasyCustomOptimizer's CAME:
+#     p.data.copy_) do not bump the parameter's version counter;
+#   - the key: version counter and data pointer of lokr_w1 / lokr_w2 / dora_scale / the base weight, the multiplier and
+#     the output dtype. It sees every write through the parameter itself (load_state_dict, p.copy_ / p.add_, an optimizer
+#     updating p in place) and a `.data = ...` swap, whoever made it. NOT seen by either: an in-place write through
+#     `p.data` outside optimizer.step and outside the trainer's step - the Anima trainer has none between optimizer steps;
+# * read only while _CKPT_PASS says the caller is that checkpoint: sampling, validation and un-checkpointed Blocks never
+#   see it (their per-call rebuild is unchanged).
+# The recompute (_CKPT_PASS == 2) still rebuilds with grad for the LoKr gradients, but hands F.linear the cached tensor's
+# bits (_FirstPassBits): its activations are then the first pass's whatever rounding the two rebuilds differ by (an eager
+# rebuild here, one fused into the compiled Block graph there), which --anima_ckpt_reuse_attn relies on.
+# Memory: one weight in the autocast dtype per cached module, i.e. 2 bytes per weight element of the cached Linears
+# (ckpt_merged_bytes reports it).
+_CKPT_PASS = 0  # 1: the no-grad first pass of anima_models.nograd_checkpoint, 2: its grad-mode recompute, 0: anything else
+_CKPT_GENERATION = 0  # part of every key; ckpt_merged_invalidate() bumps it
+
+
+class _FirstPassBits(torch.autograd.Function):
+    """forward: `cached` (the merged weight the first pass used); backward: the gradient goes to `rebuilt` unchanged, as
+    if F.linear had read it. No arithmetic on the weight, so the value is `cached` bit for bit."""
+
+    @staticmethod
+    def forward(ctx, rebuilt, cached):
+        return cached.view_as(cached)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad, None
+
+
+@contextmanager
+def ckpt_pass(n: int):
+    """_CKPT_PASS = n inside the block (anima_models.NoGradFirstPassCheckpointer: 1 around the first pass, 2 around the
+    recompute). A module global: a compiled Block graph guards on it, one graph per value."""
+    global _CKPT_PASS
+    prev = _CKPT_PASS
+    _CKPT_PASS = n
+    try:
+        yield
+    finally:
+        _CKPT_PASS = prev
+
+
+def ckpt_merged_modules(model: nn.Module, linears) -> list:
+    """The LoKr modules wrapping these Linears of `model` that _fast_forward can serve from a cached merged weight (the
+    sample cache's rule, _cache_targets, without RamTorch-streamed bases: their weights are not in VRAM to merge from).
+    Nothing while the fast forward is not installed (--anima_stock_lycoris, which the trainer refuses with the flag):
+    LyCORIS's stock forward never reads the cache, building it would only cost VRAM and a rebuild per optimizer step."""
+    if _STOCK_FORWARD is None:
+        return []
+    keep = {id(m) for m in linears}
+    return [lokr for module, _, lokr in _cache_targets(model)
+            if id(module) in keep and not getattr(lokr, "is_ramtorch_org", False)]
+
+
+def _ckpt_key(lokr, out_dtype) -> Optional[tuple]:
+    """What the cached merged weight of `lokr` was built from; None where _fast_forward would not take the fast path."""
+    weight = lokr.org_module[0].weight
+    if not (out_dtype in (torch.bfloat16, torch.float16) and lokr._cached_dtype == lokr.dora_scale.dtype
+            and torch.promote_types(weight.dtype, lokr._cached_dtype) == lokr._cached_dtype):
+        return None
+    w1, w2, dora = lokr.lokr_w1, lokr.lokr_w2, lokr.dora_scale
+    return (_CKPT_GENERATION, out_dtype, lokr._multiplier, w1._version, w1.data_ptr(), w2._version, w2.data_ptr(),
+            dora._version, dora.data_ptr(), weight._version, weight.data_ptr())
+
+
+def ckpt_merged_refresh(lokrs, out_dtype) -> tuple:
+    """Make every module's cached merged weight current for its parameters as they are now (rebuilt only where the key
+    changed) and return the keys. Call it right before the no-grad first pass, under that pass's autocast dtype."""
+    keys = []
+    for lokr in lokrs:
+        d = lokr.__dict__
+        key = _ckpt_key(lokr, out_dtype)
+        keys.append(key)
+        if key is None:  # not a fast-path module under this autocast: no cache, the forward rebuilds per call
+            d.pop("_ckpt_merged", None)
+            d.pop("_ckpt_key", None)
+            continue
+        if d.get("_ckpt_key") == key:
+            continue
+        with torch.no_grad():
+            weight = lokr.get_org_weight_for_compute(lokr.org_module[0].weight.device).detach()
+            lokr_scale = d.get("_fast_lokr_scale")
+            if lokr_scale is None:
+                lokr_scale = d["_fast_lokr_scale"] = float(lokr.scale)
+            merged = _REBUILD.get(weight)["rebuild"](weight, lokr.lokr_w1, lokr.lokr_w2, lokr_scale, lokr.dora_scale,
+                                                    lokr.multiplier_buf, lokr._dora_eps, lokr._dora_norm_dims, out_dtype)
+            cached = d.get("_ckpt_merged")
+            if cached is None or cached.shape != merged.shape or cached.dtype != merged.dtype or cached.device != merged.device:
+                d["_ckpt_merged"] = merged  # the first build: this tensor is the cache from now on
+            else:
+                cached.copy_(merged)  # in place: the object a compiled Block graph reads stays the same
+        d["_ckpt_key"] = key
+    return tuple(keys)
+
+
+def ckpt_merged_current(lokrs, keys: tuple, out_dtype) -> bool:
+    """True while every cached weight still is what `keys` (ckpt_merged_refresh's result at the first pass) describes:
+    neither a parameter nor the cache changed since. The recompute checks it before it trusts the cached bits."""
+    return len(keys) == len(lokrs) and all(
+        key == _ckpt_key(lokr, out_dtype) and (key is None or lokr.__dict__.get("_ckpt_key") == key)
+        for lokr, key in zip(lokrs, keys))
+
+
+def ckpt_merged_invalidate() -> None:
+    """Every cached merged weight is rebuilt at its next use (the tensors stay). Called whenever the adapter may have
+    changed: every optimizer.step(), the end of the trainer's optimizer step, after sample images."""
+    global _CKPT_GENERATION
+    _CKPT_GENERATION += 1
+
+
+def ckpt_merged_release(model: nn.Module) -> int:
+    """Drop the cached merged weights of the LoKr modules applied to `model`; returns the bytes they held."""
+    freed = 0
+    for _, _, lokr in _cache_targets(model):
+        cached = lokr.__dict__.pop("_ckpt_merged", None)
+        lokr.__dict__.pop("_ckpt_key", None)
+        if cached is not None:
+            freed += cached.numel() * cached.element_size()
+    return freed
+
+
+def ckpt_merged_bytes(model: nn.Module) -> int:
+    """Bytes held by the cached merged weights of the LoKr modules applied to `model` (what --anima_ckpt_nograd_merged
+    adds to VRAM)."""
+    cached = (lokr.__dict__.get("_ckpt_merged") for _, _, lokr in _cache_targets(model))
+    return sum(c.numel() * c.element_size() for c in cached if c is not None)
+
+
 def _fast_forward(self, x, *args, **kwargs):
     # Under autocast F.linear casts its float input to the autocast dtype, and the stock x.to(fp32) before it is exact for
     # these dtypes, so any float input takes the same path (Anima feeds fp32 LayerNorm outputs, MOSS bf16).
@@ -113,13 +255,24 @@ def _fast_forward(self, x, *args, **kwargs):
         and torch.promote_types(org.weight.dtype, self._cached_dtype) == self._cached_dtype  # bf16/fp16 base, fp32 net
     ):
         return _STOCK_FORWARD(self, x, *args, **kwargs)
-    weight = self.get_org_weight_for_compute(x.device).detach()  # stock uses .data (no grad into the base)
-    lokr_scale = self.__dict__.get("_fast_lokr_scale")
-    if lokr_scale is None:  # alpha / factor: a numpy scalar in LyCORIS; a plain float keeps torch.compile's guards simple
-        lokr_scale = self.__dict__["_fast_lokr_scale"] = float(self.scale)
-    rebuild = _REBUILD.get(x)["rebuild"]
-    merged = rebuild(weight, self.lokr_w1, self.lokr_w2, lokr_scale, self.dora_scale, self.multiplier_buf, self._dora_eps,
-                     self._dora_norm_dims, torch.get_autocast_dtype(device_type))
+    # --anima_ckpt_nograd_merged: inside anima_models.nograd_checkpoint a module may carry a merged weight that was built
+    # for exactly these parameter values (ckpt_merged_refresh). _CKPT_PASS is 0 everywhere else: cached stays None and the
+    # lines below are the forward as it was.
+    cached = self.__dict__.get("_ckpt_merged") if _CKPT_PASS else None
+    if cached is not None and cached.dtype != torch.get_autocast_dtype(device_type):
+        cached = None  # built for another autocast dtype than this call runs under: rebuild as usual
+    if cached is not None and _CKPT_PASS == 1:  # the no-grad first pass: no rebuild
+        merged = cached
+    else:
+        weight = self.get_org_weight_for_compute(x.device).detach()  # stock uses .data (no grad into the base)
+        lokr_scale = self.__dict__.get("_fast_lokr_scale")
+        if lokr_scale is None:  # alpha / factor: a numpy scalar in LyCORIS; a plain float keeps torch.compile's guards simple
+            lokr_scale = self.__dict__["_fast_lokr_scale"] = float(self.scale)
+        rebuild = _REBUILD.get(x)["rebuild"]
+        merged = rebuild(weight, self.lokr_w1, self.lokr_w2, lokr_scale, self.dora_scale, self.multiplier_buf, self._dora_eps,
+                         self._dora_norm_dims, torch.get_autocast_dtype(device_type))
+        if cached is not None:  # the recompute (_CKPT_PASS == 2): the first pass's weight bits, this rebuild's gradients
+            merged = _FirstPassBits.apply(merged, cached)
     bias = self.get_org_bias_for_compute(x.device)  # moves a RamTorch CPU bias like the stock forward
     if bias is not None:
         bias = bias.to(x.dtype)

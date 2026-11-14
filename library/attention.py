@@ -18,6 +18,11 @@ except ImportError:
     _flash_attn_forward = None
     flash_attn_func = None
 
+try:  # the backward kernel alone, for --anima_ckpt_reuse_attn (the torch custom op from torch 2.4, the plain function before)
+    from flash_attn.flash_attn_interface import _wrapped_flash_attn_backward
+except ImportError:
+    _wrapped_flash_attn_backward = None
+
 # Verify flash_attn GPU compatibility: requires Ampere (sm_80, compute capability 8.0) or newer.
 # T4 (Turing, sm_75) and older GPUs will hit "FlashAttention only supports Ampere GPUs or newer"
 # at runtime. Detect this early and disable flash_attn so callers fall back gracefully.
@@ -130,12 +135,64 @@ class AttentionParams:
             return AttentionParams(attn_mode, split_attn, img_len, attention_mask, seqlens, cu_seqlens, max_seqlen, seqlens_host)
 
 
+# ---- self-attention reuse in a checkpoint recompute (--anima_ckpt_reuse_attn, 2026-11-14; off by default) ---------------
+# anima_models.nograd_checkpoint runs a checkpointed Block twice: a no-grad first pass, and a grad-mode recompute in
+# backward that used to run the flash forward kernel again only to get the same output and softmax_lse (the recompute's
+# q, k, v come from the same weights and inputs). With the flag the first pass keeps both (ckpt_stash, a list it fills)
+# and the recompute returns the stored output and saves q, k, v, out, lse for the flash BACKWARD kernel, which is all the
+# flash autograd node needs (FlashAttnFunc.backward calls the same op with the same arguments). Only on the plain flash
+# call (no mask, no split, no dropout, head dim a multiple of 8: FlashAttnFunc pads other head dims) and only when this
+# flash-attn exposes the backward kernel on its own (flash_reuse_available); anything else leaves the stash empty and the
+# recompute runs the forward as before.
+
+
+def flash_reuse_available() -> bool:
+    """True when the recompute can call flash's backward kernel alone: flash_attn_interface._wrapped_flash_attn_backward
+    was importable (flash-attn 2.8.4 has it; an older build with only FlashAttnFunc would fail in the first backward).
+    False: nothing is stored for reuse, the recompute runs flash_attn_func again, as without --anima_ckpt_reuse_attn."""
+    return _wrapped_flash_attn_backward is not None
+
+
+def _flash_forward_with_lse(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+    """flash_attn_func(q, k, v, 0.0) plus its softmax_lse. The kernel call is the same (return_softmax only reaches it with
+    dropout), so the output is the one the plain call gives."""
+    out, softmax_lse, _ = flash_attn_func(q, k, v, 0.0, return_attn_probs=True)
+    return out, softmax_lse
+
+
+def _flash_backward(dout, q, k, v, out, softmax_lse):
+    """dq, dk, dv from the flash backward kernel, called as FlashAttnFunc.backward calls it for flash_attn_func's
+    defaults (no dropout: the rng state is not read)."""
+    dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+    _wrapped_flash_attn_backward(dout, q, k, v, out, softmax_lse, dq, dk, dv, 0.0, q.shape[-1] ** (-0.5), False, -1, -1,
+                                 0.0, None, False, rng_state=None)
+    return dq, dk, dv
+
+
+class _FlashReuse(torch.autograd.Function):
+    """The flash attention node of a recompute: the forward kernel is skipped (the first pass stored its results), the
+    backward kernel runs on this pass's q, k, v."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, out, softmax_lse):
+        ctx.save_for_backward(q, k, v, out, softmax_lse)
+        return out.view_as(out)
+
+    @staticmethod
+    def backward(ctx, dout):
+        q, k, v, out, softmax_lse = ctx.saved_tensors
+        dq, dk, dv = _flash_backward(dout, q, k, v, out, softmax_lse)
+        return dq, dk, dv, None, None
+
+
 def attention(
     qkv_or_q: Union[torch.Tensor, list],
     k: Optional[torch.Tensor] = None,
     v: Optional[torch.Tensor] = None,
     attn_params: Optional[AttentionParams] = None,
     drop_rate: float = 0.0,
+    ckpt_stash: Optional[list] = None,
+    ckpt_reuse: Optional[tuple] = None,
 ) -> torch.Tensor:
     """
     Compute scaled dot-product attention with variable sequence lengths.
@@ -149,6 +206,9 @@ def attention(
         v: Value tensor [B, L, H, D].
         attn_params: Attention parameters including mask and sequence lengths.
         drop_rate: Attention dropout rate.
+        ckpt_stash: --anima_ckpt_reuse_attn, the no-grad first pass of a checkpointed Block: an empty list that receives
+            (out, softmax_lse) of the plain flash call. None (the default): nothing is kept.
+        ckpt_reuse: the recompute of that Block: the stored (out, softmax_lse); the flash forward is not run again.
 
     Returns:
         Attention output tensor [B, L, H*D].
@@ -296,7 +356,15 @@ def attention(
             x = torch.cat(x, dim=0)
             del q, k, v
         elif attn_params.cu_seqlens is None:  # all tokens are valid
-            x = flash_attn_func(q, k, v, drop_rate)  # B, L, H, D
+            if ckpt_reuse is not None:  # a checkpoint recompute: the first pass's output, only the backward kernel later
+                x = _FlashReuse.apply(q, k, v, ckpt_reuse[0], ckpt_reuse[1])
+            elif (ckpt_stash is not None and _wrapped_flash_attn_backward is not None and drop_rate == 0.0
+                  and q.shape[-1] % 8 == 0):  # no backward op to call later: nothing stored, the recompute runs the forward
+                x, softmax_lse = _flash_forward_with_lse(q, k, v)  # the same kernel call, its softmax_lse kept too
+                ckpt_stash.append(x)
+                ckpt_stash.append(softmax_lse)
+            else:
+                x = flash_attn_func(q, k, v, drop_rate)  # B, L, H, D
             del q, k, v
         else:
             # Reshape to [(bxs), a, d]

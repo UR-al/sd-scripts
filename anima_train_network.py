@@ -34,7 +34,8 @@ from library.custom_train_functions import (
 )
 import train_network
 from library.utils import setup_logging
-from library.lycoris_fast import enable_compiled_rebuild, install_fast_lokr_forward
+from library.lycoris_fast import (ckpt_merged_bytes, ckpt_merged_invalidate, enable_compiled_rebuild,
+                                  install_fast_lokr_forward)
 from library.ramtorch_util import apply_ramtorch_to_module
 
 setup_logging()
@@ -204,6 +205,115 @@ def validate_block_compile_args(args) -> None:
         refuse("--anima_block_compile_recompile_limit must be >= 8")
 
 
+def validate_ckpt_reuse_args(args) -> None:
+    """--anima_ckpt_nograd_merged / --anima_ckpt_reuse_attn (library/anima_models.py NoGradFirstPassCheckpointer): refused
+    where the switch would silently do nothing or cannot work. Raises ValueError."""
+    nograd = bool(getattr(args, "anima_ckpt_nograd_merged", False))
+    reuse = bool(getattr(args, "anima_ckpt_reuse_attn", False))
+    if not (nograd or reuse):
+        return
+    if reuse and not nograd:
+        raise ValueError("--anima_ckpt_reuse_attn requires --anima_ckpt_nograd_merged: the stored self-attention output is"
+                         " produced by that checkpoint's no-grad first pass")
+    # the offload checkpointers and block swap keep their own checkpoint paths in Block.forward: the switch would be ignored
+    for flag in ("unsloth_offload_checkpointing", "cpu_offload_checkpointing", "blocks_to_swap"):
+        if getattr(args, flag, None):
+            raise ValueError(f"--anima_ckpt_nograd_merged replaces the plain gradient checkpoint of a Block; not with"
+                             f" --{flag}, which uses another one")
+    if getattr(args, "anima_stock_lycoris", False):
+        # prepare_anima_runtime does not install the fast LoKr+DoRA forward then, and LyCORIS's stock forward never reads
+        # the cache: it would only be built (Anima 2.9B: 4.69 GiB of VRAM, every merged weight rebuilt once more per
+        # optimizer step). lycoris_fast.ckpt_merged_modules also returns nothing while that forward is not installed.
+        raise ValueError("--anima_ckpt_nograd_merged caches the merged weights for the fork's fast LoKr+DoRA forward; not"
+                         " with --anima_stock_lycoris, whose stock LyCORIS forward never reads that cache (it would only"
+                         " cost VRAM and a rebuild per optimizer step). Remove one of the two options")
+    if not getattr(args, "gradient_checkpointing", False):
+        logger.warning("Anima: --anima_ckpt_nograd_merged / --anima_ckpt_reuse_attn change nothing without"
+                       " --gradient_checkpointing")
+    if reuse:
+        if getattr(args, "attn_mode", None) != "flash":
+            raise ValueError("--anima_ckpt_reuse_attn needs --attn_mode flash: it calls flash-attn's backward kernel with"
+                             " the output and softmax_lse the first pass stored")
+        if getattr(args, "split_attn", False):
+            raise ValueError("--anima_ckpt_reuse_attn is not supported with --split_attn (one flash call per row)")
+        if not anima_models.attention.flash_reuse_available():
+            logger.warning("Anima: --anima_ckpt_reuse_attn changes nothing with this flash-attn: it has no separate backward"
+                           " op (flash_attn_interface._wrapped_flash_attn_backward), the recompute runs the forward kernel"
+                           " as before")
+
+
+def ckpt_reuse_not_applied_warning(args) -> Optional[str]:
+    """The warning for a script that parses --anima_ckpt_nograd_merged / --anima_ckpt_reuse_attn (they are options of
+    anima_train_network.setup_parser, which anima_train_addift.py and anima_train_leco.py's dataset-backed iLECO share)
+    but never calls prepare_anima_runtime: the module switches stay off and the options do nothing there. None when no
+    option is given or the switches are on."""
+    given = [f"--{name}" for name in ("anima_ckpt_nograd_merged", "anima_ckpt_reuse_attn") if getattr(args, name, False)]
+    if not given or anima_models.CKPT_NOGRAD_MERGED:
+        return None
+    return (f"Anima: {' / '.join(given)} has no effect in this script: only anima_train_network.py applies it"
+            " (prepare_anima_runtime); the Blocks keep the plain gradient checkpoint")
+
+
+def network_trains_t_embedder(network) -> bool:
+    """True if the network has trainable modules on the DiT's timestep embedding (t_embedder / t_embedding_norm): a
+    LyCORIS preset that targets TimestepEmbedding (anima-full-no-excludes, anima-inpaint) names them
+    lora_unet_t_embedder_1_linear_1 / _2."""
+    if network is None:
+        return False
+    for name, parameter in getattr(network, "named_parameters", lambda: [])():
+        if parameter.requires_grad and ("t_embedder" in name or "t_embedding_norm" in name):
+            return True
+    return False
+
+
+def ckpt_reuse_text_grad_warning(network, train_text_encoder: bool) -> Optional[str]:
+    """The warning for --anima_ckpt_nograd_merged (switched on) with a trained llm_adapter, text encoder or t_embedder;
+    None otherwise. The checkpoint node hands back one gradient per Block for a tensor that enters every Block from
+    outside - the text conditioning (crossattn_emb: the trainer marks it requires_grad under gradient checkpointing) and
+    the timestep embedding (emb / adaln_lora from t_embedder) - summed inside the Block in that tensor's dtype before the
+    sum over Blocks; the plain checkpoint sums every use flat. Whatever is trained behind such a tensor gets gradients
+    that differ from the flag-off run by that rounding (t_embedder LoKr+DoRA on a 4-Block toy: up to ~1e-2 relative on a
+    bf16 stream, ~4e-7 with --anima_stream_fp32; tests/test_anima_ckpt_reuse_review2.py); every other LoKr / DoRA
+    gradient is not affected."""
+    if not anima_models.CKPT_NOGRAD_MERGED:
+        return None
+    from library.anima38.training import network_trains_llm_adapter
+
+    text = [name for name, on in (("llm_adapter", network_trains_llm_adapter(network)),
+                                  ("the text encoder", bool(train_text_encoder))) if on]
+    timestep = network_trains_t_embedder(network)
+    trained = text + (["t_embedder"] if timestep else [])
+    if not trained:
+        return None
+    names = trained[0] if len(trained) == 1 else ", ".join(trained[:-1]) + " and " + trained[-1]
+    if text and timestep:
+        summed = ("the text-conditioning and timestep-embedding gradients are summed per Block first (the text"
+                  " conditioning in its fp16 / bf16 dtype, the timestep embedding in the stream's dtype: fp32 with"
+                  " --anima_stream_fp32)")
+    elif timestep:
+        summed = ("the timestep-embedding gradient is summed per Block first (in the stream's dtype: fp32 with"
+                  " --anima_stream_fp32, else the training dtype)")
+    else:
+        summed = "the text-conditioning gradient is summed per Block first (in its fp16 / bf16 dtype)"
+    rest = "all other LoKr / DoRA gradients are unchanged" if timestep else "the DiT's LoKr / DoRA gradients are unchanged"
+    return (f"Anima: --anima_ckpt_nograd_merged with {names} trained: {summed}, so those gradients differ from the"
+            f" flag-off run by rounding (not bit-identical); {rest}")
+
+
+_CKPT_STEP_HOOK = None  # the handle of the global optimizer-step hook below (registered once per process)
+
+
+def invalidate_ckpt_merged_on_optimizer_steps() -> None:
+    """--anima_ckpt_nograd_merged: every optimizer.step() of the process invalidates the checkpoint merged-weight cache
+    (lycoris_fast.ckpt_merged_invalidate). A global torch.optim hook, so it does not depend on where the training loop
+    steps: the cache's own keys cannot see an optimizer that writes through p.data (CAME does)."""
+    global _CKPT_STEP_HOOK
+    if _CKPT_STEP_HOOK is None:
+        from torch.optim.optimizer import register_optimizer_step_post_hook
+
+        _CKPT_STEP_HOOK = register_optimizer_step_post_hook(lambda optimizer, args, kwargs: ckpt_merged_invalidate())
+
+
 def validate_stream_args(args) -> None:
     """--anima_stream_fp32: refused where the fp32 parts could not run or the switch would be skipped. Raises ValueError."""
     if not getattr(args, "anima_stream_fp32", False):
@@ -246,6 +356,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         self._ckpt_modes_logged = set()  # per-token-count checkpointing modes announced once (get_noise_pred_and_target)
         self._train_dataset_group = None  # --anima_block_compile: the buckets' token counts (after_network_loaded)
         self._tier_timer = None  # --anima_tier_timing: library/tier_timing.TierTimer, created at the first micro-step
+        self._ckpt_merged_unet = None  # --anima_ckpt_nograd_merged: the DiT, for the one-time cache size log (on_epoch_end)
+        self._ckpt_merged_logged = False
         self._stream_fp32 = False  # --anima_stream_fp32: the DiT was switched (prepare_unet_with_accelerator)
         self._micro_batch_logged = set()  # per-sample token counts whose chunking was announced (split_batch_for_backward)
         # Cache of zero padding masks keyed by (batch, height, width, dtype, device).
@@ -478,6 +590,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         self._train_dataset_group = train_dataset_group
         validate_block_compile_args(args)  # --anima_block_compile: no RamTorch / block swap / accelerate compile / stock LyCORIS
         validate_stream_args(args)  # --anima_stream_fp32: no full_bf16 / full_fp16 / deepspeed / text-encoder-only training
+        validate_ckpt_reuse_args(args)  # --anima_ckpt_nograd_merged / --anima_ckpt_reuse_attn: plain checkpoint, flash
+        not_applied = ckpt_reuse_not_applied_warning(args)  # anima_train_addift.py / iLECO: parsed, never switched on
+        if not_applied:
+            logger.warning(not_applied)
         validate_tier_timing_args(args)  # --anima_tier_timing_every >= 1
 
         if args.unsloth_offload_checkpointing:
@@ -1226,6 +1342,12 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def after_network_loaded(self, args, accelerator, network, text_encoders, unet):
         """--anima_block_compile: torch.compile every Block's _forward with the (applied, loaded) network inside the graphs;
         the token bands come from the training buckets (library/anima_block_compile.py)."""
+        # --anima_ckpt_nograd_merged with a trained llm_adapter / text encoder / t_embedder: one line, not an error (the
+        # network is applied by now, so LyCORIS's llm_adapter and t_embedder modules are visible)
+        if anima_models.CKPT_NOGRAD_MERGED:
+            text_grad = ckpt_reuse_text_grad_warning(network, self.is_train_text_encoder(args))
+            if text_grad:
+                logger.warning(text_grad)
         if not getattr(args, "anima_block_compile", False):
             return
         anima = accelerator.unwrap_model(unet)
@@ -1283,6 +1405,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             self._tier_timer.stop()
 
     def on_optimizer_step_end(self, args, accelerator, global_step: int, is_tracking: bool):
+        if anima_models.CKPT_NOGRAD_MERGED:
+            # --anima_ckpt_nograd_merged: the adapter just changed (optimizer.step, or step_func which has no step hook,
+            # then weight noise / max-norm scaling): the cached merged weights are rebuilt at their next use
+            ckpt_merged_invalidate()
         timer = self._tier_timer
         if timer is None or global_step % max(1, int(getattr(args, "anima_tier_timing_every", 50) or 50)):
             return
@@ -1293,6 +1419,10 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             logger.info(timer.format_line(stats, what=f"step {global_step}"))
 
     def on_epoch_end(self, args, accelerator, epoch: int, global_step: int):
+        if anima_models.CKPT_NOGRAD_MERGED and not self._ckpt_merged_logged:
+            self._ckpt_merged_logged = True  # once, after an epoch has touched every tier: what the cache holds
+            held = ckpt_merged_bytes(accelerator.unwrap_model(self._ckpt_merged_unet)) if self._ckpt_merged_unet else 0
+            logger.info(f"--anima_ckpt_nograd_merged: {held / 2**30:.2f} GiB of cached merged LoKr weights")
         if self._tier_timer is not None:
             logger.info(self._tier_timer.format_line(self._tier_timer.epoch_report(), what=f"epoch {epoch + 1}"))
 
@@ -1316,6 +1446,15 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 text_encoding_strategy,
                 self.sample_prompts_te_outputs,
             )
+        self.after_sample_images()
+
+    def after_sample_images(self) -> None:
+        """The end of every sample round, whichever sampler ran it: sample_images above and the override that does not
+        call it (library/anima38/trainer.py Anima38TrainerMixin.sample_images) both end here."""
+        if anima_models.CKPT_NOGRAD_MERGED:
+            # sampling never reads the checkpoint cache (it has its own, lycoris_fast.cached_lokr_weights, which parks the
+            # base weights in RAM and brings them back as new tensors): rebuild at the next training step
+            ckpt_merged_invalidate()
 
     def _lycoris_fix_sampler_timestep_scale(self):
         # LyCORIS fixed paths: the sampler calls dit(x, sigma, ...) with sigma in [0, 1]; training masks use sigma*1000
@@ -1398,6 +1537,8 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         is_train=True,
     ):
         anima: anima_models.Anima = unet
+        if self._ckpt_merged_unet is None and anima_models.CKPT_NOGRAD_MERGED:
+            self._ckpt_merged_unet = unet
         if is_train and args.gradient_checkpointing and any(checkpoint_token_limits(args)):
             m = accelerator.unwrap_model(anima)
             tokens = micro_step_tokens(latents, anima_patch_spatial(m))  # rows x tokens per sample: what the memory scales with
@@ -1815,6 +1956,13 @@ def prepare_anima_runtime(args) -> None:
     # torch.compile would nest inside the Block graphs (recompile-budget storms), so both stay eager there.
     anima_models.enable_elementwise_compile(not args.anima_no_compile and not block_compile)
     anima_models.ADALN_HOIST = bool(getattr(args, "anima_adaln_hoist", False))
+    # the plain Block checkpoint with a no-grad first pass + cached merged LoKr weights / the stored self-attention output
+    anima_models.CKPT_NOGRAD_MERGED = bool(getattr(args, "anima_ckpt_nograd_merged", False))
+    anima_models.CKPT_REUSE_ATTN = bool(getattr(args, "anima_ckpt_reuse_attn", False))
+    if anima_models.CKPT_NOGRAD_MERGED:
+        invalidate_ckpt_merged_on_optimizer_steps()
+        logger.info("Anima: checkpointed Blocks run a no-grad first pass with merged LoKr weights cached per optimizer step"
+                    + (", the recompute reuses the stored self-attention output" if anima_models.CKPT_REUSE_ATTN else ""))
     # The fast forward's LoKr+DoRA weight rebuild, fused by torch.compile (~1 bf16 ulp; 1536 b1: 2.66 -> 2.38 s/step)
     enable_compiled_rebuild(not (args.anima_stock_lycoris or args.anima_no_compile or args.anima_no_lokr_compile
                                  or block_compile))
@@ -1865,6 +2013,27 @@ def setup_parser() -> argparse.ArgumentParser:
                              " checkpoint instead of inside it (forward, recompute and backward of the 6 modulation Linears"
                              " per Block); same results. Off by default: measured +-0 s/step on Anima 2.9B 4-tier batch 1"
                              " (library/anima_models.py ADALN_HOIST)")
+    parser.add_argument("--anima_ckpt_nograd_merged", action="store_true",
+                        help="gradient checkpointing without offload: run a checkpointed Block's first pass under no_grad"
+                             " on the GPU (the plain checkpoint runs it in grad mode) and recompute + backpropagate it in"
+                             " backward, and let that first pass read each merged LoKr+DoRA weight from a tensor that is"
+                             " rebuilt only when the adapter changed (once per optimizer step under gradient"
+                             " accumulation) instead of on every call. Same math; costs one fp16/bf16 copy of the"
+                             " attention / MLP weights of the checkpointed Blocks in VRAM (Anima 2.9B: ~4.7 GiB, held for"
+                             " the whole run, also while sample images are made). LoKr / DoRA gradients are those of the"
+                             " plain checkpoint; gradients that pass through the text conditioning (llm_adapter or text"
+                             " encoder training) or the timestep embedding are summed per Block first and differ from it"
+                             " by rounding (a warning at start-up)."
+                             " Not with --unsloth_offload_checkpointing, --cpu_offload_checkpointing, --blocks_to_swap or"
+                             " --anima_stock_lycoris."
+                             " Off by default (library/anima_models.py NoGradFirstPassCheckpointer)")
+    parser.add_argument("--anima_ckpt_reuse_attn", action="store_true",
+                        help="with --anima_ckpt_nograd_merged and --attn_mode flash: keep each checkpointed Block's"
+                             " self-attention output and softmax_lse from the first pass and reuse them in the recompute"
+                             " (only flash-attn's backward kernel runs there, not its forward again). Same math; the"
+                             " stored tensors live until the Block's backward (2048 tier of Anima 2.9B: ~2.5 GiB)."
+                             " Does nothing (a warning) with a flash-attn build that lacks the separate backward op."
+                             " Off by default (library/attention.py _FlashReuse)")
     parser.add_argument("--anima_stream_fp32", action="store_true",
                         help="run the residual stream, adaLN modulation, q/k norms, RoPE, embedders and final layer in fp32"
                              " around the Blocks' attention and MLP Linears, which stay in the training dtype (bf16 or fp16"
