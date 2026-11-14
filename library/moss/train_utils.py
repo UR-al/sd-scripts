@@ -68,6 +68,17 @@ def add_moss_training_arguments(parser) -> None:
                              " differ by ~1 bf16 ulp)")
     parser.add_argument("--moss_stock_lycoris", action="store_true",
                         help="use LyCORIS's stock LoKr forward and per-call sample merges (slower; same results)")
+    parser.add_argument("--moss_block_compile", action="store_true",
+                        help="torch.compile every joint MossBlock's math with the LyCORIS / LoRA modules inside the graph"
+                             " (library/moss/block_compile.py, the --anima_block_compile design): fewer Python module calls"
+                             " and kernel launches per micro-step. The first steps compile (minutes on Windows). Not with"
+                             " RamTorch, --blocks_to_swap, --torch_compile, stock LyCORIS or DyLoRA. Default off")
+    parser.add_argument("--moss_block_compile_backend", choices=["inductor", "aot_eager", "eager"], default="inductor",
+                        help="--moss_block_compile: torch.compile backend (default inductor)")
+    parser.add_argument("--moss_block_compile_mode", type=str, default=None,
+                        help="--moss_block_compile: torch.compile mode (default: torch's default)")
+    parser.add_argument("--moss_block_compile_recompile_limit", type=int, default=64,
+                        help="--moss_block_compile: dynamo recompile limit (>= 8; default 64)")
     parser.add_argument("--moss_no_sample_cache", action="store_true",
                         help="sample images without the merged LoKr weight cache (~9 GB less VRAM while sampling; slower)")
     parser.add_argument("--moss_lora_exclude_blocks", type=moss_exclude_blocks_arg, default="",
@@ -106,6 +117,34 @@ def _datasets(groups: Sequence) -> List:
         if group is not None:
             out.extend(getattr(group, "datasets", [group]))
     return out
+
+
+def validate_moss_block_compile_args(args) -> None:
+    """--moss_block_compile (library/moss/block_compile.py): refused with what the compiled block graphs cannot hold or
+    would re-trace every step (the --anima_block_compile rules). Raises ValueError."""
+    if not getattr(args, "moss_block_compile", False):
+        return
+
+    def refuse(why: str):
+        raise ValueError(f"MOSS-Image: --moss_block_compile {why}")
+
+    if getattr(args, "use_ramtorch", False) or getattr(args, "use_ramtorch_network", False):
+        refuse("is not supported with RamTorch (use_ramtorch): the streamed weights change device inside the graph."
+               " Turn one of them off (RamTorch for VRAM, block compile for speed)")
+    if (getattr(args, "blocks_to_swap", None) or 0) > 0:
+        refuse("is not supported with --blocks_to_swap: a swapped block's weights change device between calls")
+    if getattr(args, "torch_compile", False):
+        refuse("is not supported together with --torch_compile (the blocks are compiled here)")
+    module = str(getattr(args, "network_module", "") or "")
+    if module.startswith("lycoris") and (getattr(args, "moss_stock_lycoris", False) or getattr(args, "lycoris_stock", False)):
+        refuse("needs the fork's LyCORIS paths (not --moss_stock_lycoris / --lycoris_stock): the stock forwards read"
+               " org_module[0] through a bound method, which dynamo cannot trace")
+    net_kwargs = dict(item.split("=", 1) for item in (getattr(args, "network_args", None) or []) if "=" in item)
+    algo = str(net_kwargs.get("algo", "lora") or "lora").strip().lower()
+    if (module.startswith("lycoris") and algo == "dylora") or module == "networks.dylora":
+        refuse("is not supported with DyLoRA: it draws a random rank every forward (a graph per rank)")
+    if int(getattr(args, "moss_block_compile_recompile_limit", 64) or 0) < 8:
+        refuse("needs --moss_block_compile_recompile_limit >= 8")
 
 
 def validate_moss_args(args, train_dataset_group, val_dataset_group) -> None:
@@ -154,6 +193,7 @@ def validate_moss_args(args, train_dataset_group, val_dataset_group) -> None:
         if not args.gradient_checkpointing:
             logger.warning("unsloth_offload_checkpointing is on, enabling gradient_checkpointing")
             args.gradient_checkpointing = True
+    validate_moss_block_compile_args(args)
     if getattr(args, "hf_scale", 0.0) and getattr(args, "hf_patch", 1) != 1:
         logger.warning("MOSS latents are already 2x2 packed tokens: setting hf_patch=1")
         args.hf_patch = 1

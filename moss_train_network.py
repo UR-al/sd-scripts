@@ -9,6 +9,7 @@
 #   - LyCORIS: network_args "preset=moss" (or "moss-text" to add the two text refiner blocks).
 
 import argparse
+from types import SimpleNamespace
 from typing import Optional, Union
 
 import torch
@@ -23,6 +24,7 @@ from library import anima_train_utils, attention, sd3_train_utils, strategy_base
 from library.custom_train_functions import apply_snr_weight_for_flow_matching, maybe_apply_antithetic_noise_pairing
 from library.moss import captions, flow, strategy
 from library.moss import train_utils as moss_train_utils
+from library.moss import block_compile as moss_block_compile
 from library.lycoris_fast import enable_compiled_rebuild, install_fast_lokr_forward
 from library.moss.lycoris_presets import register_moss_lycoris_presets
 from library.moss.models import MOSS_DIT_CONFIG, MossTransformer, enable_elementwise_compile
@@ -350,7 +352,44 @@ class MossNetworkTrainer(train_network.NetworkTrainer):
 
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
         self.clear_tlora_mask_if_needed()  # a training mask may still be set (kept for checkpoint recomputation)
-        moss_train_utils.sample_images(accelerator, args, epoch, global_step, unet, vae, self.sample_prompts_te_outputs)
+        with moss_block_compile.pause():  # --moss_block_compile: sampling runs the eager blocks (no extra graphs)
+            moss_train_utils.sample_images(accelerator, args, epoch, global_step, unet, vae, self.sample_prompts_te_outputs)
+
+    def after_network_loaded(self, args, accelerator, network, text_encoders, unet):
+        """--moss_block_compile: torch.compile every joint block's _forward with the (applied, loaded) network inside the
+        graphs (library/moss/block_compile.py)."""
+        if not getattr(args, "moss_block_compile", False):
+            return
+        model = accelerator.unwrap_model(unet)
+        fixes_on = getattr(self, "_lycoris_fix_on", False)
+        # the per-module caches the fixed paths fill on the first forward (a .item() each for LoKr) must be warm before
+        # the first trace: traced cold, the first call breaks the graph and dynamo keeps those fragments
+        primed = self._lycoris_fixes.prime_module_caches(network) if fixes_on else 0
+        if fixes_on:
+            # the LoHa / ABBA path rule reads the row count: inside a graph a fixed choice at the largest joint length
+            rows = int(getattr(args, "max_bucket_reso", 2048) or 2048) ** 2 // (strategy.MossLatentsCachingStrategy.STRIDE ** 2)
+            # every adapted Linear of a joint block has the joint token axis as rows (plan_block_compile_rows reads .blocks)
+            self._lycoris_fixes.plan_block_compile_rows(network, SimpleNamespace(blocks=model.layers),
+                                                        rows + int(args.moss_max_token_length))
+        if getattr(model, "split_attn", False):
+            logger.warning("--moss_block_compile with --split_attn: the per-row slice by the seqlens tensor is a graph break"
+                           " inside every attention call (the blocks still run, in pieces)")
+        if int(getattr(args, "train_batch_size", 1) or 1) > 1:
+            logger.warning("--moss_block_compile with batch > 1: a batch whose captions differ in length is padded, and the"
+                           " padded attention specialises a graph per text length (batch 1 / equal lengths share one)")
+        state = moss_block_compile.compile_moss_blocks(
+            model,
+            backend=args.moss_block_compile_backend,
+            mode=args.moss_block_compile_mode,
+            recompile_limit=int(args.moss_block_compile_recompile_limit),
+            stream_fp32=bool(getattr(args, "moss_stream_fp32", False)),
+        )
+        accelerator.print(
+            f"MOSS block compile: {len(model.layers)} joint blocks compiled per call (backend"
+            f" {args.moss_block_compile_backend}, mode {args.moss_block_compile_mode or 'default'}, {primed} LyCORIS module"
+            " caches primed); the first steps of every checkpointing regime compile (minutes on Windows), later runs"
+            " reuse the inductor cache. Sample images and validation run eager.")
+        return state
 
     def process_val_batch(self, batch, text_encoders, unet, network, vae, noise_scheduler, vae_dtype, weight_dtype,
                           accelerator, args, *rest, **kwargs):
@@ -404,9 +443,18 @@ def prepare_moss_runtime(args) -> None:
     register_moss_lycoris_presets()
     if not args.moss_stock_lycoris:
         install_fast_lokr_forward()  # before the network is created: apply_to binds LokrModule.forward
-    enable_elementwise_compile(not args.moss_no_compile)
+    block_compile = bool(getattr(args, "moss_block_compile", False))
+    if block_compile:
+        from library import lycoris_algo_fixes
+
+        # re-bind the adapted forwards after apply_to (traceable closures) - library/moss/block_compile.py
+        lycoris_algo_fixes.set_block_compile(True)
+    # Under block compile the compiled block graphs contain the elementwise chains and the LoKr rebuild: their own
+    # torch.compile would nest inside the block graphs (recompile-budget storms), so both stay eager there.
+    enable_elementwise_compile(not args.moss_no_compile and not block_compile)
     # The fast forward's LoKr+DoRA weight rebuild, fused by torch.compile (~1 bf16 ulp)
-    enable_compiled_rebuild(not (args.moss_stock_lycoris or args.moss_no_compile or args.moss_no_lokr_compile))
+    enable_compiled_rebuild(not (args.moss_stock_lycoris or args.moss_no_compile or args.moss_no_lokr_compile
+                                 or block_compile))
     # Rectified-flow target (noise - latents) for contrastive flow matching in train_network (historical flag name).
     args._anima_model = True
 

@@ -428,8 +428,14 @@ class MossTransformer(nn.Module):
             text_params = attention.AttentionParams.create_attention_params_from_mask(self.attn_mode, split, 0, text_mask,
                                                                                       text_lengths=lengths)
             hidden = torch.cat((video, self.text_embedder(text, rope[:, img_len:], text_params)), 1)
-            joint_params = attention.AttentionParams.create_attention_params_from_mask(self.attn_mode, split, img_len, text_mask,
-                                                                                       text_lengths=lengths)
+            if getattr(self, "_block_compile", False) and not split and all(n == max_len for n in lengths):
+                # --moss_block_compile (library/moss/block_compile.py): no padding (one sample, or equal text lengths) -
+                # the same attention without a mask, and no per-length Python ints in the params for dynamo to guard on
+                # (a compiled graph per caption length otherwise)
+                joint_params = attention.AttentionParams.create_attention_params(self.attn_mode, split)
+            else:
+                joint_params = attention.AttentionParams.create_attention_params_from_mask(self.attn_mode, split, img_len,
+                                                                                           text_mask, text_lengths=lengths)
 
         for index, layer in enumerate(self.layers):
             if self.blocks_to_swap:
