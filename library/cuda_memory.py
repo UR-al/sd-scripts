@@ -9,9 +9,9 @@
 # * CUDA_MEMLOG=N: allocated / reserved / window peaks / fragmentation / allocator retries every N optimizer steps and
 #   after sampling / save_state / epoch end; CUDA_MEMLOG_FILE=path writes one JSON line per entry instead (N defaults to
 #   50, CUDA_MEMLOG=0 switches it off). Peaks reset after each entry, so do not combine with TSM_LOKR_MEMLOG (its max_*
-#   would become per-window too). Every process writes (multi-GPU: one file, rows tagged with device index and rank;
-#   the save_state marks come from the main process only). Applied by NetworkTrainer.train (train_network.py and the
-#   *_train_network.py scripts).
+#   would become per-window too); run_peaks() gives the peaks of the whole run across those resets. Every process
+#   writes (multi-GPU: one file, rows tagged with device index and rank; the save_state marks come from the main process
+#   only). Applied by NetworkTrainer.train (train_network.py and the *_train_network.py scripts).
 # * torch >= 2.14: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True unless the variable is already set (2026-11-04).
 #   Windows builds ship expandable segments from 2.14 (2.13 and 2.7.1 compile them out). Without them every tensor of
 #   10 MiB or more gets a segment of its own exact size and free segments never merge, so after each epoch-end
@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 GIB = 2**30
 _CAP: dict = {}  # device index -> cap in bytes (fraction x total, as the allocator computes it)
+_RUN_PEAK: dict = {}  # device index -> (max allocated, max reserved) bytes the MemLog rows cleared (run_peaks)
 
 
 def _rank() -> int:
@@ -155,6 +156,18 @@ def cap_bytes(device) -> Optional[int]:
     return None if d is None else _CAP.get(d.index)
 
 
+def run_peaks(device) -> Optional[tuple]:
+    """(peak allocated, peak reserved) bytes of this process on a CUDA device over the whole run: torch's peak counters
+    and what the MemLog rows cleared from them (MemLog.mark resets the counters at every row, so on their own they only
+    cover the time since the last row). None for another device. Allocator counters only: no synchronize."""
+    d = _cuda(device)
+    if d is None:
+        return None
+    before = _RUN_PEAK.get(d.index, (0, 0))
+    return (max(before[0], int(torch.cuda.max_memory_allocated(d))),
+            max(before[1], int(torch.cuda.max_memory_reserved(d))))
+
+
 def maybe_empty_cache(args, device, global_step: int) -> bool:
     """At an optimizer-step boundary. True when the cache was released."""
     d = _cuda(device)
@@ -214,6 +227,7 @@ class MemLog:
             "cuda_mallocs": s.get("num_device_alloc", 0),
             "cuda_frees": s.get("num_device_free", 0),
         }
+        _RUN_PEAK[d.index] = run_peaks(d)  # the reset below clears them: run_peaks keeps the run's
         torch.cuda.reset_peak_memory_stats(d)
         if self.path:
             try:  # a log problem (folder gone, file locked by an editor) must not stop the training

@@ -48,8 +48,26 @@ def _env():
     enable_elementwise_compile(False)  # production: off under block compile (prepare_moss_runtime)
     torch._dynamo.reset()
     yield
+    _teardown_env()
+
+
+def _teardown_env():
+    """What `_env` undoes after every test (idempotent). The class patches of lycoris_algo_fixes go too: a test module
+    that runs later in the same process (tests/test_moss_pipeline.py) expects LyCORIS's classes without them, as
+    tests/test_lycoris_algo_fixes.py leaves them. Every test here applies them again and builds its own model."""
     laf.set_block_compile(False)
+    laf._revert_module_patches()
     torch._dynamo.reset()
+
+
+def test_env_teardown_leaves_no_lycoris_class_patch():
+    """tests/test_moss_pipeline.py::test_fast_lokr_forward_is_bit_identical_to_lycoris sorts after this module and
+    failed when it ran in the same process: the fixture left LokrModule.forward patched by lycoris_algo_fixes."""
+    lokr_class = lycoris_fast._lokr_class()
+    assert laf.patched_targets() and lokr_class.forward is not lycoris_fast._fast_forward  # what the fixture set up
+    _teardown_env()
+    assert laf.patched_targets() == []
+    assert lokr_class.forward is lycoris_fast._fast_forward
 
 
 def build(block_compile: bool = True, seed: int = 0):

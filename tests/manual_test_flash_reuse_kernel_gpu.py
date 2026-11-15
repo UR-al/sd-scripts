@@ -12,11 +12,13 @@ can be kernel noise or a real difference. This script measures both on the bare 
   path: its dq, dk, dv must sit inside that floor (bit-identical when the floor is zero).
 
 VRAM: under 2 GiB at the default sizes (16384 tokens x 16 heads x 128: 67 MB per fp16 tensor; q, k, v, the cotangent,
-one reference and one current set of gradients are alive at a time; the process is capped at 3 GiB). A few seconds.
-It refuses to start when other processes hold more than --busy_gb of the GPU.
+one reference and one current set of gradients are alive at a time; the process is capped at --vram_cap_gb, default 3).
+A few seconds. It refuses to start when other processes hold more than --busy_gb of the GPU.
 
 Run (GPU):       venv_t214/Scripts/python.exe -B tests/manual_test_flash_reuse_kernel_gpu.py
 Self-test (CPU): venv_t214/Scripts/python.exe -B tests/manual_test_flash_reuse_kernel_gpu.py --device cpu
+MOSS-Image's joint attention (24 heads x 128, bf16, a 2048^2 image + 256 text tokens; every tensor is 1.5x the default's,
+so the cap is raised):  ... --heads 24 --head_dim 128 --mixed_precision bf16 --tokens 1024 4096 16640 --vram_cap_gb 6
 """
 import argparse
 import json
@@ -69,6 +71,8 @@ def main():
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--mixed_precision", default="fp16", choices=["fp16", "bf16"])
     parser.add_argument("--busy_gb", type=float, default=6.0)
+    parser.add_argument("--vram_cap_gb", type=float, default=3.0,
+                        help="per-process VRAM cap (the default sizes stay under 2 GiB; more heads / tokens need more)")
     parser.add_argument("--json", default=None)
     args = parser.parse_args()
 
@@ -80,7 +84,8 @@ def main():
         if (total - free) / 2**30 > args.busy_gb:
             raise SystemExit(f"{(total - free) / 2**30:.1f} GiB of the GPU is in use (> --busy_gb {args.busy_gb}): not"
                              " starting next to another job")
-        torch.cuda.set_per_process_memory_fraction(min(1.0, 3 * 2**30 / total))  # this check stays under 2 GiB
+        # the default sizes stay under 2 GiB (cap 3)
+        torch.cuda.set_per_process_memory_fraction(min(1.0, args.vram_cap_gb * 2**30 / total))
         if attention.flash_attn_func is None or attention._wrapped_flash_attn_backward is None:
             raise SystemExit("flash-attn (with _wrapped_flash_attn_backward) is not usable here")
     else:

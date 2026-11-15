@@ -23,8 +23,10 @@ def _clean(monkeypatch):
     for k in ("CUDA_MEMORY_FRACTION", "CUDA_MEMLOG", "CUDA_MEMLOG_FILE", "PYTORCH_CUDA_ALLOC_CONF"):
         monkeypatch.delenv(k, raising=False)
     cm._CAP.clear()
+    cm._RUN_PEAK.clear()
     yield
     cm._CAP.clear()
+    cm._RUN_PEAK.clear()
 
 
 def ns(**kw):
@@ -206,6 +208,11 @@ def test_memlog_writes_json_lines(monkeypatch, tmp_path):
     assert rows[0]["inactive_split_peak"] == pytest.approx(1.0) and rows[0]["cap"] == pytest.approx(27.0)
     assert rows[0]["device_used"] == pytest.approx(28.0) and rows[0]["alloc_retries"] == 3
     assert calls.count("reset") == 3  # peaks are per window
+    # ... and what the rows cleared is kept: the peaks of the whole run (fake_cuda: max = current + 1 GiB)
+    assert cm._RUN_PEAK[cm._cuda(FAKE).index] == (9 * GIB, 11 * GIB) and cm.run_peaks(FAKE) == (9 * GIB, 11 * GIB)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda d=None: 20 * GIB)  # a later, larger window
+    assert cm.run_peaks(FAKE) == (20 * GIB, 11 * GIB)
+    assert cm.run_peaks(torch.device("cpu")) is None and cm.run_peaks(None) is None
 
 
 def test_memlog_env_switches(monkeypatch, tmp_path):

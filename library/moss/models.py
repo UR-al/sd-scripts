@@ -6,6 +6,8 @@
 # gradient checkpointing (plain / CPU offload / unsloth offload) and block swap like library/anima_models.py.
 
 import contextlib
+import math
+import sys
 from typing import Iterable, Optional
 
 import torch
@@ -13,7 +15,8 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
-from library import attention, custom_offloading_utils
+from library import anima_models as _ckpt  # the checkpointers and the no-grad first-pass switches, shared with Anima
+from library import attention, custom_offloading_utils, lycoris_fast
 from library.elementwise_compile import ElementwiseChains
 from library.anima_models import to_cpu, to_device, unsloth_checkpoint
 from library.utils import setup_logging
@@ -28,20 +31,80 @@ MOSS_DIT_CONFIG = dict(dim=3072, ffn_dim=8192, num_heads=24, num_layers=42, text
                        latent_channels=128, rope_base=10000.0)
 
 
+def split_fused_qkv(state: dict) -> int:
+    """Split ComfyUI-style fused joint-block ``layers.N.proj.qkv.weight`` [3 dim, dim] into q / k / v, in place.
+
+    KBlueLeaf/MOSS-Image-heal's ComfyUI file (moss_image_heal_fp16.safetensors) fuses each joint block's attention input
+    projections; every other key and shape is Base's. ComfyUI runs it as ``proj["qkv"](y).chunk(3, dim=-1)``, so the rows
+    are q, then k, then v. The trainer keeps separate q / k / v Linears (the LoRA / LyCORIS targets; ComfyUI maps their
+    keys onto the fused rows, comfy/lora.py). ``text_embedder.blocks.N.qkv`` is a fused Linear in the model itself and is
+    not touched. Returns the number of blocks split (0 for a Base-layout file)."""
+    count = 0
+    for key in [k for k in state if k.startswith("layers.") and k.endswith(".proj.qkv.weight")]:
+        prefix = key[:-len("qkv.weight")]
+        clash = [prefix + name + ".weight" for name in ("q", "k", "v") if prefix + name + ".weight" in state]
+        if clash:
+            raise ValueError(f"{key} and separate {clash} in the same file")
+        weight = state.pop(key)
+        if weight.dim() != 2 or weight.shape[0] % 3:
+            raise ValueError(f"{key} has shape {tuple(weight.shape)}: expected [3 * dim, dim]")
+        for name, part in zip(("q", "k", "v"), weight.chunk(3, 0)):
+            state[prefix + name + ".weight"] = part.clone()  # own storage: the fused block is not kept behind 3 views
+        count += 1
+    return count
+
+
 class MossRMSNorm(nn.Module):
     """Direct-scale RMSNorm, eps 1e-6, fp32 internals (official ``_RMSNorm``)."""
 
     def __init__(self, dim):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
+        # None: the official 1e-6. A float only on the norms that read the joint stream under --moss_stream_scale
+        # (MossTransformer.set_stream_scale). A plain attribute: never in a state dict.
+        self.eps: Optional[float] = None
 
     def forward(self, x):
-        return rms_norm(x, self.weight)
+        return rms_norm(x, self.weight, self.eps)
 
 
-def rms_norm(x, weight):
-    y = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)
+def rms_norm(x, weight, eps: Optional[float] = None):
+    # eps None keeps the literal 1e-6 in the expression: the same eager kernels and the same torch.compile graph as
+    # before --moss_stream_scale existed (dynamo specialises None; a float eps is a graph input on torch 2.14)
+    y = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + (1e-6 if eps is None else eps))
     return y.to(x.dtype) * weight
+
+
+# ---- --moss_stream_scale C (2026-11-15, default 1.0 = off): an exact fold of the joint residual stream -------------------
+# Under fp16 the joint stream of the 42 MossBlocks grows past fp16's largest value (65504); --moss_stream_fp32 keeps it in
+# fp32 instead (~4 GiB more at the 2048 tier). The fold keeps it in the training dtype, C times smaller:
+# * everything that reads the joint stream is an RMSNorm - norm1 / norm2 of every block (inside norm_modulate) and
+#   final_norm_video - and RMSNorm(C * x, eps * C**2) == RMSNorm(x, eps). Those norms get eps = 1e-6 * C**2.
+#   q_norm / k_norm read the projections of the normalised stream and the text refiner's norms read its own residual
+#   stream (not scaled): they keep 1e-6.
+# * everything that writes into it is multiplied by C, out of place, in MossTransformer.forward: the joint input (the
+#   video embedder output and the text refiner output, concatenated) and the two gates of the shared modulation
+#   (gate_a, gate_f: rows 2 and 5 of [shift_a, scale_a, gate_a, shift_f, scale_f, gate_f], the order MossBlock._forward
+#   unbinds) - once per forward, before the joint blocks, so every block, every checkpoint / recompute / compiled graph
+#   and every sampling forward get the scaled modulation without a change inside MossBlock.
+# * C is a power of two in (0, 1]: each multiplication by C or C**2 changes only the exponent, so it is exact in fp16 /
+#   bf16 / fp32 unless a value leaves the normal range (fp16 values below ~6.1e-5 * C round as subnormals). The block
+#   outputs are exactly C times the unscaled ones, the norm outputs - and with them every LoRA / LyCORIS input, output and
+#   gradient - are the same, and the stream's gradient is exactly 1 / C times its unscaled one (CPU tests: bit-identical,
+#   tests/test_moss_stream_scale.py). No weight changes: a --resume state or --network_weights trained without the
+#   option continue with it and back.
+# * C == 1.0 is the code before the option: forward multiplies nothing (a Python float check) and every eps stays None.
+def stream_scale_problem(scale) -> Optional[str]:
+    """Why `scale` cannot be --moss_stream_scale (a sentence), or None for a power of two in (0, 1] (2**-k, k >= 0)."""
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)):
+        return f"must be a number (a power of two in (0, 1], e.g. 0.0625 = 1/16), got {scale!r}"
+    value = float(scale)
+    if not math.isfinite(value) or not 0.0 < value <= 1.0:
+        return f"must be in (0, 1] (1.0 = off, 0.0625 = 1/16 recommended for fp16), got {scale!r}"
+    if math.frexp(value)[0] != 0.5:
+        return (f"must be a power of two (1, 0.5, 0.25, ..., 0.0625 = 1/16) so that multiplying by it is exact, got"
+                f" {scale!r}")
+    return None
 
 
 def situ(hidden, gate):
@@ -62,8 +125,8 @@ def rotate(x, rope):
 # Eager, each chain between two matmuls is a string of separate memory-bound kernels (fp32 RMSNorm, RoPE, SiTU-GLU,
 # gated residual): ~2 s of a ~9 s step at 1536 batch 2. Compiled, each becomes one or two fused kernels. The LoRA-wrapped
 # Linears and attention stay eager (library/elementwise_compile.py).
-def norm_modulate(x, weight, scale, shift):
-    return rms_norm(x, weight) * (1 + scale[:, None]) + shift[:, None]
+def norm_modulate(x, weight, scale, shift, eps: Optional[float] = None):
+    return rms_norm(x, weight, eps) * (1 + scale[:, None]) + shift[:, None]
 
 
 def qk_norm_rope(t, weight, rope, heads: int):
@@ -100,8 +163,136 @@ def joint_attention(q, k, v, rope, heads, attn_params: attention.AttentionParams
     return attention.attention([q.to(v.dtype), k.to(v.dtype), v], attn_params=attn_params)  # [B, L, H*D]
 
 
+# ---- no-grad first pass + merged LoKr weight cache / joint-attention reuse (--moss_ckpt_nograd_merged,
+# --moss_ckpt_reuse_attn; 2026-11-14, both off by default) ------------------------------------------------------------
+# The --anima_ckpt_nograd_merged / --anima_ckpt_reuse_attn machinery (library/anima_models.py NoGradFirstPassCheckpointer,
+# library/lycoris_fast.py "checkpoint merged-weight cache", library/attention.py _FlashReuse - read those section comments)
+# applied to the joint MossBlocks. Nothing is duplicated here: the plain (no offload) checkpoint of a MossBlock becomes
+# that node, which calls MossBlock._forward(..., attn_stash=list) for the no-grad first pass and
+# MossBlock._forward(..., attn_reuse=(out, softmax_lse)) for the recompute in backward.
+# * The switches are the process-wide ones of library/anima_models.py (CKPT_NOGRAD_MERGED, CKPT_REUSE_ATTN, and the
+#   CKPT_RECOMPUTE_DIFFS check): one trainer runs per process, like block_compile.pause. set_ckpt_reuse() sets them.
+# * What is cached: the merged LoKr+DoRA weight of every eligible adapted Linear of the block (proj.q / k / v / o /
+#   ffn_up_gate / ffn_down). A block left out of the network (--moss_lora_exclude_blocks) has none and still gets the
+#   no-grad first pass and the attention reuse.
+# * What is reused: the block's ONE attention call - the joint text+image self-attention - and only when it is the plain
+#   flash call: one sample, or samples of equal text length (with or without a mask in the params: attention() trims a
+#   uniform mask away). A padded batch (different text lengths) goes through flash's varlen kernel: nothing is stored, the
+#   recompute runs the forward kernel as before. MOSS has no cross-attention.
+# * Under --moss_block_compile a padded batch keeps torch.utils.checkpoint (_CheckpointMixin._ckpt_keeps_plain): its
+#   masked attention params carry per-length Python ints, so every padded length compiles a graph of its own, and the
+#   no-grad node would compile two per length (first pass and recompute differ in grad mode and _CKPT_PASS; the plain
+#   checkpoint runs both passes through one graph) for a call that has nothing to reuse.
+# * Not the two text refiner blocks (MossTextBlock): they keep torch.utils.checkpoint. Their output enters joint block 0
+#   as part of its x, a tensor with a single consumer, so LoRA on them (preset moss-text) gets the same gradients.
+# * Tensors that enter every joint block from outside: rope (no grad) and the shared modulation. Each block reads the
+#   modulation once (unbind), so the per-block gradients reach its producer one per block in both checkpoints - unlike
+#   Anima's three adaLN uses per Block there is no per-block pre-sum that could round differently.
+# * Sampling and validation run under no_grad: _run calls _forward directly, lycoris_fast._CKPT_PASS stays 0 and neither
+#   the cache nor a stash is ever consulted. A sample round drops the cache first (library/moss/train_utils.py
+#   sample_images: ~8.65 GiB on the real model that sampling would only carry), the next training step builds it again.
+# Both off: _run and MossBlock._forward run exactly as before.
+#
+# Reuse-only (2026-11-15): --moss_ckpt_reuse_attn WITHOUT --moss_ckpt_nograd_merged. The cache is one bf16 / fp16 copy
+# of every adapted Linear (~8.65 GiB on MOSS-Image) and measured +-0 % on its own on Anima; the gain is the attention
+# reuse, and with the cache the 2048 tier does not fit a 32 GB card. So the two switches are independent here:
+# * CKPT_REUSE_ATTN alone (CKPT_NOGRAD_MERGED off): a joint block still goes through the same node (no-grad first pass,
+#   stored attention, recompute + backward in the node's backward), but the node gets an empty stand-in module where it
+#   expects the block (_NO_CACHE), so it finds no module to cache and builds nothing, and the function it runs
+#   (MossBlock._forward_uncached) keeps lycoris_fast._CKPT_PASS at 0: every adapted Linear rebuilds its merged LoKr+DoRA
+#   weight in both passes exactly as under torch.utils.checkpoint, and a cache tensor left on a module by an earlier
+#   cached run in the same process is never read. library/anima_models.py is not touched: Anima's path is the same code.
+#   The node's check "the parameters are still what the first pass read" works on the modules it caches, i.e. on none
+#   here, so that function makes it itself with the same keys (MossBlock._ckpt_adapter_keys) before it lets the
+#   recompute take the stored attention.
+#   Where nothing is compiled, both passes run the same kernels on the same values (CPU tests: bit-identical outputs
+#   and gradients). On the GPU that is only the run with --moss_no_compile and --moss_no_lokr_compile and without
+#   --moss_block_compile. Every compile splits by grad mode, so the no-grad first pass and the grad-mode recompute are
+#   two compiled graphs:
+#   - under --moss_block_compile, of the whole block (its fused weight rebuilds and chains);
+#   - without it, in the default CUDA run, of the LoKr+DoRA rebuild (lycoris_fast.enable_compiled_rebuild) and of the
+#     elementwise chains above (_CHAINS; prepare_moss_runtime switches both on). The plain checkpoint runs both of its
+#     passes in grad mode, through one graph of each.
+#   The two graphs may round their reductions differently (DoRA's vector_norm, the RMSNorm means): then the stored
+#   attention output belongs to q / k / v that differ from the recompute's at rounding level. The cached mode hands
+#   the recompute the first pass's weight bits (not its q / k chains, which split the same way); this mode has no such
+#   tensor. Not measurable on CPU (aot_eager: bit-identical; the chain and rebuild compiles are CUDA-only), for the GPU
+#   harness to report (CKPT_RECOMPUTE_DIFFS; tests/manual_test_moss_ckpt_reuse_gpu.py modes "chains" and "compiled").
+# * a byte budget for the stored attention (CKPT_REUSE_BUDGET_BYTES, --moss_ckpt_reuse_attn_budget_gib): every block
+#   stores joint tokens x rows x ckpt_stash_bytes_per_token bytes until its backward, and at the start of backward all of
+#   them are alive. Per call, from the shape of x (Python ints, outside any compiled graph, no device read):
+#   n = floor(budget / bytes per block); the blocks with index < n store and reuse, the others do not - they keep
+#   torch.utils.checkpoint (reuse-only) or the node without a stash (with the cache). The index is set when the model is
+#   built. The compiled entry is shared by all blocks, so n moving between micro-steps compiles nothing new: the kinds of
+#   call (plain grad forward / no-grad first pass with a stash / recompute with the stored tensors) each compile once
+#   (x2 with a block left out of the network: 6 graphs). With the cache on, the blocks over the budget run the node
+#   without a stash (_forward_no_stash): first pass and recompute each exist with and without the stored attention - 8
+#   graphs, which is why that combination needs --moss_block_compile_recompile_limit >= 16
+#   (train_utils.validate_moss_ckpt_reuse_args; the default is 64).
+CKPT_REUSE_BUDGET_BYTES: Optional[int] = None  # None: no limit, every joint block stores and reuses
+_NO_CACHE = nn.Module()  # what the node gets instead of the block in reuse-only mode: nothing in it to cache
+_NO_LIMIT = sys.maxsize
+
+
+def ckpt_stash_bytes_per_token(dim: int, heads: int) -> int:
+    """Bytes one token of the joint sequence adds to a block's stored attention: the flash output [L, heads, head_dim]
+    in the autocast dtype (bf16 / fp16: 2 bytes) + softmax_lse [heads, L] in fp32. MOSS-Image: 3072 * 2 + 24 * 4 = 6240."""
+    return int(dim) * 2 + int(heads) * 4
+
+
+def ckpt_reuse_block_count(budget_bytes: Optional[int], tokens: int, rows: int, per_token: int) -> int:
+    """How many joint blocks (those with index < the result) may store their attention under `budget_bytes` when one
+    block stores tokens * rows * per_token bytes: floor(budget / that). No budget, or nothing to store: no limit (a
+    number above any block count; callers compare an index with it or clip it)."""
+    if budget_bytes is None:
+        return _NO_LIMIT
+    if budget_bytes < 0:
+        raise ValueError(f"the stored-attention budget must be >= 0 bytes, got {budget_bytes}")
+    per_block = int(tokens) * int(rows) * int(per_token)
+    if per_block <= 0:
+        return _NO_LIMIT
+    return int(budget_bytes) // per_block
+
+
+def set_ckpt_reuse(nograd_merged: bool, reuse_attn: bool = False, reuse_budget_gib: Optional[float] = None) -> None:
+    """--moss_ckpt_nograd_merged / --moss_ckpt_reuse_attn / --moss_ckpt_reuse_attn_budget_gib: the process-wide switches
+    (library/anima_models.py's two, and the budget here). Either of the first two sends the joint blocks through the
+    no-grad first-pass node; nograd_merged alone decides whether merged weights are cached."""
+    budget = None
+    if reuse_budget_gib is not None:
+        gib = float(reuse_budget_gib)
+        if not math.isfinite(gib) or gib < 0:
+            raise ValueError(f"--moss_ckpt_reuse_attn_budget_gib must be a finite number >= 0, got {reuse_budget_gib!r}")
+        budget = int(gib * 2**30)
+    global CKPT_REUSE_BUDGET_BYTES
+    _ckpt.CKPT_NOGRAD_MERGED = bool(nograd_merged)
+    _ckpt.CKPT_REUSE_ATTN = bool(reuse_attn)
+    CKPT_REUSE_BUDGET_BYTES = budget
+
+
+def ckpt_nograd_merged_enabled() -> bool:
+    """--moss_ckpt_nograd_merged: the merged-weight cache (and with it the node) is on."""
+    return bool(_ckpt.CKPT_NOGRAD_MERGED)
+
+
+def ckpt_node_enabled() -> bool:
+    """The joint blocks' plain checkpoint may be the no-grad first-pass node: either switch is on."""
+    return bool(_ckpt.CKPT_NOGRAD_MERGED or _ckpt.CKPT_REUSE_ATTN)
+
+
+def ckpt_reuse_attn_enabled() -> bool:
+    """--moss_ckpt_reuse_attn: the joint attention is stored and reused (with or without the cache)."""
+    return bool(_ckpt.CKPT_REUSE_ATTN)
+
+
+def ckpt_reuse_budget_bytes() -> Optional[int]:
+    return CKPT_REUSE_BUDGET_BYTES
+
+
 class _CheckpointMixin:
     """Per-block gradient checkpointing switch, same three modes as library/anima_models.py Block."""
+
+    _ckpt_nograd = False  # True on MossBlock: its plain checkpoint may be the no-grad first-pass one (section above)
 
     def _init_checkpointing(self):
         self.gradient_checkpointing = False
@@ -115,6 +306,17 @@ class _CheckpointMixin:
 
     def disable_gradient_checkpointing(self):
         self._init_checkpointing()
+
+    def _ckpt_keeps_plain(self, args) -> bool:
+        """--moss_ckpt_nograd_merged / --moss_ckpt_reuse_attn: True for a call that stays on torch.utils.checkpoint
+        although a switch is on - a
+        compiled block (library/moss/block_compile.py installs `_forward` on the instance) called with masked attention
+        params: a padded batch, or --split_attn. Those params carry per-length Python ints (seqlens_host, max_seqlen,
+        img_len), so each padded length specialises a compiled graph. The no-grad node would make that two graphs per
+        length - its first pass runs under no_grad with lycoris_fast._CKPT_PASS == 1 (and a stash list), its recompute in
+        grad mode with _CKPT_PASS == 2, where the plain checkpoint runs both passes through one graph - and has nothing
+        to offer there: flash varlen stores no attention output, and the no-grad pass alone measured +-0 % on Anima."""
+        return "_forward" in self.__dict__ and getattr(args[-1], "attention_mask", None) is not None
 
     def _run(self, *args):
         if torch.is_grad_enabled() and self.training and self.gradient_checkpointing:
@@ -130,6 +332,19 @@ class _CheckpointMixin:
                     return to_cpu(func(*to_device(inputs, device)))
 
                 return torch_checkpoint(custom_forward, *args, use_reentrant=False)
+            if ((_ckpt.CKPT_NOGRAD_MERGED or _ckpt.CKPT_REUSE_ATTN) and self._ckpt_nograd and args[0].requires_grad
+                    and not self._ckpt_keeps_plain(args)):
+                # --moss_ckpt_nograd_merged / --moss_ckpt_reuse_attn: no offload, the first pass under no_grad
+                # (NoGradFirstPassCheckpointer; an autograd node needs a grad-bearing input, so a block whose x has none
+                # stays on torch.utils.checkpoint, and so does a compiled block's padded call: _ckpt_keeps_plain)
+                reuse = _ckpt.CKPT_REUSE_ATTN and self._ckpt_reuses(args[0])
+                if _ckpt.CKPT_NOGRAD_MERGED:
+                    # the cache is on: every joint block gets the node; a block over the stored-attention budget runs
+                    # it without the stash (the node makes one whenever CKPT_REUSE_ATTN is set)
+                    function = self._forward if reuse or not _ckpt.CKPT_REUSE_ATTN else self._forward_no_stash
+                    return _ckpt.nograd_checkpoint(function, self, *args)
+                if reuse:  # reuse-only: the node with nothing to cache; a block over the budget keeps the plain checkpoint
+                    return _ckpt.nograd_checkpoint(self._forward_uncached(), _NO_CACHE, *args)
             return torch_checkpoint(self._forward, *args, use_reentrant=False)
         return self._forward(*args)
 
@@ -196,20 +411,81 @@ class MossBlock(_CheckpointMixin, nn.Module):
         self.proj["ffn_up_gate"] = nn.Linear(dim, 2 * ffn_dim, bias=False)
         self.proj["ffn_down"] = nn.Linear(ffn_dim, dim, bias=False)
         self._init_checkpointing()
+        # --moss_ckpt_reuse_attn_budget_gib (plain Python attributes, not buffers: nothing reaches a state dict or a
+        # compiled graph): the bytes per token this block's stored attention takes, and the block's position in
+        # MossTransformer.layers (set there; a standalone block is 0)
+        self._ckpt_stash_per_token = ckpt_stash_bytes_per_token(dim, heads)
+        self._ckpt_index = 0
 
-    def _forward(self, x, rope, modulation, attn_params):
+    _ckpt_nograd = True  # --moss_ckpt_nograd_merged / --moss_ckpt_reuse_attn apply to the joint blocks
+
+    def _ckpt_reuses(self, x) -> bool:
+        """--moss_ckpt_reuse_attn: whether this block stores and reuses its attention for a call with the stream x
+        [rows, joint tokens, dim] under the byte budget (no budget: always). Shape ints only: no device read."""
+        budget = CKPT_REUSE_BUDGET_BYTES
+        if budget is None:
+            return True
+        return self._ckpt_index < ckpt_reuse_block_count(budget, x.shape[1], x.shape[0], self._ckpt_stash_per_token)
+
+    def _ckpt_adapter_keys(self, x) -> tuple:
+        """Reuse-only: what the adapted Linears of this block are built from right now (lycoris_fast._ckpt_key per LoKr
+        module: version counter and data pointer of its factors, DoRA scale and base weight, the multiplier, the
+        invalidation generation) - the cached mode's check that the stored attention still belongs to the parameters,
+        without a cache. Host values only. The module list is found once per block and kept under a name of its own
+        (not the node's _ckpt_lokrs: nothing here may make the node cache); an empty list (a block left out of the
+        network, a non-LyCORIS network) is looked up again, like the node's."""
+        lokrs = self.__dict__.get("_ckpt_guard_lokrs")
+        if not lokrs:
+            linears = [m for m in self.modules() if isinstance(m, nn.Linear)]
+            lokrs = self.__dict__["_ckpt_guard_lokrs"] = lycoris_fast.ckpt_merged_modules(self, linears)
+        dtype = torch.get_autocast_dtype(x.device.type)
+        return tuple(lycoris_fast._ckpt_key(lokr, dtype) for lokr in lokrs)
+
+    def _forward_uncached(self):
+        """The node's function in reuse-only mode (one object per call of the block: it carries the first pass's keys
+        to the recompute). It runs _forward (the compiled one under --moss_block_compile) with lycoris_fast._CKPT_PASS
+        held at 0, so no adapted Linear looks for a cached merged weight in either pass, and it hands the recompute the
+        stored attention only while the adapter is what the first pass read: a parameter written between a forward and
+        its backward (nothing in the trainer does that) makes the recompute run the attention plainly, as
+        torch.utils.checkpoint would and as the cached mode does. Like there, a write through `p.data` is not seen."""
+        block, keys = self, []
+
+        def _forward_uncached(*args, **kwargs):
+            if "attn_stash" in kwargs:  # the no-grad first pass
+                keys.append(block._ckpt_adapter_keys(args[0]))
+            elif "attn_reuse" in kwargs and (not keys or block._ckpt_adapter_keys(args[0]) != keys[-1]):
+                del kwargs["attn_reuse"]
+            with lycoris_fast.ckpt_pass(0):
+                return block._forward(*args, **kwargs)
+
+        return _forward_uncached
+
+    def _forward_no_stash(self, *args, attn_stash=None, attn_reuse=None):
+        """The node's function for a block over the stored-attention budget while the cache is on: the stash list the
+        node offers is left empty, so nothing is stored and the recompute runs the attention as the plain checkpoint."""
+        return self._forward(*args)
+
+    def _forward(self, x, rope, modulation, attn_params, attn_stash=None, attn_reuse=None):
         # Same math as the official _Block; the elementwise chains come from _chains() (eager or compiled).
+        # attn_stash / attn_reuse: only NoGradFirstPassCheckpointer passes them (--moss_ckpt_reuse_attn): the first pass
+        # fills the list with the joint attention's flash output and softmax_lse, the recompute gets them back as a tuple
+        # --moss_stream_scale: x and the gates arrive scaled by C (MossTransformer.forward), norm1 / norm2 carry
+        # eps = 1e-6 * C**2 (None when off)
         fn = _chains(x)
         shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = modulation.unbind(1)
         dtype = self.proj["q"].weight.dtype
-        y = fn["norm_modulate"](x, self.norm1.weight, scale_a, shift_a).to(dtype)
+        y = fn["norm_modulate"](x, self.norm1.weight, scale_a, shift_a, self.norm1.eps).to(dtype)
         q = fn["qk_norm_rope"](self.proj["q"](y), self.q_norm.weight, rope, self.heads)
         k = fn["qk_norm_rope"](self.proj["k"](y), self.k_norm.weight, rope, self.heads)
         v = self.proj["v"](y)
         v = v.reshape(*v.shape[:2], self.heads, -1)
-        attn = attention.attention([q.to(v.dtype), k.to(v.dtype), v], attn_params=attn_params)  # [B, L, H*D]
+        if attn_stash is None and attn_reuse is None:
+            attn = attention.attention([q.to(v.dtype), k.to(v.dtype), v], attn_params=attn_params)  # [B, L, H*D]
+        else:  # a checkpointed block's joint attention under --moss_ckpt_reuse_attn
+            attn = attention.attention([q.to(v.dtype), k.to(v.dtype), v], attn_params=attn_params, ckpt_stash=attn_stash,
+                                       ckpt_reuse=attn_reuse)
         x = fn["gated_residual"](x, self.proj["o"](attn), gate_a)
-        y = fn["norm_modulate"](x, self.norm2.weight, scale_f, shift_f)
+        y = fn["norm_modulate"](x, self.norm2.weight, scale_f, shift_f, self.norm2.eps)
         hidden, gate = self.proj["ffn_up_gate"](y.to(dtype)).chunk(2, -1)  # first half hidden(up), second gate
         return fn["gated_residual"](x, self.proj["ffn_down"](fn["situ"](hidden, gate)), gate_f)
 
@@ -282,6 +558,8 @@ class MossTransformer(nn.Module):
         self.time_embedding = nn.Sequential(nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.shared_block_modulation = nn.Linear(dim, 6 * dim)
         self.layers = nn.ModuleList([MossBlock(dim, ffn_dim, num_heads) for _ in range(num_layers)])
+        for index, layer in enumerate(self.layers):
+            layer._ckpt_index = index  # --moss_ckpt_reuse_attn_budget_gib: the blocks with index < n store and reuse
         self.final_norm_video = MossRMSNorm(dim)
         self.final_linear_video = nn.Linear(dim, latent_channels, bias=False)
         self.video_head_modulation = nn.Linear(dim, 2 * dim)
@@ -293,6 +571,30 @@ class MossTransformer(nn.Module):
         self.offloader: Optional[custom_offloading_utils.ModelOffloader] = None
         self.last_text_tokens: Optional[int] = None  # set by forward (a host int it computes anyway)
         self.stream_fp32 = False  # --moss_stream_fp32, see enable_stream_fp32
+        self.stream_scale = 1.0  # --moss_stream_scale, see set_stream_scale (a Python float: 1.0 multiplies nothing)
+
+    def set_stream_scale(self, scale: float = 1.0):
+        """--moss_stream_scale C (section above rms_norm): carry the joint residual stream multiplied by C, a power of
+        two in (0, 1]. The norms reading it get eps = 1e-6 * C**2; forward scales what writes into it. No parameter or
+        buffer changes. 1.0 restores the plain forward (eps None). Any time before a forward; also on a compiled model
+        (block compile reads the eps at trace time - the graphs traced before a change are guarded by its value)."""
+        problem = stream_scale_problem(scale)
+        if problem:
+            raise ValueError(f"--moss_stream_scale {problem}")
+        scale = float(scale)
+        eps = None if scale == 1.0 else 1e-6 * scale * scale  # exact: C**2 is a power of two
+        for layer in self.layers:
+            layer.norm1.eps = eps
+            layer.norm2.eps = eps
+        self.final_norm_video.eps = eps
+        self.stream_scale = scale
+
+    def _scale_stream(self, hidden: torch.Tensor, mod: torch.Tensor, scale: float):
+        """--moss_stream_scale: the joint input and the shared modulation's gate_a / gate_f (rows 2 and 5, MossBlock's
+        unbind order) times C, out of place. The other four rows pass through untouched (the same values)."""
+        shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = mod.unbind(1)
+        mod = torch.stack((shift_a, scale_a, gate_a * scale, shift_f, scale_f, gate_f * scale), 1)
+        return hidden * scale, mod
 
     def enable_stream_fp32(self):
         """Run the residual stream, modulation, norms, embedders and head in fp32 around the joint blocks' Linears.
@@ -428,6 +730,10 @@ class MossTransformer(nn.Module):
             text_params = attention.AttentionParams.create_attention_params_from_mask(self.attn_mode, split, 0, text_mask,
                                                                                       text_lengths=lengths)
             hidden = torch.cat((video, self.text_embedder(text, rope[:, img_len:], text_params)), 1)
+            if self.stream_scale != 1.0:
+                # --moss_stream_scale: the video embedder and text refiner outputs and every block's gates write into the
+                # joint stream C times smaller (the text refiner's own stream stays as it is)
+                hidden, mod = self._scale_stream(hidden, mod, self.stream_scale)
             if getattr(self, "_block_compile", False) and not split and all(n == max_len for n in lengths):
                 # --moss_block_compile (library/moss/block_compile.py): no padding (one sample, or equal text lengths) -
                 # the same attention without a mask, and no per-length Python ints in the params for dynamo to guard on

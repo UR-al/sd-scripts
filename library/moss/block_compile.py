@@ -19,6 +19,24 @@
 #   ints: those calls specialise per length (see the warning at compile time for batch > 1).
 # * only the 42 joint blocks: the two text refiner blocks run once per forward on the text only and are frozen by the
 #   default "moss" LyCORIS preset.
+# * --moss_ckpt_nograd_merged (library/moss/models.py, anima_models.NoGradFirstPassCheckpointer) replaces the plain
+#   checkpoint's "grad forward twice" by a no-grad forward that reads the cached merged LoKr weights (graph inputs;
+#   lycoris_fast._CKPT_PASS == 1) and a grad forward for the recompute (_CKPT_PASS == 2): two more entries. With
+#   --moss_ckpt_reuse_attn the first-pass graph returns the joint attention's output and softmax_lse (a list argument
+#   it appends to) and the recompute graph takes them as inputs, their token axis soft-marked like x's. A padded batch
+#   (masked params, a graph per padded length) keeps torch.utils.checkpoint there, so the option adds no graphs per
+#   padded length (MossBlock._ckpt_keeps_plain).
+# * --moss_ckpt_reuse_attn without --moss_ckpt_nograd_merged (reuse-only) and --moss_ckpt_reuse_attn_budget_gib: the
+#   same two entries (first pass with a stash list, recompute with the stored tensors) with lycoris_fast._CKPT_PASS == 0
+#   and no cached weight among the graph inputs; both passes rebuild the merged weights inside their graph, so the two
+#   graphs may round that rebuild differently (the cached mode gives the recompute the first pass's weight bits). Which
+#   blocks reuse under the budget is decided per call outside the graphs (MossBlock._ckpt_reuses, shape ints): all blocks
+#   share the entries, so a block changing between "plain", "first pass" and "recompute" calls compiles nothing new.
+#   Entries on the shared block (adapted blocks + a block left out of the network): 4 without a budget, 6 reuse-only
+#   with a budget (the plain grad graph next to the node's two), 8 with the cache and a budget (the node with and
+#   without a stored output): that last combination is refused below a recompile limit of 16.
+# * --moss_stream_scale (library/moss/models.py): the scaled input and gates come from outside the graphs; inside, only
+#   the eps of norm1 / norm2 differs (read from the block, one value for the run): no extra graph (compile_moss_blocks).
 #
 # Refused combinations (library/moss/train_utils.validate_moss_args): RamTorch, block swap, accelerate's --torch_compile,
 # stock LyCORIS (--moss_stock_lycoris / --lycoris_stock), DyLoRA - the same reasons as for Anima.
@@ -45,13 +63,21 @@ def compile_moss_blocks(
     recompile_limit: int = 64,
     isolate_cache: bool = True,
     stream_fp32: bool = False,
+    stream_scale: float = 1.0,
 ) -> abc.CompiledBlocks:
     """torch.compile every joint MossBlock's `_forward` of `model` (a MossTransformer). Call AFTER the network's apply_to
     and weight loading (the graphs trace the patched Linear forwards) and with the elementwise-chain / LoKr-rebuild
-    compiles off (nested torch.compile inside a compiled frame exhausts the recompile budget)."""
+    compiles off (nested torch.compile inside a compiled frame exhausts the recompile budget).
+
+    --moss_stream_scale (`stream_scale`, MossTransformer.set_stream_scale): nothing changes in the graphs but the eps of
+    norm1 / norm2, which the traced `_forward` reads from the block (`block.norm1.eps`; None when off: the graphs of
+    before). It is one value for the whole run and for all 42 blocks, so the shared entry compiles no extra graph; a C
+    other than 1.0 gets an inductor cache dir of its own (the signature)."""
     limit = abc.raise_recompile_limit(recompile_limit)
     if isolate_cache and backend == "inductor":
         signature = abc.compile_signature([], backend, mode, "moss-soft", stream_fp32)
+        if float(stream_scale) != 1.0:
+            signature += f";stream_scale={float(stream_scale)!r}"
         logger.info(f"MOSS block compile: inductor cache dir {abc.isolate_inductor_cache(signature)}")
     kwargs: Dict[str, Any] = {"backend": backend, "dynamic": False}
     if mode:
@@ -88,6 +114,15 @@ def compile_moss_blocks(
             torch._dynamo.maybe_mark_dynamic(x, 1)
             if isinstance(rope, torch.Tensor):
                 torch._dynamo.maybe_mark_dynamic(rope, 1)
+            if kw:  # --moss_ckpt_reuse_attn: the stored joint attention (out [B, L, heads, head_dim], softmax_lse
+                # [B, heads, L]) handed to a recompute - the same token axis as x's. On torch 2.14 a tensor that left
+                # the first-pass graph with a symbolic axis is already treated as dynamic here (measured: the graph
+                # count is the same without these marks); they keep the axis symbolic should the stored tensors ever
+                # come from an eager first pass, where an unmarked size compiles a graph per caption length.
+                reuse = kw.get("attn_reuse")
+                if reuse is not None:
+                    torch._dynamo.maybe_mark_dynamic(reuse[0], 1)
+                    torch._dynamo.maybe_mark_dynamic(reuse[1], 2)
             state.compiled_calls += 1
             dev = x.device.type
             # autocast OFF around the compiled call, the caller's state handed to the graph (anima_block_compile.make)

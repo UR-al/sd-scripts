@@ -223,6 +223,21 @@ def ckpt_merged_invalidate() -> None:
     _CKPT_GENERATION += 1
 
 
+_CKPT_STEP_HOOK = None  # the handle of ckpt_merged_invalidate_on_optimizer_steps' hook (one per process)
+
+
+def ckpt_merged_invalidate_on_optimizer_steps() -> None:
+    """Every optimizer.step() of the process invalidates the checkpoint merged-weight cache: a global torch.optim hook, so
+    it does not depend on where the training loop steps (the keys cannot see an optimizer that writes through p.data;
+    CAME does). Registered once. moss_train_network.py uses this one; anima_train_network.py keeps its own older copy
+    (invalidate_ckpt_merged_on_optimizer_steps, the same hook)."""
+    global _CKPT_STEP_HOOK
+    if _CKPT_STEP_HOOK is None:
+        from torch.optim.optimizer import register_optimizer_step_post_hook
+
+        _CKPT_STEP_HOOK = register_optimizer_step_post_hook(lambda optimizer, args, kwargs: ckpt_merged_invalidate())
+
+
 def ckpt_merged_release(model: nn.Module) -> int:
     """Drop the cached merged weights of the LoKr modules applied to `model`; returns the bytes they held."""
     freed = 0
