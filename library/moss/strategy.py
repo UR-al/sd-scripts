@@ -122,7 +122,14 @@ class MossTextEncoderStub(nn.Module):
         raise RuntimeError("MOSS text encoding runs through the cached outputs (cache_text_encoder_outputs)")
 
 
+def _is_live_encoder(model: Any) -> bool:
+    from .te_live import LiveTextEncoder  # import here: te_live imports this module
+
+    return isinstance(model, LiveTextEncoder)
+
+
 def resolve_text_encoder(model: Any) -> MossQwen35TextEncoder:
+    """The encoder behind a provider / stub; a LiveTextEncoder (--moss_te_live) is returned as it is."""
     if isinstance(model, MossTextEncoderProvider):
         return model.get()
     if isinstance(model, MossTextEncoderStub):
@@ -157,8 +164,11 @@ class MossTextEncodingStrategy(TextEncodingStrategy):
     @torch.no_grad()
     def encode_tokens(self, tokenize_strategy: TokenizeStrategy, models: List[Any], tokens: List[torch.Tensor],
                       attn_masks=None) -> List[torch.Tensor]:
-        """-> [text_embeds [B, L, 4096] (bf16, zero at padding), text_mask [B, L] long]. Each row runs unpadded."""
+        """-> [text_embeds [B, L, 4096] (bf16, zero at padding), text_mask [B, L] long]. Each row runs unpadded (also
+        through a LiveTextEncoder, which streams the layers from host RAM: the same rows)."""
         model = resolve_text_encoder(models[0])
+        if _is_live_encoder(model):
+            return model.encode_tokens(tokens)
         input_ids, mask = tokens[0], tokens[1]
         rows = []
         with torch.autocast(device_type=model.device.type, enabled=False):
@@ -182,7 +192,8 @@ class MossTextEncodingStrategy(TextEncodingStrategy):
         return [text_embeds, text_mask]
 
 
-CAPTION_DROPOUT_ERROR = "MOSS: caption dropout needs --cache_caption_variants N>1 (cached outputs are never zeroed)"
+CAPTION_DROPOUT_ERROR = ("MOSS: caption dropout needs --cache_caption_variants N>1 (cached outputs are never zeroed),"
+                         " or the live text encoder of moss_train.py (--moss_te_live)")
 
 
 def _is_host(rates) -> bool:

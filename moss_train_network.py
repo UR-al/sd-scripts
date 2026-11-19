@@ -22,7 +22,7 @@ init_ipex()
 import train_network
 from library import anima_train_utils, attention, sd3_train_utils, strategy_base, tier_timing, timestep_presets, train_util
 from library.custom_train_functions import apply_snr_weight_for_flow_matching, maybe_apply_antithetic_noise_pairing
-from library.moss import captions, flow, strategy
+from library.moss import captions, flow, strategy, te_cache
 from library.moss import train_utils as moss_train_utils
 from library.moss import block_compile as moss_block_compile
 from library.lycoris_fast import (ckpt_merged_bytes, ckpt_merged_invalidate, ckpt_merged_invalidate_on_optimizer_steps,
@@ -83,6 +83,23 @@ def apply_ramtorch_to_moss_blocks(model: MossTransformer, args, device, dtype, a
     return streamed
 
 
+def refuse_lycoris_full(args) -> None:
+    """LyCORIS algo=full trains every base weight through the LoRA trainer: it crashes in MossBlock._forward (LyCORIS
+    deletes the Linears' `weight`) and would keep fp32 weights, gradients and AdamW states on the GPU (~71 GiB at
+    preset=moss). The full fine-tune is its own script (docs/moss_full_finetune_design.md 0, 1.3)."""
+    module = str(getattr(args, "network_module", "") or "")
+    if not module.startswith("lycoris"):
+        return
+    for item in getattr(args, "network_args", None) or []:
+        key, _, value = str(item).partition("=")
+        if key.strip() == "algo" and value.strip().strip("'\"").strip().lower() == "full":
+            raise ValueError("MOSS-Image: LyCORIS algo=full is not supported by moss_train_network.py. MOSS full"
+                             " fine-tuning is moss_train.py (host-resident fp32 master and AdamW states, an estimated ~15 GiB of"
+                             " VRAM at 1024^2 batch 1); LyCORIS full needs ~71 GiB of VRAM (fp32 weights, gradients and AdamW"
+                             " states of 5.08B parameters on the GPU) and its deleted Linear weights break the MOSS"
+                             " blocks")
+
+
 class MossNetworkTrainer(train_network.NetworkTrainer):
     def __init__(self):
         super().__init__()
@@ -114,6 +131,7 @@ class MossNetworkTrainer(train_network.NetworkTrainer):
     # ---- checks / models ------------------------------------------------------------------------------------
     def assert_extra_args(self, args, train_dataset_group: Union[train_util.DatasetGroup, train_util.MinimalDataset],
                           val_dataset_group: Optional[train_util.DatasetGroup]):
+        refuse_lycoris_full(args)
         moss_train_utils.validate_moss_args(args, train_dataset_group, val_dataset_group)
         # a dataset TOML sets batch_size and the resolution tiers per dataset: the args do not show them
         self._dataset_limits = moss_train_utils.dataset_group_limits(train_dataset_group)
@@ -178,48 +196,14 @@ class MossNetworkTrainer(train_network.NetworkTrainer):
 
     def cache_text_encoder_outputs_if_needed(self, args, accelerator, unet, vae, text_encoders, dataset, weight_dtype):
         """Cache dataset captions (every variant) and sample prompts. The 9B encoder loads on the first caption that
-        actually needs encoding and is released at the end, so complete caches never load it."""
-        provider = self._te_provider
-        caching = strategy_base.TextEncoderOutputsCachingStrategy.get_strategy()
-        captions.install_canonical_captions(dataset)
-        captions.prepare_canonical_captions(dataset)
-        captions.register_caption_digests(dataset, caching)
-        org_vae_device = vae.device
-        if not args.lowram:
-            vae.to("cpu")
-            clean_memory_on_device(accelerator.device)
-        try:
-            dataset.new_cache_text_encoder_outputs([provider], accelerator)
-            if args.sample_prompts is not None and self.sample_prompts_te_outputs is None:
-                self.sample_prompts_te_outputs = self._cache_sample_prompts(args, provider)
-            accelerator.wait_for_everyone()
-        finally:
-            captions.uninstall_canonical_captions(dataset)  # DataLoader workers pickle the dataset
-            if provider.loaded:
-                provider.release()
-                logger.info("released the MOSS text encoder after caching")
-            clean_memory_on_device(accelerator.device)
-            if not args.lowram:
-                vae.to(org_vae_device)
+        actually needs encoding and is released at the end, so complete caches never load it.
+        (library/moss/te_cache.py, shared with moss_train.py)"""
+        self.sample_prompts_te_outputs = te_cache.cache_moss_text_encoder_outputs(
+            args, accelerator, vae, dataset, self._te_provider, self.sample_prompts_te_outputs,
+            cache_sample_prompts=self._cache_sample_prompts)
 
     def _cache_sample_prompts(self, args, provider):
-        tokenize_strategy = strategy_base.TokenizeStrategy.get_strategy()
-        encoding_strategy = strategy_base.TextEncodingStrategy.get_strategy()
-        signature = strategy.moss_te_signature(args.moss_text_encoder, args.moss_max_token_length, args.moss_tokenizer_dir)
-        cache_dir = moss_train_utils.sample_prompt_cache_dir(args)
-        outputs = {}
-        for text in moss_train_utils.sample_prompt_texts(args):
-            path = moss_train_utils.sample_prompt_cache_path(cache_dir, signature, text)
-            cached = moss_train_utils.load_cached_sample_prompt(path)
-            if cached is None:
-                logger.info(f"  encode sample prompt: {text[:100]}")
-                with torch.no_grad():
-                    cached = encoding_strategy.encode_tokens(tokenize_strategy, [provider], tokenize_strategy.tokenize(text))
-                cached = [cached[0].to("cpu"), cached[1].to("cpu")]
-                moss_train_utils.save_cached_sample_prompt(path, cached)
-            outputs[text] = cached
-        logger.info(f"sample prompt embeddings ready: {len(outputs)} prompts ({cache_dir})")
-        return outputs
+        return te_cache.cache_moss_sample_prompts(args, provider)
 
     def is_text_encoder_not_needed_for_training(self, args):
         return True

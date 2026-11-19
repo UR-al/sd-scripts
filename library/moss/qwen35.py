@@ -287,6 +287,23 @@ _PREFIXES = ("language_model.", "model.language_model.", "model.", "")
 _SKIP = ("visual.", "mtp.", "lm_head.")
 
 
+def is_language_model_key(prefix: str, key: str) -> bool:
+    """A key of the language model (loaded) rather than the vision tower / MTP head / lm_head (skipped)."""
+    return key.startswith(prefix) and not key[len(prefix):].startswith(_SKIP)
+
+
+def detect_text_encoder_prefix(path: str) -> str:
+    """Header-only: the key prefix of a Qwen3.5-like text encoder file (no size check; tests use tiny configs)."""
+    from safetensors import safe_open
+
+    with safe_open(path, framework="pt", device="cpu") as f:
+        keys = set(f.keys())
+    for prefix in _PREFIXES:
+        if prefix + "embed_tokens.weight" in keys:
+            return prefix
+    raise ValueError(f"No embed_tokens.weight in {path}: not a Qwen3.5 text encoder")
+
+
 def check_moss_text_encoder(path: str) -> str:
     """Header-only check that ``path`` is the Qwen3.5-9B text encoder; returns the key prefix."""
     from safetensors import safe_open
@@ -306,22 +323,21 @@ def check_moss_text_encoder(path: str) -> str:
     return prefix
 
 
-def load_moss_text_encoder(path: str, device="cpu", dtype: torch.dtype = torch.bfloat16) -> MossQwen35TextEncoder:
-    """Strict load of the 426 language-model tensors (vision tower skipped), straight to ``device``."""
+def load_moss_text_encoder(path: str, device="cpu", dtype: torch.dtype = torch.bfloat16,
+                           config: Optional[MossQwen35Config] = None) -> MossQwen35TextEncoder:
+    """Strict load of the 426 language-model tensors (vision tower skipped), straight to ``device``. ``config``: a
+    non-default (tiny, test) config; then the 9B shape check is skipped and only the key prefix is detected."""
     from safetensors import safe_open
 
-    prefix = check_moss_text_encoder(path)
+    prefix = check_moss_text_encoder(path) if config is None else detect_text_encoder_prefix(path)
     state = {}
     with safe_open(path, framework="pt", device=str(torch.device(device))) as f:
         for key in f.keys():
-            if not key.startswith(prefix):
+            if not is_language_model_key(prefix, key):
                 continue
-            name = key[len(prefix):]
-            if name.startswith(_SKIP):
-                continue
-            state[name] = f.get_tensor(key).to(dtype)
+            state[key[len(prefix):]] = f.get_tensor(key).to(dtype)
     with torch.device("meta"):
-        model = MossQwen35TextEncoder()
+        model = MossQwen35TextEncoder(config or MossQwen35Config())
     model.requires_grad_(False)
     model.load_state_dict(state, strict=True, assign=True)  # inv_freq is a non-persistent fp32 CPU buffer
     logger.info(f"MOSS text encoder (Qwen3.5-9B) loaded from {path}: {len(state)} tensors, {dtype}, {device}")

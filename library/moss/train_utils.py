@@ -599,8 +599,13 @@ def validate_moss_stream_scale_args(args) -> None:
                        " overflow there")
 
 
-def validate_moss_args(args, train_dataset_group, val_dataset_group) -> None:
-    """Refuse option combinations the MOSS path does not support (ValueError with the reason)."""
+def validate_moss_args(args, train_dataset_group, val_dataset_group, *, live_te: bool = False,
+                       check_captions: bool = True) -> None:
+    """Refuse option combinations the MOSS path does not support (ValueError with the reason).
+
+    moss_train.py passes live_te (--moss_te_live: no TE cache, so no cache requirement and no caption-vs-cache checks)
+    and check_captions=False (ft_args.check_captions makes the caption checks there, with messages that name both
+    text paths). The LoRA trainer passes neither: unchanged."""
 
     def fail(message):
         raise ValueError(f"MOSS-Image: {message}")
@@ -624,7 +629,7 @@ def validate_moss_args(args, train_dataset_group, val_dataset_group) -> None:
         if args.mixed_precision not in ("bf16", "fp16"):
             logger.warning("MOSS-Image: --moss_stream_fp32 changes nothing without bf16 or fp16 mixed precision")
     validate_moss_stream_scale_args(args)
-    if not args.cache_text_encoder_outputs:
+    if not args.cache_text_encoder_outputs and not live_te:
         fail("--cache_text_encoder_outputs is required (the 16 GB Qwen3.5-9B is only loaded while caching; the user guide"
              " keeps the text encoder frozen)")
     if not args.network_train_unet_only:
@@ -653,14 +658,16 @@ def validate_moss_args(args, train_dataset_group, val_dataset_group) -> None:
         logger.warning("MOSS latents are already 2x2 packed tokens: setting hf_patch=1")
         args.hf_patch = 1
 
-    assert train_dataset_group.is_text_encoder_output_cacheable(cache_supports_dropout=True), (
-        "when caching text-encoder outputs, shuffle_caption / caption_tag_dropout_rate need --cache_caption_variants N>1,"
-        " and token_warmup_step cannot be used")
+    caption_checks = check_captions and not live_te
+    if caption_checks:
+        assert train_dataset_group.is_text_encoder_output_cacheable(cache_supports_dropout=True), (
+            "when caching text-encoder outputs, shuffle_caption / caption_tag_dropout_rate need --cache_caption_variants"
+            " N>1, and token_warmup_step cannot be used")
     for dataset in _datasets([train_dataset_group, val_dataset_group]):
         variants = int(getattr(dataset, "caption_aug_variant_count", 0) or 0)
         if variants > 1 and int(getattr(dataset, "aug_refresh_epochs", 0) or 0) > 0:
             fail("--cache_aug_refresh_epochs is not supported with caption variants (it re-encodes through the text encoder)")
-        for subset in getattr(dataset, "subsets", []):
+        for subset in getattr(dataset, "subsets", []) if caption_checks else []:
             if int(getattr(subset, "caption_dropout_every_n_epochs", 0) or 0) > 0:
                 fail("caption_dropout_every_n_epochs is not supported (it zeroes cached outputs; MOSS needs >= 1 text"
                      " token). Use caption_dropout_rate with --cache_caption_variants N>1")
