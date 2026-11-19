@@ -5,7 +5,7 @@ import torch
 from safetensors.torch import load_file, save_file
 from tqdm import tqdm
 from library import train_util
-from library.utils import setup_logging # このライブラリは別途必要です
+from library.utils import lora_tensor_dtype, setup_logging # このライブラリは別途必要です
 import logging
 import re
 import math
@@ -48,7 +48,7 @@ def load_state_dict_and_collect_modules(file_name, dtype):
 
     for key in list(sd.keys()):
         if isinstance(sd[key], torch.Tensor):
-            sd[key] = sd[key].to(dtype)
+            sd[key] = sd[key].to(lora_tensor_dtype(key, dtype))
         
         base_name = get_base_module_name(key)
         # lora_down.weight を代表としてモジュールを収集

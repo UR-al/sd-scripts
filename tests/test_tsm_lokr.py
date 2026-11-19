@@ -488,7 +488,7 @@ def test_save_load_round_trip_and_metadata(tmp_path, dtype):
     assert not info.get("missing keys") and not info.get("unexpected keys")
     sd1, sd2 = net.state_dict(), net2.state_dict()
     for k in sd1:
-        if dtype == torch.float32:
+        if dtype == torch.float32 or k.endswith(".dora_scale"):
             assert torch.equal(sd1[k], sd2[k]), k
         else:
             assert torch.equal(sd1[k].to(dtype).float(), sd2[k].float()), k

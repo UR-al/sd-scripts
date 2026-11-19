@@ -95,10 +95,12 @@
 
 from __future__ import annotations
 
+import copy
 import inspect
 import json
 import math
 import os
+import tempfile
 from collections import Counter, OrderedDict
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -106,7 +108,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from library.utils import setup_logging
+from library.utils import lora_tensor_dtype, setup_logging
 
 setup_logging()
 import logging
@@ -3939,7 +3941,7 @@ def after_network_created(network, args, logger=logger) -> None:
             "alpha": float(net_args.get("tlora_mask_alpha", 1.0)),
         }
 
-    orig_save = network.save_weights
+    orig_save = type(network).save_weights
     orig_requires_grad = network.requires_grad_
 
     def save_weights(file, dtype, metadata):
@@ -4338,11 +4340,29 @@ def _save_weights_for_forge(network, orig_save, file, dtype, metadata, log) -> A
 
         md[tsm_lokr.METADATA_EXPERT_KEY] = "lokr"
         md[tsm_lokr.METADATA_CONFIG_KEY] = tsm_lokr.metadata_json(tl[0], _tsm_timestep_dtype(network))
-    network.__dict__["state_dict"] = lambda *a, **k: converted  # read once by LycorisNetworkKohya.save_weights
-    try:
-        return orig_save(file, dtype, md)
-    finally:
-        network.__dict__.pop("state_dict", None)
+    mixed = dtype in (torch.float16, torch.bfloat16) and any(k.endswith(".dora_scale") for k in converted)
+    if mixed:
+        # Supply the final tensors to LyCORIS so its hash and serializer see the same mixed-precision state.
+        for key, value in converted.items():
+            if key.endswith(".dora_scale"):
+                value = network.get_parameter(key)
+            converted[key] = value.detach().cpu().to(lora_tensor_dtype(key, dtype), copy=True)
+        dtype = None
+        md["ss_dora_scale_dtype"] = "float32"
+    # Keep the basename for extension dispatch and the member names of torch.save archives.
+    with tempfile.TemporaryDirectory(dir=os.path.dirname(os.path.abspath(file))) as tmp:
+        staged = os.path.join(tmp, os.path.basename(file))
+        if mixed and os.path.splitext(file)[1] != ".safetensors":
+            # Creating _metadata before orig_save would also add NoRA flags to old-style torch archives.
+            converted._metadata = {"": {"ss_dora_scale_dtype": "float32"}}
+            result = torch.save(converted, staged)
+        else:
+            # Isolate the serializer's state_dict override from other saves and native resume snapshots.
+            writer = copy.copy(network)
+            writer.state_dict = lambda: converted
+            result = orig_save(writer, staged, dtype, md)
+        os.replace(staged, file)
+        return result
 
 
 # ---------------------------------------------------------------------------------------------------------------- load

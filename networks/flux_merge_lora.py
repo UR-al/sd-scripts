@@ -9,7 +9,7 @@ from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from tqdm import tqdm
 
-from library.utils import setup_logging, str_to_dtype
+from library.utils import lora_tensor_dtype, setup_logging, str_to_dtype
 from library.safetensors_utils import MemoryEfficientSafeOpen, mem_eff_save_file
 
 setup_logging()
@@ -31,7 +31,7 @@ def load_state_dict(file_name, dtype):
 
     for key in list(sd.keys()):
         if type(sd[key]) == torch.Tensor:
-            sd[key] = sd[key].to(dtype)
+            sd[key] = sd[key].to(lora_tensor_dtype(key, dtype))
 
     return sd, metadata
 
@@ -41,7 +41,7 @@ def save_to_file(file_name, state_dict: Dict[str, Union[Any, torch.Tensor]], dty
         logger.info(f"converting to {dtype}...")
         for key in tqdm(list(state_dict.keys())):
             if type(state_dict[key]) == torch.Tensor and state_dict[key].dtype.is_floating_point:
-                state_dict[key] = state_dict[key].to(dtype)
+                state_dict[key] = state_dict[key].to(lora_tensor_dtype(key, dtype))
 
     logger.info(f"saving to: {file_name}")
     if mem_eff_save:

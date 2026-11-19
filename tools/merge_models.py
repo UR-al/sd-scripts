@@ -5,7 +5,7 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from tqdm import tqdm
-from library.utils import setup_logging
+from library.utils import lora_tensor_dtype, setup_logging
 setup_logging()
 import logging
 logger = logging.getLogger(__name__)
@@ -81,7 +81,7 @@ def merge(args):
                         supplementary_key_ratios[key] = 1.0  # use first model's value for VAE or TextEncoder
                         continue
 
-                    value = ratio * value.to(dtype)  # first model's value * ratio
+                    value = ratio * value.to(lora_tensor_dtype(key, dtype))  # first model's value * ratio
                     merged_sd[key] = value
 
             logger.info(f"Model has {len(merged_sd)} keys " + ("(UNet only)" if args.unet_only else ""))
@@ -100,7 +100,7 @@ def merge(args):
                     continue
 
                 value = f.get_tensor(key)
-                merged_sd[new_key] = merged_sd[new_key] + ratio * value.to(dtype)
+                merged_sd[new_key] = merged_sd[new_key] + ratio * value.to(lora_tensor_dtype(key, dtype))
 
             # enumerate keys not in this model
             model_keys = set(model_keys)
@@ -125,12 +125,12 @@ def merge(args):
                 if is_unet_key(new_key):  # not VAE or TextEncoder
                     logger.warning(f"Key {new_key} not in all models, ratio = {supplementary_key_ratios[new_key]}")
 
-                value = f.get_tensor(key)  # original key
+                value = f.get_tensor(key).to(lora_tensor_dtype(key, dtype))  # original key
 
                 if new_key not in merged_sd:
-                    merged_sd[new_key] = supplementary_key_ratios[new_key] * value.to(dtype)
+                    merged_sd[new_key] = supplementary_key_ratios[new_key] * value
                 else:
-                    merged_sd[new_key] = merged_sd[new_key] + supplementary_key_ratios[new_key] * value.to(dtype)
+                    merged_sd[new_key] = merged_sd[new_key] + supplementary_key_ratios[new_key] * value
 
     # save
     output_file = args.output
@@ -141,7 +141,7 @@ def merge(args):
 
     # convert to save_dtype
     for k in merged_sd.keys():
-        merged_sd[k] = merged_sd[k].to(save_dtype)
+        merged_sd[k] = merged_sd[k].to(lora_tensor_dtype(k, save_dtype))
 
     save_file(merged_sd, output_file)
 

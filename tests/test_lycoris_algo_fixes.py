@@ -304,6 +304,143 @@ def metadata(path):
         return f.metadata() or {}
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("algo", ["lokr", "lora", "loha"])
+def test_dora_save_and_load_preserve_live_magnitudes(tmp_path, algo, dtype):
+    from safetensors.torch import load_file
+    from lycoris.utils import precalculate_safetensors_hashes
+
+    def new_net():
+        return make_net(make_model(dtype=torch.float32), algo, 4, 4, dora_wd=True, wd_on_output=False)
+
+    net = new_net()
+    with torch.no_grad():
+        for name, p in net.named_parameters():
+            if name.endswith(".dora_scale"):
+                p.fill_(0.500123)
+            else:
+                # Exactly representable factors give a common fp32 merge reference.
+                p.fill_(0.125)
+    live = {m.lora_name + ".dora_scale": m.dora_scale.detach().clone() for m in loras(net)}
+    assert live and all(not torch.equal(v, v.to(dtype).float()) for v in live.values())
+    old, new = (str(tmp_path / f"{name}.safetensors") for name in ("old", "new"))
+    old_md = {laf.METADATA_FLAG_KEY: "1", laf.METADATA_FORMAT_KEY: algo, laf.METADATA_ALGO_KEY: algo, "custom": "x"}
+    type(net).save_weights(net, old, dtype, old_md)
+    net.save_weights(new, dtype, {"custom": "x"})
+    legacy, saved = load_file(old), load_file(new)
+    assert saved.keys() == legacy.keys()
+    for key, tensor in saved.items():
+        expected = live.get(key, legacy[key])
+        assert tensor.dtype == expected.dtype, key
+        assert torch.equal(tensor, expected), key
+    converted, _ = laf.convert_state_dict_for_forge(net, net.state_dict())
+    model_hash = precalculate_safetensors_hashes({k: saved[k] for k in converted})
+    assert metadata(new) == {**metadata(old), "ss_dora_scale_dtype": "float32", "sshs_model_hash": model_hash}
+
+    for path, state in ((new, saved), (old, legacy)):
+        resumed = new_net()
+        assert not resumed.load_weights(path)
+        for m in loras(resumed):
+            assert torch.equal(m.dora_scale, state[m.lora_name + ".dora_scale"].float())
+        check_forge(resumed, path, dora_axis="input", tol=2e-6)
+    check_forge(net, new, dora_axis="input", tol=2e-6)
+
+
+@pytest.mark.parametrize("algo", ["lokr", "lora", "loha"])
+def test_dim_from_mixed_weights_reads_output_magnitudes(tmp_path, algo):
+    from lycoris import kohya
+
+    kwargs = {"factor": 4, "full_matrix": True} if algo == "lokr" else {}
+    net = make_net(make_model(dtype=torch.float32), algo, 4, 4, dora_wd=True, wd_on_output=True, **kwargs)
+    path = str(tmp_path / "weights.safetensors")
+    net.save_weights(path, torch.float16, {})
+    model = make_model(dtype=torch.float32)
+    inferred, _ = kohya.create_network_from_weights(1.0, path, None, None, model)
+    inferred.apply_to(None, model, False, True)
+    for m in loras(net):
+        assert torch.equal(inferred.get_parameter(m.lora_name + ".dora_scale"), m.dora_scale)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("ext", ["safetensors", "pt"])
+def test_save_without_dora_matches_legacy(tmp_path, dtype, ext):
+    net = make_net(make_model(dtype=torch.float32), "lora", 4, 4)
+    old = tmp_path / ("old/weights." + ext)
+    new = tmp_path / ("weights." + ext)
+    old.parent.mkdir()
+    md = {laf.METADATA_FLAG_KEY: "1", laf.METADATA_FORMAT_KEY: "lora", laf.METADATA_ALGO_KEY: "lora"}
+    # Reproduce the previous wrapper, including Forge conversion for torch's archive.
+    converted, _ = laf.convert_state_dict_for_forge(net, net.state_dict())
+    net.state_dict = lambda: converted
+    try:
+        type(net).save_weights(net, str(old), dtype, md)
+    finally:
+        del net.state_dict
+    net.save_weights(str(new), dtype, {})
+    a, b = old.read_bytes(), new.read_bytes()
+    if ext == "safetensors":
+        # Rust randomizes metadata map order even between two legacy saves.
+        end = 8 + int.from_bytes(a[:8], "little")
+        assert a[:8] == b[:8] and json.loads(a[8:end]) == json.loads(b[8:end])
+        a, b = a[end:], b[end:]
+    assert a == b
+
+
+def test_dora_save_failure_preserves_checkpoint(tmp_path, monkeypatch):
+    import safetensors.torch
+
+    net = make_net(make_model(dtype=torch.float32), "lokr", 4, 4, dora_wd=True)
+    path = tmp_path / "weights.safetensors"
+    net.save_weights(str(path), torch.float16, {})
+    previous = path.read_bytes()
+
+    def fail(tensors, filename, metadata):
+        with open(filename, "wb") as stream:
+            stream.write(b"incomplete")
+        raise OSError("interrupted save")
+
+    monkeypatch.setattr(safetensors.torch, "save_file", fail)
+    with pytest.raises(OSError, match="interrupted save"):
+        net.save_weights(str(path), torch.float16, {})
+    assert path.read_bytes() == previous
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_dora_torch_archive_keeps_magnitudes_and_metadata(tmp_path):
+    net = make_net(make_model(dtype=torch.float32), "lora", 4, 4, dora_wd=True)
+    path = str(tmp_path / "weights.pt")
+    net.save_weights(path, torch.bfloat16, {})
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    # The previous Forge torch archive carried no root metadata.
+    assert state._metadata[""] == {"ss_dora_scale_dtype": "float32"}
+    resumed = make_net(make_model(dtype=torch.float32), "lora", 4, 4, dora_wd=True)
+    assert not resumed.load_weights(path)
+    for m in loras(net):
+        key = m.lora_name + ".dora_scale"
+        assert state[key].dtype == torch.float32
+        assert torch.equal(state[key], m.dora_scale)
+        assert torch.equal(resumed.get_parameter(key), m.dora_scale)
+
+
+def test_overlapping_saves_take_independent_snapshots(tmp_path, monkeypatch):
+    import safetensors.torch
+
+    net = make_net(make_model(dtype=torch.float32), "lora", 4, 4, dora_wd=True)
+    other = str(tmp_path / "fp32.safetensors")
+    original = safetensors.torch.save_file
+
+    def save_during_write(tensors, filename, metadata):
+        monkeypatch.setattr(safetensors.torch, "save_file", original)
+        net.save_weights(other, torch.float32, {})
+        original(tensors, filename, metadata)
+
+    monkeypatch.setattr(safetensors.torch, "save_file", save_during_write)
+    net.save_weights(str(tmp_path / "fp16.safetensors"), torch.float16, {})
+    other_sd = safetensors.torch.load_file(other)
+    for key, tensor in net.state_dict().items():
+        assert torch.equal(other_sd[key], tensor), key
+
+
 def model_out(model, seed=7, conv=False):
     b = make_batch(seed, conv=conv)
     b = {k: v.float() for k, v in b.items()}

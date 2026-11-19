@@ -129,6 +129,13 @@ def weighs_to_device(layer: nn.Module, device: torch.device):
             module.weight.data = module.weight.data.to(device, non_blocking=True)
 
 
+def lora_tensor_dtype(key: str, dtype: Optional[torch.dtype]) -> Optional[torch.dtype]:
+    """Keep the small learned changes in DoRA magnitudes when casting adapter weights."""
+    if key.endswith(".dora_scale") and dtype in (torch.float16, torch.bfloat16):
+        return torch.float32
+    return dtype
+
+
 def str_to_dtype(s: Optional[str], default_dtype: Optional[torch.dtype] = None) -> torch.dtype:
     """
     Convert a string to a torch.dtype

@@ -12,7 +12,7 @@ import library.model_util as model_util
 import lora
 import oft
 from svd_merge_lora import format_lbws, get_lbw_block_index, LAYER26
-from library.utils import setup_logging
+from library.utils import lora_tensor_dtype, setup_logging
 
 setup_logging()
 import logging
@@ -30,7 +30,7 @@ def load_state_dict(file_name, dtype):
 
     for key in list(sd.keys()):
         if type(sd[key]) == torch.Tensor:
-            sd[key] = sd[key].to(dtype)
+            sd[key] = sd[key].to(lora_tensor_dtype(key, dtype))
 
     return sd, metadata
 
@@ -429,7 +429,7 @@ def merge(args):
         for key in list(state_dict.keys()):
             value = state_dict[key]
             if type(value) == torch.Tensor and value.dtype.is_floating_point and value.dtype != save_dtype:
-                state_dict[key] = value.to(save_dtype)
+                state_dict[key] = value.to(lora_tensor_dtype(key, save_dtype))
 
         logger.info(f"calculating hashes and creating metadata...")
 

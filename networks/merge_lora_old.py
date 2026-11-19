@@ -6,7 +6,7 @@ import torch
 from safetensors.torch import load_file, save_file
 import library.model_util as model_util
 import lora
-from library.utils import setup_logging
+from library.utils import lora_tensor_dtype, setup_logging
 setup_logging()
 import logging
 logger = logging.getLogger(__name__)
@@ -18,7 +18,7 @@ def load_state_dict(file_name, dtype):
     sd = torch.load(file_name, map_location='cpu')
   for key in list(sd.keys()):
     if type(sd[key]) == torch.Tensor:
-      sd[key] = sd[key].to(dtype)
+      sd[key] = sd[key].to(lora_tensor_dtype(key, dtype))
   return sd
 
 
@@ -26,7 +26,7 @@ def save_to_file(file_name, model, state_dict, dtype):
   if dtype is not None:
     for key in list(state_dict.keys()):
       if type(state_dict[key]) == torch.Tensor:
-        state_dict[key] = state_dict[key].to(dtype)
+        state_dict[key] = state_dict[key].to(lora_tensor_dtype(key, dtype))
 
   if os.path.splitext(file_name)[1] == '.safetensors':
     save_file(model, file_name)
@@ -108,7 +108,10 @@ def merge_lora_models(models, ratios, merge_dtype):
         if key in merged_sd:
           assert merged_sd[key] == lora_sd[key], f"alpha mismatch / alphaが異なる場合、現時点ではマージできません"
         else:
-          alpha = lora_sd[key].detach().numpy()
+          alpha_tensor = lora_sd[key].detach()
+          if alpha_tensor.dtype == torch.bfloat16:  # NumPy cannot represent bf16.
+            alpha_tensor = alpha_tensor.float()
+          alpha = alpha_tensor.numpy()
           merged_sd[key] = lora_sd[key]
       else:
         if key in merged_sd:

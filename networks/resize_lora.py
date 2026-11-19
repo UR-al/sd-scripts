@@ -11,7 +11,7 @@ import numpy as np
 
 from library import train_util
 from library import model_util
-from library.utils import setup_logging
+from library.utils import lora_tensor_dtype, setup_logging
 
 setup_logging()
 import logging
@@ -41,7 +41,7 @@ def load_state_dict(file_name, dtype):
 
     for key in list(sd.keys()):
         if type(sd[key]) == torch.Tensor:
-            sd[key] = sd[key].to(dtype)
+            sd[key] = sd[key].to(lora_tensor_dtype(key, dtype))
 
     return sd, metadata
 
@@ -368,7 +368,7 @@ def resize(args):
     for key in list(state_dict.keys()):
         value = state_dict[key]
         if type(value) == torch.Tensor and value.dtype.is_floating_point and value.dtype != save_dtype:
-            state_dict[key] = value.to(save_dtype)
+            state_dict[key] = value.to(lora_tensor_dtype(key, save_dtype))
 
     model_hash, legacy_hash = train_util.precalculate_safetensors_hashes(state_dict, metadata)
     metadata["sshs_model_hash"] = model_hash
