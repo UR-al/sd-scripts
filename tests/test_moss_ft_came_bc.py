@@ -53,6 +53,32 @@ def flags(decay: str) -> dict:
     return dict(dict(weight_decouple=True, fixed_decay=False, cautious_weight_decay=False), **spec)
 
 
+@pytest.mark.parametrize("shape", [(), (2,), (2, 2)], ids=["scalar", "vector", "matrix"])
+@pytest.mark.parametrize("strategy", ["unmodified", "cautious"])
+@pytest.mark.parametrize("corrected", [False, True])
+def test_host_coupled_l2_updates_moments_with_zero_data_gradient(shape, strategy, corrected):
+    weights = torch.ones(shape)
+    weights.view(-1)[::2] = -1.0
+    p = torch.nn.Parameter(weights)
+    opt = HostCAME([p], lr=0.01, betas=(0.5, 0.5, 0.5), weight_decay=0.5, weight_decouple=False,
+                   update_strategy=strategy, bias_correction=corrected, non_factored_confidence=True)
+    slots = ft_host.make_slots([("p", p)], opt)
+    pool = ft_host.HostPool(slots, opt.POOL_ROLES)
+    pool.copy_master_from_params()
+    opt.bind(slots, pool)
+    master, moment = pool.view("master", 0), pool.view("exp_avg", 0)
+    opt.step_param(slots[0], opt.snapshot_group(opt.param_groups[0]), master, torch.zeros_like(master),
+                   moment, pool.step(0).add_(1))
+
+    # |dL/dp + wd*p| = 0.5, so the first raw variance is (1 - beta2) * 0.5**2.
+    keys = ("exp_avg_sq_row", "exp_avg_sq_col") if len(shape) == 2 else ("exp_avg_sq",)
+    for key in keys:
+        variance = opt.extra_state()[f"p.{key}"]
+        assert torch.equal(variance, torch.full_like(variance, 0.125))
+    assert torch.equal(moment.sign(), p.detach().flatten().sign())
+    assert (master.abs() < 1.0).all()
+
+
 @pytest.mark.parametrize("decay", list(DECAYS))
 @pytest.mark.parametrize("strategy", ["unmodified", "cautious"])
 def test_core_matches_came_py_without_correction(strategy, decay):

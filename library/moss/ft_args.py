@@ -103,6 +103,9 @@ def _refuse(message: str):
 # ---- the parser (4.2, 4.5) ------------------------------------------------------------------------------------------
 def add_moss_ft_arguments(parser) -> None:
     """The new arguments of design 4.5."""
+    parser.add_argument("--moss_ft_resume_new_lr_schedule", action="store_true",
+                        help="on resume, start the current CLI LR schedule from its beginning instead of loading the"
+                             " saved LR/scheduler state; keep optimizer state, global step and dataset progress")
     parser.add_argument("--moss_ft_lr_phases", type=lr_phases_arg, default=None,
                         help='LR phases "E1:LR1,E2:LR2[,...]" (epochs and LR of each phase, e.g. "2:5e-6,6:1e-6";'
                              " fractional epochs allowed). Phase i ends after round(cumsum(E)_i x steps per epoch)"

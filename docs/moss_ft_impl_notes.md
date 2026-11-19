@@ -162,10 +162,9 @@ Tests: `tests/test_moss_ft_host_adamw.py`, `tests/test_moss_ft_hooks.py`, `tests
     update rule but are fed the corrected update, so they differ in the first steps. The test checks the same state
     tensors (names, shapes, dtypes), bit-identical second-moment EMAs, and identical steps from either state once
     1 - beta^t rounds to 1.
-14. came.py's non-decoupled weight decay (`weight_decouple=False`) is added to the gradient after the update is built,
-    so it only changes the cautious mask. It is kept as came.py does it (bit-identical test), and HostCAME warns when
-    it is used with weight_decay > 0. HostCAME refuses came.py's deprecated `cautious=` and applies the refusal rules
-    to every param group too.
+14. With `weight_decouple=False`, HostCAME and came.py add `weight_decay * master` to the gradient before computing
+    the moments. `cautious_weight_decay=True` takes precedence and applies masked decay directly to the master.
+    HostCAME refuses came.py's deprecated `cautious=` and applies the refusal rules to every param group too.
 15. `test_bias_correction_removes_amplification` also runs beta3 = 0.9999 (the failing default): with beta2 = beta3 a
     swapped bc2 / bc3 goes unnoticed (checked by a mutation run). Measured (64x64, ratio to the mean of steps
     1,001-3,000): corrected t1 / t2 / t5 / t10 / t24 = 3.37 / 2.45 / 1.62 / 1.27 / 1.04 for both beta3; AdamW

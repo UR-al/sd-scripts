@@ -544,6 +544,53 @@ NON_PHASE_SCHEDULERS = {  # moss_train.py without --moss_ft_lr_phases: any get_s
 }
 
 
+@pytest.mark.parametrize("override", [False, True])
+@pytest.mark.parametrize("case", sorted(NON_PHASE_SCHEDULERS))
+def test_resume_lr_policy_is_explicit(tmp_path, monkeypatch, case, override):
+    """Default restores the saved LR; opt-in starts the entire newly configured schedule at step zero."""
+    if case == "custom_restarts":
+        pytest.importorskip("LoraEasyCustomOptimizer.CosineAnnealingWarmRestarts")
+    base_path, _ = M.write_base(tmp_path)
+    args = _args(moss_ft_lr_phases=None, max_train_steps=8, **NON_PHASE_SCHEDULERS[case])
+    first = Run(base_path, args)
+    try:
+        first.windows(3)
+        path = first.save(str(tmp_path / "states"), "saved")
+        saved_lrs = [g["lr"] for g in first.optimizer.param_groups]
+        saved_moments = first.pool.roles["exp_avg"].clone()
+    finally:
+        first.close()
+    new_args = _args(moss_ft_lr_phases=None, max_train_steps=12, learning_rate=5e-4,
+                     moss_ft_resume_new_lr_schedule=override, **NON_PHASE_SCHEDULERS[case])
+    parsed = ft_args.setup_parser().parse_args(["--moss_ft_resume_new_lr_schedule"] if override else [])
+    assert parsed.moss_ft_resume_new_lr_schedule is override
+    resumed = Run(base_path, new_args)
+    fresh = Run(base_path, new_args)
+    lines = []
+    monkeypatch.setattr(ft_state.logger, "warning", lambda msg, *a, **kw: lines.append(str(msg)))
+    try:
+        resumed.load(path)
+        assert resumed.global_step == 3
+        assert torch.equal(resumed.pool.roles["exp_avg"], saved_moments)
+        if override:
+            assert resumed.scheduler.state_dict() == fresh.scheduler.state_dict()
+            for _ in range(4):
+                assert [g["lr"] for g in resumed.optimizer.param_groups] == [g["lr"] for g in fresh.optimizer.param_groups]
+                # Include recursive and group-state cycle schedulers, not just base_lrs.
+                resumed.optimizer.step()
+                fresh.optimizer.step()
+                resumed.scheduler.step()
+                fresh.scheduler.step()
+        else:
+            assert [g["lr"] for g in resumed.optimizer.param_groups] == saved_lrs
+            assert resumed.scheduler.last_epoch == 3
+            assert any("saved LR" in line and "--moss_ft_resume_new_lr_schedule" in line
+                       and "learning_rate" in line for line in lines), lines
+    finally:
+        resumed.close()
+        fresh.close()
+
+
 @pytest.mark.parametrize("case", sorted(NON_PHASE_SCHEDULERS))
 def test_resume_continues_a_non_phase_scheduler(tmp_path, caplog, case):
     """Review fix: the param groups (lr, initial_lr and whatever a scheduler keeps there) are part of the state. A
@@ -582,6 +629,47 @@ def test_resume_continues_a_non_phase_scheduler(tmp_path, caplog, case):
         _assert_same(straight, resumed)
     finally:
         resumed.close()
+
+
+def test_new_lr_schedule_keeps_mode_b_optimizer_state(tmp_path):
+    """Mode b loads whole optimizer groups: the saved LR must not overwrite the new scheduler's LR."""
+    from transformers.optimization import Adafactor
+
+    base_path, _ = M.write_base(tmp_path)
+    args = _args(optimizer_type="Adafactor", fused_backward_pass=True, gradient_accumulation_steps=1,
+                 moss_ft_lr_phases=None, max_grad_norm=0.0, moss_ft_resume_new_lr_schedule=True)
+
+    def make(lr):
+        model, pool, slots = ft_model.load_moss_for_full_ft(str(base_path), args, "cpu", config=M.TINY)
+        assert pool is None
+        optimizer = Adafactor(ft_model.param_groups(ft_model.trainable_named(slots)), lr=lr,
+                              scale_parameter=False, relative_step=False, warmup_init=False)
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.5)
+        return model, slots, optimizer, scheduler
+
+    model, slots, optimizer, scheduler = make(1e-3)
+    for p in model.parameters():
+        if p.requires_grad:
+            p.grad = torch.ones_like(p)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    scheduler.step()
+    path = ft_state.write_state(str(tmp_path), "mode_b", model=model, slots=slots, pool=None,
+                                optimizer=optimizer, lr_scheduler=scheduler, mode=ft_args.ADAFACTOR_FUSED,
+                                progress=ft_state.TrainProgress(global_step=1, completed_epochs=1), args=args,
+                                fsync=False)
+    other, other_slots, other_opt, other_sched = make(5e-4)
+    fresh_state = other_sched.state_dict()
+    info = ft_state.load_state(path, model=other, slots=other_slots, pool=None, optimizer=other_opt,
+                               lr_scheduler=other_sched, mode=ft_args.ADAFACTOR_FUSED, args=args, restore_rng=False)
+    assert info.progress.global_step == 1
+    assert other_sched.state_dict() == fresh_state
+    assert all(g["lr"] == 5e-4 and g["initial_lr"] == 5e-4 for g in other_opt.param_groups)
+    for p, q in zip(model.parameters(), other.parameters()):
+        assert torch.equal(p, q)
+        for key, value in optimizer.state.get(p, {}).items():
+            actual = other_opt.state[q][key]
+            assert torch.equal(actual, value) if torch.is_tensor(value) else actual == value
 
 
 def _keep_test_progress(global_step, completed_epochs, epoch_step=0):

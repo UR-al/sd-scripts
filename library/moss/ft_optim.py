@@ -161,10 +161,6 @@ def _decay_and_apply(update, grad, p_fp32, lr, weight_decay, weight_decouple, fi
     elif weight_decouple:
         wd_factor = 1.0 if fixed_decay else lr
         p_fp32.mul_(1.0 - weight_decay * wd_factor)
-    else:
-        # came.py's non-decoupled decay: added to the gradient AFTER the update was built, so it changes only the
-        # cautious mask below (kept as came.py does it; HostCAME warns about it)
-        grad.add_(p_fp32, alpha=weight_decay)
     update.mul_(lr)
     if cautious:
         mask = (update * grad > 0).to(grad.dtype)
@@ -188,6 +184,8 @@ def came_factored_core(grad: torch.Tensor, exp_avg: torch.Tensor, exp_avg_sq_row
     final update reads exp_avg / bc1; the row factors are ratios and need nothing; the residual uses the uncorrected
     exp_avg. Every EMA update is unchanged, so states are interchangeable with and without it."""
     bc1, bc2, bc3 = _read_out(bias_correction)
+    if not weight_decouple and not cautious_weight_decay:
+        grad.add_(p_fp32, alpha=weight_decay)
     update = torch.mul(grad, grad).add_(eps1)
 
     a1, a2, a3 = alphas
@@ -237,6 +235,8 @@ def came_unfactored_core(grad: torch.Tensor, exp_avg: torch.Tensor, exp_avg_sq: 
     correction: rsqrt(exp_avg_sq / bc2), the update exp_avg / bc1 and, with non_factored_confidence, the denominator
     sqrt(exp_avg_res / bc3) + eps2. exp_avg_res may be None when non_factored_confidence is off."""
     bc1, bc2, bc3 = _read_out(bias_correction)
+    if not weight_decouple and not cautious_weight_decay:
+        grad.add_(p_fp32, alpha=weight_decay)
     update = torch.mul(grad, grad).add_(eps1)
 
     a1, a2, a3 = alphas
@@ -342,11 +342,6 @@ class HostCAME(torch.optim.Optimizer):
                                  f"({_BETA3_TABLE})")
             if group["update_strategy"] not in ("unmodified", "cautious"):
                 raise ValueError(f"came_host group {index}: update_strategy {group['update_strategy']!r} is refused")
-            if not group["weight_decouple"] and not group["cautious_weight_decay"] and group["weight_decay"] > 0:
-                logger.warning(f"came_host group {index}: weight_decouple=False - came.py adds this weight decay to "
-                               "the gradient after the update is built, so it only changes the cautious mask, never "
-                               "the step itself (kept as came.py does it). Use weight_decouple=True for a weight "
-                               "decay.")
         self._slot_state: Dict[int, Dict[str, torch.Tensor]] = {}
         self._slot_names: Dict[int, str] = {}
 

@@ -30,6 +30,31 @@ from library.moss.ft_optim import HostAdamW, HostCAME  # noqa: E402
 TARGET = "layers.2.proj.q.weight"
 
 
+@pytest.mark.parametrize("inline", [True, False])
+@pytest.mark.parametrize("clip", ["none", "stale", "exact"])
+@pytest.mark.parametrize("kind", ["adamw", "came"])
+def test_finite_accumulated_gradients_can_exceed_fp32_squared_norm(kind, clip, inline):
+    """Each micro norm fits fp32; the accumulated squared norm does not. Unscale exactly once."""
+    param = torch.nn.Parameter(torch.ones(4))
+    named = [("weight", param)]
+    opt = make_optimizer(kind, named)
+    kw = {} if clip == "none" else dict(max_grad_norm=0.05, clip_mode=clip)
+    pipe, pool, slots = C.make_pipeline(named, opt, 2, inline=inline, **kw)
+    scaler = ft_scaler.DynamicLossScaler(init_scale=2.0 ** 24)
+    try:
+        stats, _ = train([[lambda: param.sum() * (1e19 / 2.0 ** 24)] * 2], pipe, opt, scaler)
+        st = stats[0]
+        assert st.stepped_params == 1 and not st.overflow
+        assert st.grad_norm == pytest.approx(2e19 / 2.0 ** 24, rel=1e-6)
+        if clip != "none":
+            assert st.clip_coef == pytest.approx(0.05 / (2e19 / 2.0 ** 24), rel=1e-6, abs=0)
+        assert all(torch.isfinite(t).all() for t in pool.roles.values())
+        assert not torch.equal(param.detach(), torch.ones(4))
+        C.assert_compute_copies(pool, slots)
+    finally:
+        pipe.close()
+
+
 def make_optimizer(kind, named):
     if kind == "adamw":
         return HostAdamW(C.param_groups(named, 0.1), lr=1e-3, betas=(0.9, 0.999), eps=1e-8)

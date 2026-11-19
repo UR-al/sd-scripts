@@ -808,8 +808,11 @@ class GradPipeline:
                 norms = [w.slot_norm[s] for s in range(len(self.slots)) if w.first_j[s] >= 0 and not w.poisoned[s]]
                 # clip_grad_norm_'s total: the norm of the stacked per-parameter norms (slot order)
                 total = torch.linalg.vector_norm(torch.stack(norms), 2.0) if norms else torch.zeros(())
+                if not torch.isfinite(total):
+                    total = torch.linalg.vector_norm(torch.stack(norms).double(), 2.0)
                 if w.inv_scale != 1.0:
                     total = total * w.inv_scale
+                total = total.float()
                 coef = self._coef_from_norm(total)
             else:
                 coef = w.plan.coef
@@ -1087,6 +1090,12 @@ class GradPipeline:
     def _add_sumsq(self, w: _Window, t: torch.Tensor, slot: ParamSlot) -> None:
         value = torch.dot(t, t).item()
         if not math.isfinite(value):
+            # Keep the normal fp32 result bit for bit. Only the reduction may have overflowed:
+            # fp64 squares every finite fp32 input safely. The sum is still SCALED; _finish_window
+            # applies inv_scale once, after sqrt, and stepping unscales independently via w.coef.
+            wide = t.double()
+            value = torch.dot(wide, wide).item()
+        if not math.isfinite(value):
             raise HostPipelineError(f"{slot.name}: non-finite accumulated gradient although every micro-step's norm "
                                     "was finite (fp32 overflow); the pool may be partly stepped - resume from a state")
         w.sumsq += value
@@ -1165,7 +1174,11 @@ class GradPipeline:
         of the parameter-shaped gradient, fp32)."""
         slot = self.slots[s]
         if w.slot_norm[s] is None:
-            w.slot_norm[s] = torch.linalg.vector_norm(self._acc_flat(slot).view(slot.shape), 2.0)
+            grad = self._acc_flat(slot).view(slot.shape)
+            norm = torch.linalg.vector_norm(grad, 2.0)
+            if not torch.isfinite(norm):
+                norm = torch.linalg.vector_norm(grad.double(), 2.0)
+            w.slot_norm[s] = norm
 
     # ---------------------------------------------------------------------------------------- worker: uploads
 

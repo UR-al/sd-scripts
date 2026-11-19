@@ -464,6 +464,15 @@ seed = 1234
 
 **Resume:** `resume = "<output_root>/<run>/<name>-state"` (a state folder, not `output_dir` itself: that is refused with the
 name of the newest state inside it).
+- By default, the saved LR and scheduler state are restored. A changed CLI LR or schedule produces a warning with
+  the changed values and the override flag. The existing `moss_ft_lr_phases` exception remains: it applies the current
+  phase configuration at the saved scheduler step and warns when it differs.
+- Opt in with `--moss_ft_resume_new_lr_schedule` (TOML: `moss_ft_resume_new_lr_schedule = true`) to start the current
+  CLI schedule at its beginning, including warmup and restart cycles. This retains model weights, optimizer moments
+  and parameter step counts, `global_step`, data position and loss scaler. The new scheduler's step zero is relative
+  to the resume, while logging/save step numbers remain cumulative. For example, `--learning_rate 5e-6` with this
+  flag starts a new schedule based on 5e-6; without the flag the saved LR is restored. This option also restarts an
+  explicitly configured phase schedule from its beginning.
 - **An epoch-end state** continues the optimizer state, the LR (any scheduler: the param groups are part of the state),
   the clipping counters and the noise exactly. A step state written at an epoch's last window counts as an epoch-end
   state.
@@ -479,6 +488,17 @@ name of the newest state inside it).
 - A resumed run does not sample at its start.
 
 ## 6. Logs
+
+`global_step` counts accumulation windows that update at least one parameter. An all-overflow skip or a stale-clip
+measurement window does not advance LR, Carousel periods, the progress bar, step logs, validation, step sampling or
+step saves. Partial overflow with some updated parameters counts as one step. Loss-scale recovery and consumed
+images/batches advance on every attempted window, so resume retains the correct data position. Epoch-end sampling
+and saving still follow consumed epochs; the configured epoch budget is unchanged, so skips can leave fewer
+successful updates than `max_train_steps` at train end.
+
+DiT metadata `ss_moss_ft_epoch` is the one-based epoch containing the save, consistently for step, epoch-end and
+final saves (including a final save inside an epoch). It is zero only before any batch has been consumed. Training
+state `completed_epochs` remains a count of fully consumed epochs, with `epoch_step` locating an unfinished epoch.
 
 TensorBoard via `log_with` / `logging_dir`.
 
@@ -716,11 +736,11 @@ gains or loses (low sigma = detail, high sigma = composition).
   written at start-up in the same VAE pass as the training latents), variant 0, never flipped. An image without cached
   latents is refused at start-up. With `cache_latents_to_disk` they are read from the npz at every validation (no host
   RAM held); without it they stay in memory like the training latents.
-- **Captions:** kohya's `process_caption` without its draws: the **first line** of a multi-line caption (with or without
-  `enable_wildcard`), the first `{a|b}` option with `enable_wildcard`, prefix / suffix, the `keep_tokens` /
+- **Captions:** kohya's `process_caption` without its draws: retain the entire multi-line caption when
+  `enable_wildcard = false`; with `enable_wildcard`, select the first line and the first `{a|b}` option. Prefix / suffix, the `keep_tokens` /
   `keep_tokens_separator` split joined with ", " like the shuffled training captions (a `HEAD ||| TAGS ||| SENTENCES`
   caption reaches the encoder as `HEAD, TAGS, SENTENCES` in the file's order), no shuffle, no tag dropout, no caption
-  dropout, no token warmup (`captions.canonical_caption` on the first line). A log line lists the random caption
+  dropout, no token warmup (`captions.canonical_caption` on the original caption). A log line lists the random caption
   settings of the TOML that are not applied.
 - **Text-encoder outputs:** encoded once at start-up, each caption alone and unpadded (the cached path's encoding; the
   live encoder's pass runs with `batch_rows` 1 even under `moss_te_live_batch` N), kept on the CPU (~2.4 MB per

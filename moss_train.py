@@ -806,12 +806,15 @@ def _train_loop(run: Run, train_dataset_group, collator, current_epoch, current_
 
             # the window is stepped and drained: the pool is stable for logs, samples and saves
             step_s = time.perf_counter() - meter.start
-            run.lr_scheduler.step()
-            global_step += 1
+            stepped = stats.stepped_params > 0  # partial overflow still counts when any parameter was updated
+            if stepped:
+                run.lr_scheduler.step()
+                global_step += 1
             current_step.value = global_step
             # carousel: a new active set at a period boundary (before the logs, samples and saves of this step; none
             # after the last step)
-            switch_logs = pipeline.after_step(global_step, max_steps) if hasattr(pipeline, "after_step") else None
+            switch_logs = (pipeline.after_step(global_step, max_steps)
+                           if stepped and hasattr(pipeline, "after_step") else None)
             progress = progress_after_window(global_step=global_step, epoch=epoch, consumed=consumed,
                                              num_batches=num_batches, steps_per_epoch=run.steps_per_epoch,
                                              gradient_accumulation_steps=ga, lr_schedule=run.lr_schedule(),
@@ -829,6 +832,17 @@ def _train_loop(run: Run, train_dataset_group, collator, current_epoch, current_
                 if event != ft_scaler.KEEP:
                     logger.info(f"step {global_step}: fp16 loss scale {stats.loss_scale:g} -> {scaler.scale:g}"
                                 f" ({'overflow' if event == ft_scaler.BACKOFF else 'clean steps'})")
+            if not stepped:
+                # Data progress and loss-scale recovery belong to attempted windows. LR, Carousel, step logs,
+                # samples and saves belong to successful updates (also excludes stale clipping's measure window).
+                if scaler is None:
+                    pipeline.check_skip_streak(stats)
+                else:
+                    scaler.check(args.moss_ft_max_skipped_steps)
+                logger.info(f"step {global_step}: window without a parameter update ({stats.clip_mode});"
+                            " LR and step cadence unchanged")
+                mark = time.perf_counter()
+                continue
             if global_step % log_every == 0:
                 memory = memory_logs(device, pipeline)
                 tiers = timer.report()
@@ -859,7 +873,7 @@ def _train_loop(run: Run, train_dataset_group, collator, current_epoch, current_
             if step_save_due(args, global_step):
                 accelerator.wait_for_everyone()
                 if accelerator.is_main_process:
-                    run.save_dit(train_util.get_step_ckpt_name(args, ".safetensors", global_step), global_step, epoch)
+                    run.save_dit(train_util.get_step_ckpt_name(args, ".safetensors", global_step), global_step, epoch_no)
                     remove_no = train_util.get_remove_step_no(args, global_step)
                     run.remove_dit(None if remove_no is None else
                                    train_util.get_step_ckpt_name(args, ".safetensors", remove_no))
@@ -892,7 +906,8 @@ def _train_loop(run: Run, train_dataset_group, collator, current_epoch, current_
     if accelerator.is_main_process:
         if args.save_state or args.save_state_on_train_end:
             run.save_state(ft_state.last_state_name(args.output_name), progress)
-        run.save_dit(train_util.get_last_ckpt_name(args, ".safetensors"), global_step, progress.completed_epochs)
+        save_epoch = progress.completed_epochs + int(progress.epoch_step > 0)
+        run.save_dit(train_util.get_last_ckpt_name(args, ".safetensors"), global_step, save_epoch)
         logger.info("model saved.")
 
 

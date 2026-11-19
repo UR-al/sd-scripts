@@ -612,6 +612,7 @@ class CarouselEngine:
             if i not in trainable:
                 continue  # an always-group change (e.g. small -> head): that tensor is not trained any more
             self._pending[i] = cco.state_from_entries(self.kind, values)
+        self.switches = int(info.get("switches", 0))
         logger.info(f"{LOG}: read the optimizer states of {len(self._pending)} tensors from {path} (saved active"
                     f" units {info.get('active')})")
 

@@ -542,7 +542,9 @@ def load_state(path: str, *, model, slots: Sequence[ft_host.ParamSlot], pool: Op
     hyperparameters, the steps per epoch (this run's, when given), GA or other arguments changed (the LR phase
     scheduler warns about its own schedule). The param groups' scheduled values (lr, initial_lr, what the scheduler keeps
     there) come back from param_groups.pt before the scheduler's state (modes a / c; mode b: optimizer.pt), so the
-    first resumed window steps with the LR the saved run would have used. The caller continues at
+    first resumed window steps with the LR the saved run would have used. With moss_ft_resume_new_lr_schedule,
+    the fresh scheduler and its group values instead start at step zero; all other state is still restored.
+    The caller continues at
     info.progress.global_step, in epoch info.start_epoch, skipping info.batches_to_skip batches, and restores the
     pipeline's counters: pipeline.restore_counters(info.last_grad_norm, info.skip_streak), and an fp16 run's loss
     scaler: ft_scaler.restore(scaler, info.loss_scaler). extra_reader(path, files, train_state): the counterpart of
@@ -584,6 +586,24 @@ def load_state(path: str, *, model, slots: Sequence[ft_host.ParamSlot], pool: Op
     if state.get("torch_version") != torch.__version__:
         logger.info(f"{PREFIX}the state was saved with torch {state.get('torch_version')}, this is {torch.__version__}")
     files = complete["files"]
+    new_schedule = bool(getattr(args, "moss_ft_resume_new_lr_schedule", False))
+    own = _own_keys(optimizer) or set()
+    fresh_schedule_groups = [{k: v for k, v in group.items()
+                              if k != "params" and (k in SCHEDULED_KEYS or k not in own)}
+                             for group in optimizer.param_groups] if new_schedule else None
+    if new_schedule:
+        logger.info(f"{PREFIX}--moss_ft_resume_new_lr_schedule: starting the current CLI LR schedule from its"
+                    " beginning; optimizer state, global_step and data progress are still restored")
+    elif args is not None and not isinstance(lr_scheduler, ft_args.LrPhaseScheduler):
+        saved_args, now = state.get("args") or {}, sanitized_args(args)
+        keys = {k for k in set(saved_args) | set(now)
+                if k == "learning_rate" or k.startswith("lr_")
+                or k in ("moss_ft_lr_phases", "max_train_steps", "max_train_epochs")}
+        changed = {k: (saved_args.get(k), now.get(k)) for k in sorted(keys) if saved_args.get(k) != now.get(k)}
+        if changed:
+            logger.warning(f"{PREFIX}CLI LR/schedule differs (saved, now): {changed}. The saved LR and scheduler"
+                           " state are restored by default; use --moss_ft_resume_new_lr_schedule to start the new"
+                           " CLI schedule from its beginning")
 
     _load_master(os.path.join(path, MASTER_FILE), model, slots, pool)
     if extra_reader is not None:
@@ -605,11 +625,19 @@ def load_state(path: str, *, model, slots: Sequence[ft_host.ParamSlot], pool: Op
         optimizer.load_state_dict(saved)
         _restore_state_dtypes(optimizer, saved)
     groups_restored = pool is None  # adafactor_fused: optimizer.load_state_dict restored the param groups
-    if pool is not None and PARAM_GROUPS_FILE in files:
+    if new_schedule:
+        # Optimizer.load_state_dict (mode b) may have overwritten LR and cycle keys. Restore the whole fresh
+        # scheduler-owned group state, removing saved-only keys, without touching the optimizer's moments/steps.
+        for group, fresh in zip(optimizer.param_groups, fresh_schedule_groups):
+            for key in list(group):
+                if key != "params" and (key in SCHEDULED_KEYS or key not in own):
+                    del group[key]
+            group.update(fresh)
+    if not new_schedule and pool is not None and PARAM_GROUPS_FILE in files:
         saved_groups = torch.load(os.path.join(path, PARAM_GROUPS_FILE), map_location="cpu", weights_only=True)
         _restore_scheduled_values(optimizer, saved_groups, path)
         groups_restored = True
-    if lr_scheduler is not None:
+    if lr_scheduler is not None and not new_schedule:
         if SCHEDULER_FILE in files:
             lr_scheduler.load_state_dict(torch.load(os.path.join(path, SCHEDULER_FILE), map_location="cpu",
                                                     weights_only=True))

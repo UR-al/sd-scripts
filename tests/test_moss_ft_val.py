@@ -174,17 +174,17 @@ def test_kohya_validation_inside_the_training_toml_points_to_the_flag():
 
 
 # ---------------------------------------------------------------------------------------------------- the plan
-def test_captions_are_fixed_first_lines():
+def test_captions_follow_training_multiline_and_wildcard_rules():
     plain = subset()
     dataset = types.SimpleNamespace(replacements={})
-    assert ft_val.val_caption(dataset, plain, "line one\nline two") == "line one"
+    assert ft_val.val_caption(dataset, plain, "line one\nline two") == "line one\nline two"
     assert ft_val.val_caption(dataset, plain, None) == ""
     wild = subset(enable_wildcard=True)
     assert ft_val.val_caption(dataset, wild, "a {red|blue} cat\nshort") == "a red cat"
     shuffled = subset(shuffle_caption=True, keep_tokens_separator="|||", caption_tag_dropout_rate=0.5)
     # the separator split joined with ", " (as the shuffled training captions), the tags in their order, nothing dropped
     assert ft_val.val_caption(dataset, shuffled, "1girl ||| b, a, c ||| She smiles.\nshort") == \
-        "1girl, b, a, c, She smiles."
+        "1girl, b, a, c, She smiles.\nshort"
     for _ in range(3):  # no draw: the same text every time
         assert ft_val.val_caption(dataset, shuffled, "x ||| p, q") == "x, p, q"
 
@@ -192,8 +192,8 @@ def test_captions_are_fixed_first_lines():
 def test_plan_batches_by_bucket_in_a_fixed_order():
     group = fake_group(CAPTIONS, batch_size=2, resos={1: (32, 64), 3: (32, 64)})
     items, batches = ft_val.val_plan(group)
-    assert [item.caption for item in items] == ["a red square", "cat ||| sitting, window", "two blue circles", "green",
-                                                "an empty room"]
+    assert [item.caption for item in items] == ["a red square", "cat ||| sitting, window\ncat ||| sitting",
+                                                "two blue circles", "green\nlong line two", "an empty room"]
     by_reso = [[items[i].bucket_reso for i in batch] for batch in batches]
     assert all(len(set(resos)) == 1 for resos in by_reso)
     assert sorted(i for batch in batches for i in batch) == list(range(len(CAPTIONS)))  # every image once

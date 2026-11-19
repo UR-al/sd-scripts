@@ -66,12 +66,15 @@ def test_resume_is_bit_identical(tmp_path, kind, state, dtype, cut):
     sched_a = scheduler_of(a)
     path = None
     stats_a = train_engine(a, WINDOWS[:cut], scheduler=sched_a)
+    saved_switches = a.switches
+    assert saved_switches > 0
     path = save(a, sched_a, tmp_path, cut)
     stats_a += train_engine(a, WINDOWS[cut:], start_step=cut, scheduler=sched_a)
 
     b = make_engine(build_model(seed=9), kind, **kw)  # other initial values: everything must come from the state
     sched_b = scheduler_of(b)
     info = load(b, sched_b, path)
+    assert b.switches == saved_switches
     assert info.progress.global_step == cut
     b.restore_counters(info.last_grad_norm, info.skip_streak)
     stats_b = train_engine(b, WINDOWS[cut:], start_step=cut, scheduler=sched_b)

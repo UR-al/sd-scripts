@@ -222,9 +222,8 @@ class ValItem:
 
 
 def val_caption(dataset, subset, caption: Optional[str]) -> str:
-    """The fixed caption of a validation image: the first line, then process_caption without its draws."""
-    first = (caption or "").split("\n")[0]
-    return moss_captions.canonical_caption(dataset, subset, first)
+    """Training's canonical caption: keep all lines unless enable_wildcard selects the first candidate."""
+    return moss_captions.canonical_caption(dataset, subset, caption or "")
 
 
 def _batch_size(dataset, subset) -> int:
