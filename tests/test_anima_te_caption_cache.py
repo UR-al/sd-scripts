@@ -16,6 +16,7 @@ Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe -m pytest -p no:cachep
      tests/test_anima_te_caption_cache.py
 """
 import random
+import os
 import types
 from dataclasses import asdict
 
@@ -62,6 +63,16 @@ def _bare_dataset(replacements=None):
     dataset.current_step = 1000  # past any token warmup used below
     dataset.max_train_steps = 1000
     return dataset
+
+
+@pytest.mark.parametrize("source", ["subset", "global"])
+def test_bom_protected_tags_survive_tag_dropout(tmp_path, source):
+    protected_file = tmp_path / "protected.txt"
+    protected_file.write_text("Masterpiece\nSMILE\n", encoding="utf-8-sig")
+    dataset = _bare_dataset()
+    subset = _subset(image_dir=str(tmp_path), shuffle_caption=False, caption_tag_dropout_rate=1.0)
+    setattr(subset if source == "subset" else dataset, "protected_tags_file", str(protected_file))
+    assert dataset.process_caption(subset, "masterpiece, smile, blue hair") == "masterpiece, smile"
 
 
 # ======================================================================================================
@@ -257,6 +268,127 @@ def _cache_run(image_dir, caption, caption_variants=16, **subset_kwargs):
 def _decoded_t5(caching, info, variant=0):
     ids = np.asarray(caching.load_outputs_npz(info.text_encoder_outputs_npz, variant=variant)[2])
     return "".join(chr(int(x)) for x in ids if int(x))
+
+
+@pytest.mark.parametrize("source", ["subset", "global"])
+@pytest.mark.parametrize("model_type", ["anima", "moss"])
+def test_protected_file_edit_rebuilds_te_variants(tmp_path, monkeypatch, source, model_type):
+    class MossEncoding(TextEncodingStrategy):
+        def encode_tokens(self, tokenize_strategy, models, tokens):
+            ids, mask = tokens[:2]
+            return [ids.float().unsqueeze(-1), mask]
+
+    caching = (_RecordingCaching() if model_type == "anima" else
+               moss_strategy.MossTextEncoderOutputsCachingStrategy(True, 1, False, signature="test"))
+    encoding = _FakeEncoding() if model_type == "anima" else MossEncoding()
+    for cls, value in zip((TokenizeStrategy, TextEncodingStrategy, TextEncoderOutputsCachingStrategy),
+                          (_CharTokenizer(), encoding, caching)):
+        monkeypatch.setattr(cls, "_strategy", value)
+    Image.new("RGB", (64, 64)).save(tmp_path / "a.png")
+    (tmp_path / "a.txt").write_text("red, sky", encoding="utf-8")
+    protected_file = tmp_path / "protected.txt"
+    protected_file.write_text("red\n", encoding="utf-8")
+    subset = DreamBoothSubset(**asdict(DreamBoothSubsetParams(
+        image_dir=str(tmp_path), caption_extension=".txt", caption_tag_dropout_rate=1.0,
+        protected_tags_file=str(protected_file) if source == "subset" else None)))
+    dataset = DreamBoothDataset(subsets=[subset], is_training_dataset=True,
+                               **asdict(DreamBoothDatasetParams(resolution=(64, 64))))
+    if source == "global":
+        dataset.protected_tags_file = str(protected_file)
+    dataset.set_aug_variant_config(caption_aug_variants=3)
+    accelerator = types.SimpleNamespace(num_processes=1, process_index=0)
+    if model_type == "moss":
+        moss_captions.prepare_canonical_captions(dataset)
+        moss_captions.register_caption_digests(dataset, caching)
+
+    def decoded(info, variant):
+        if model_type == "anima":
+            return _decoded_t5(caching, info, variant)
+        ids = np.asarray(caching.load_outputs_npz(info.text_encoder_outputs_npz, variant)[0])[:, 0]
+        return "".join(chr(int(x)) for x in ids)
+
+    dataset.new_cache_text_encoder_outputs([None], accelerator)
+    info = next(iter(dataset.image_data.values()))
+    old_hash = info.caption_aug_hash
+    assert decoded(info, 0) == "red, sky"
+    assert decoded(info, 1) == "red"
+    assert caching.is_disk_cached_outputs_expected(info.text_encoder_outputs_npz, 3, old_hash)
+    stat = protected_file.stat()
+    protected_file.write_text("sky\n", encoding="utf-8")
+    os.utime(protected_file, ns=(stat.st_atime_ns, stat.st_mtime_ns))  # same path, size and mtime
+    new_hash = dataset.get_caption_aug_config_hash(subset)
+    assert new_hash != old_hash
+    assert not caching.is_disk_cached_outputs_expected(info.text_encoder_outputs_npz, 3, new_hash)
+    dataset.new_cache_text_encoder_outputs([None], accelerator)
+    assert info.caption_aug_hash == new_hash
+    assert decoded(info, 0) == "red, sky"
+    assert decoded(info, 1) == decoded(info, 2) == "sky"
+    assert caching.is_disk_cached_outputs_expected(info.text_encoder_outputs_npz, 3, new_hash)
+    assert dataset.get_caption_aug_config_hash(subset) == new_hash
+    cached_stat = os.stat(info.text_encoder_outputs_npz)
+    dataset.new_cache_text_encoder_outputs([None], accelerator)
+    assert os.stat(info.text_encoder_outputs_npz).st_mtime_ns == cached_stat.st_mtime_ns
+
+
+@pytest.mark.parametrize("source", ["subset", "global"])
+def test_rebuilding_caption_variants_reloads_protected_tags(tmp_path, source):
+    protected_file = tmp_path / "protected.txt"
+    protected_file.write_text("red\n", encoding="utf-8")
+    dataset = _bare_dataset()
+    dataset.caption_aug_variant_count = 3
+    subset = _subset(image_dir=str(tmp_path), shuffle_caption=False, caption_tag_dropout_rate=1.0)
+    setattr(subset if source == "subset" else dataset, "protected_tags_file", str(protected_file))
+    info = types.SimpleNamespace(image_key="a", caption="red, sky")
+    dataset.image_data = {"a": info}
+    dataset.image_to_subset = {"a": subset}
+    dataset.build_caption_variants()
+    assert info.caption_variants == ["red, sky", "red", "red"]
+    protected_file.write_text("sky\n", encoding="utf-8")
+    dataset.build_caption_variants()
+    assert info.caption_variants == ["red, sky", "sky", "sky"]
+
+
+def test_protected_signature_uses_subset_precedence_and_content(tmp_path):
+    global_file = tmp_path / "global.txt"
+    global_file.write_text("sky\n", encoding="utf-8")
+    subset_file = tmp_path / "subset.txt"
+    subset_file.write_text("red\n", encoding="utf-8")
+    dataset = _bare_dataset()
+    dataset.protected_tags_file = str(global_file)
+    subset = _subset(image_dir=str(tmp_path), shuffle_caption=False, caption_tag_dropout_rate=1.0,
+                     protected_tags_file=str(subset_file))
+    original = dataset.get_caption_aug_config_hash(subset)
+    assert dataset.process_caption(subset, "red, sky") == "red"
+    global_file.write_text("other\n", encoding="utf-8")
+    assert dataset.get_caption_aug_config_hash(subset) == original
+    # Moving the same content does not change augmentation semantics.
+    copy_file = tmp_path / "copy.txt"
+    copy_file.write_bytes(subset_file.read_bytes())
+    subset.protected_tags_file = str(copy_file)
+    assert dataset.get_caption_aug_config_hash(subset) == original
+    # A missing explicit subset file must not silently use the global protection.
+    subset.protected_tags_file = str(tmp_path / "new.txt")
+    missing = dataset.get_caption_aug_config_hash(subset)
+    assert dataset.process_caption(subset, "red, sky, other") == ""
+    (tmp_path / "new.txt").write_text("sky\n", encoding="utf-8")
+    assert dataset.get_caption_aug_config_hash(subset) != missing
+    assert dataset.process_caption(subset, "red, sky, other") == "sky"
+    subset.protected_tags_file = None
+    dataset.get_caption_aug_config_hash(subset)
+    assert dataset.process_caption(subset, "red, sky, other") == "other"
+
+
+@pytest.mark.parametrize("source", ["subset", "global"])
+def test_protected_file_does_not_change_hash_without_tag_dropout(tmp_path, source):
+    dataset = _bare_dataset()
+    subset = _subset(image_dir=str(tmp_path))
+    original = dataset.get_caption_aug_config_hash(subset)
+    protected_file = tmp_path / "protected.txt"
+    protected_file.write_text("red\n", encoding="utf-8")
+    setattr(subset if source == "subset" else dataset, "protected_tags_file", str(protected_file))
+    assert dataset.get_caption_aug_config_hash(subset) == original
+    protected_file.write_text("sky\n", encoding="utf-8")
+    assert dataset.get_caption_aug_config_hash(subset) == original
 
 
 USER_SUBSET = dict(shuffle_caption=True, keep_tokens_separator="|||")  # config_anima29 / config_anima_base

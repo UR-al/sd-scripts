@@ -3273,6 +3273,59 @@ def test_ortholora_cayley_solve_no_host_sync(dora):
     assert not w.hits, w.hits
 
 
+@pytest.mark.parametrize("training", [False, True], ids=["step_epoch", "final"])
+@pytest.mark.parametrize("dora", [False, True])
+def test_trainer_checkpoint_exports_ortholora_without_timestep_mask(tmp_path, monkeypatch, training, dora):
+    """Exercise the trainer's shared save closure without starting a training run."""
+    import ast
+    import time
+    from pathlib import Path
+    from safetensors.torch import load_file
+
+    source = Path(__file__).resolve().parents[1] / "train_network.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    save = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "save_model")
+    scope = dict(os=os, time=time, args=types.SimpleNamespace(output_dir=str(tmp_path), no_metadata=False,
+                 huggingface_repo_id=None), accelerator=types.SimpleNamespace(print=lambda *a: None),
+                 metadata={}, minimum_metadata={}, save_dtype=torch.float32,
+                 self=types.SimpleNamespace(get_sai_model_spec=lambda args: {}))
+    exec(compile(ast.Module(body=[save], type_ignores=[]), str(source), "exec"), scope)
+
+    model = make_model(dtype=torch.float32)
+    net = make_net(model, "ortholora", 2, 2, use_timestep_mask=True, **({"dora_wd": True} if dora else {}))
+    _fill(net, std=0.1)
+    net.to(torch.float32)
+    for m in loras(net):
+        with torch.no_grad():
+            m.lambda_layer.fill_(1.0)
+            m._timestep_mask.copy_(torch.tensor([0.0, 1.0]))
+    net.eval()
+    net.save_weights(str(tmp_path / "reference.safetensors"), torch.float32, {})
+    expected = load_file(str(tmp_path / "reference.safetensors"))
+    net.train(training)
+    masks = [m._timestep_mask.clone() for m in loras(net)]
+    scope["save_model"]("checkpoint.safetensors", net, 3, 1, force_sync_upload=True)
+    actual = load_file(str(tmp_path / "checkpoint.safetensors"))
+    assert actual.keys() == expected.keys()
+    for key in expected:
+        torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
+    assert net.training == training
+    for m, mask in zip(loras(net), masks):
+        assert m.training == training
+        assert torch.equal(m._timestep_mask, mask)
+
+    def fail_write(*args, **kwargs):
+        raise OSError("test disk failure")
+
+    monkeypatch.setattr("safetensors.torch.save_file", fail_write)
+    with pytest.raises(OSError, match="test disk failure"):
+        scope["save_model"]("failed.safetensors", net, 3, 1)
+    assert net.training == training
+    for m, mask in zip(loras(net), masks):
+        assert m.training == training
+        assert torch.equal(m._timestep_mask, mask)
+
+
 def test_ortholora_input_axis_dora_raises():
     with pytest.raises(ValueError, match="wd_on_output"):
         laf.prepare_network_kwargs("ortholora", {"algo": "ortholora", "dora_wd": "True", "wd_on_output": "False"}, LOG)

@@ -3860,7 +3860,13 @@ class NetworkTrainer:
             sai_metadata = self.get_sai_model_spec(args)
             metadata_to_save.update(sai_metadata)
 
-            unwrapped_nw.save_weights(ckpt_file, dtype_override or save_dtype, metadata_to_save)
+            # Export all ranks, including the final save after training mode was restored.
+            was_training = unwrapped_nw.training
+            try:
+                unwrapped_nw.eval()
+                unwrapped_nw.save_weights(ckpt_file, dtype_override or save_dtype, metadata_to_save)
+            finally:
+                unwrapped_nw.train(was_training)
             if args.huggingface_repo_id is not None:
                 huggingface_util.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 

@@ -1055,6 +1055,35 @@ class BaseDataset(torch.utils.data.Dataset):
     def add_replacement(self, str_from, str_to):
         self.replacements[str_from] = str_to
 
+    def _load_protected_tags(self, subset: BaseSubset, refresh: bool = False):
+        """Snapshot the selected file for tag dropout and its cache signature.
+
+        Caption processing reuses the snapshot; cache checks and variant rebuilds refresh it.
+        An explicitly configured subset file takes precedence even when it is missing.
+        """
+        if not refresh and hasattr(subset, "_protected_tags"):
+            return getattr(subset, "_protected_tags_digest", None)
+        protected_file = getattr(subset, "protected_tags_file", None) or getattr(self, "protected_tags_file", None)
+        content = ""
+        digest = None
+        if protected_file and os.path.exists(protected_file):
+            with open(protected_file, "r", encoding="utf-8-sig") as f:
+                content = f.read()
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        source = (protected_file, digest)
+        if source != getattr(subset, "_protected_tags_source", None):
+            subset._protected_tags = {line.strip().lower() for line in content.splitlines() if line.strip()}
+            subset._protected_tags_source = source
+            subset._protected_tags_digest = digest
+            if protected_file:
+                if digest is None:
+                    logger.warning(f"[Subset '{subset.image_dir}'] Protected tags file not found: {protected_file}")
+                else:
+                    logger.info(f"[Subset '{subset.image_dir}'] Loaded {len(subset._protected_tags)} protected tags from: {protected_file}")
+                    if self.log_caption_tag_dropout and subset._protected_tags:
+                        logger.info(f"[Subset '{subset.image_dir}'] Protected tags: {subset._protected_tags}")
+        return digest
+
     def process_caption(self, subset: BaseSubset, caption):
         # with enable_wildcard every line of a multi-line caption is one candidate: pick the line BEFORE adding
         # prefix/suffix so each candidate gets both (upstream PR #2454). Without it the caption is used whole.
@@ -1142,30 +1171,7 @@ class BaseDataset(torch.utils.data.Dataset):
                     )
                     flex_tokens = flex_tokens[:tokens_len]
 
-                if not hasattr(subset, "_protected_tags"):
-                    subset._protected_tags = set()
-
-                    # subset-specific first
-                    if hasattr(subset, "protected_tags_file") and subset.protected_tags_file:
-
-                        protected_file = subset.protected_tags_file
-                        if os.path.exists(protected_file):
-                            logger.info(f"[Subset '{subset.image_dir}'] Loading protected tags from: {protected_file}")
-                            with open(protected_file, "r", encoding="utf-8") as f:
-                                subset._protected_tags = {line.strip().lower() for line in f if line. strip()}
-
-                            logger.info(f"[Subset '{subset.image_dir}'] Loaded {len(subset._protected_tags)} protected tags")
-                            if self.log_caption_tag_dropout and len(subset._protected_tags) > 0:
-                                logger.info(f"[Subset '{subset.image_dir}'] Protected tags: {subset._protected_tags}")
-                        else:
-                            logger.warning(f"[Subset '{subset.image_dir}'] Protected tags file not found: {protected_file}")
-
-                    # fallback to global protected tags file if no subset-specific file
-                    elif hasattr(self, "protected_tags_file") and self.protected_tags_file and os.path.exists(self.protected_tags_file):
-                        logger.info(f"[Subset '{subset.image_dir}'] Using global protected tags from: {self.protected_tags_file}")
-                        with open(self.protected_tags_file, "r", encoding="utf-8") as f:
-                            subset._protected_tags = {line.strip().lower() for line in f if line.strip()}
-                        logger.info(f"[Subset '{subset.image_dir}'] Loaded {len(subset._protected_tags)} protected tags (global)")
+                self._load_protected_tags(subset)
 
                 log_tag_dropout = self.log_caption_tag_dropout and subset.caption_tag_dropout_rate > 0
 
@@ -1300,6 +1306,11 @@ class BaseDataset(torch.utils.data.Dataset):
 
     def get_caption_aug_config_hash(self, subset: BaseSubset) -> str:
         """Hash of the subset's caption augmentation config (excludes the variant count itself)."""
+        protected_config = {}
+        if subset.caption_tag_dropout_rate > 0:
+            digest = self._load_protected_tags(subset, refresh=True)
+            if getattr(subset, "protected_tags_file", None) or getattr(self, "protected_tags_file", None):
+                protected_config["protected_tags_digest"] = digest
         return compute_aug_config_hash(
             {
                 "shuffle_caption": subset.shuffle_caption,
@@ -1313,6 +1324,7 @@ class BaseDataset(torch.utils.data.Dataset):
                 "secondary_separator": subset.secondary_separator,
                 "enable_wildcard": subset.enable_wildcard,
                 "replacements": self.replacements,
+                **protected_config,
             }
         )
 
@@ -1351,6 +1363,7 @@ class BaseDataset(torch.utils.data.Dataset):
         caption file to weight them (2026-11-14: tag / tag+sentence / short / medium / long mix)
         get exactly their share in every image's cache, not a share that drifts with the draw.
         """
+        refreshed_subsets = set()
         for info in self.image_data.values():
             subset = self.image_to_subset[info.image_key]
             num_variants = self.get_effective_caption_variant_count(subset)
@@ -1358,6 +1371,9 @@ class BaseDataset(torch.utils.data.Dataset):
                 info.caption_variants = None
                 continue
 
+            if subset.caption_tag_dropout_rate > 0 and id(subset) not in refreshed_subsets:
+                self._load_protected_tags(subset, refresh=True)
+                refreshed_subsets.add(id(subset))
             variants = [self.process_caption_canonical(subset, info.caption)]
             lines = self._stratified_caption_lines(subset, info.caption, num_variants)
 
