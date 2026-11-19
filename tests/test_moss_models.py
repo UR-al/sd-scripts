@@ -1,6 +1,6 @@
 """CPU tests for the MOSS-Image port (no GPU, no model files needed except where noted).
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe tests/test_moss_models.py   (or with pytest if installed)
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe tests/test_moss_models.py   (or with pytest if installed)
 The parity tests compare our batched DiT with a per-sample reference. By default that is ReferenceMossImage below
 (the official per-sample loop, copied from upstream sd-scripts' tests/test_moss_image_models.py, which copied it from
 OpenMOSS pipeline_moss_image.py, Apache-2.0); set MOSS_REF_PIPELINE to a local copy of the official

@@ -3,7 +3,7 @@ a batch, the timer (CPU clock and CUDA-style event pairs harvested only once fin
 and the trainer wiring (hooks around each micro-step, the periodic and epoch-end reports, the parser); MOSS adds the
 patch-1 / stride-16 token count and the text tokens per tier.
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe -B -m pytest tests/test_tier_timing.py
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe -B -m pytest tests/test_tier_timing.py
 """
 import argparse
 import inspect

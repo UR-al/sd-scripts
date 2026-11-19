@@ -1316,6 +1316,28 @@ class BaseDataset(torch.utils.data.Dataset):
             }
         )
 
+    @staticmethod
+    def _stratified_caption_lines(subset: BaseSubset, caption: str, num_variants: int) -> Optional[List[str]]:
+        """The lines for variants 1..num_variants-1 of a multi-line wildcard caption, or None (not multi-line / no
+        wildcard: the variants sample the whole caption as before).
+
+        Every line gets num_variants // len(lines) slots and a random set of the remaining num_variants % len(lines)
+        lines one more; variant 0 (the canonical caption = first line) uses one of the first line's slots. The rest are
+        shuffled, so which variant holds which line is random but the counts are exact."""
+        if not subset.enable_wildcard or not caption or "\n" not in caption:
+            return None
+        lines = caption.split("\n")
+        n = len(lines)
+        full, rem = divmod(num_variants, n)
+        extra = set(random.sample(range(n), rem)) if rem else set()
+        if full == 0 and 0 not in extra:  # fewer variants than lines: the canonical first line needs a slot
+            extra.discard(random.choice(sorted(extra)))
+            extra.add(0)
+        slots = [i for i in range(n) for _ in range(full + (1 if i in extra else 0))]
+        slots.remove(0)
+        random.shuffle(slots)
+        return [lines[i] for i in slots]
+
     def build_caption_variants(self):
         """Build processed caption variants for every image (info.caption_variants).
 
@@ -1323,6 +1345,11 @@ class BaseDataset(torch.utils.data.Dataset):
         process_caption. Epoch/step-dependent triggers (caption_dropout_every_n_epochs,
         token_warmup_step) are neutralized during sampling because a cache is a static
         snapshot; token_warmup_step remains incompatible with TE output caching.
+
+        With enable_wildcard and a multi-line caption, the variants take the lines in proportion
+        (_stratified_caption_lines) instead of independent random picks, so lines repeated in the
+        caption file to weight them (2026-11-14: tag / tag+sentence / short / medium / long mix)
+        get exactly their share in every image's cache, not a share that drifts with the draw.
         """
         for info in self.image_data.values():
             subset = self.image_to_subset[info.image_key]
@@ -1332,14 +1359,16 @@ class BaseDataset(torch.utils.data.Dataset):
                 continue
 
             variants = [self.process_caption_canonical(subset, info.caption)]
+            lines = self._stratified_caption_lines(subset, info.caption, num_variants)
 
             saved_every_n = subset.caption_dropout_every_n_epochs
             saved_warmup = subset.token_warmup_step
             subset.caption_dropout_every_n_epochs = 0
             subset.token_warmup_step = 0
             try:
-                for _ in range(num_variants - 1):
-                    variants.append(self.process_caption(subset, info.caption))
+                for k in range(num_variants - 1):
+                    # one line (no "\n" left) -> process_caption skips its own line pick, keeps {a|b} and shuffles
+                    variants.append(self.process_caption(subset, lines[k] if lines is not None else info.caption))
             finally:
                 subset.caption_dropout_every_n_epochs = saved_every_n
                 subset.token_warmup_step = saved_warmup

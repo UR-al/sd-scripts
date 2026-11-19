@@ -5,7 +5,7 @@ these tests check the bookkeeping (which tensors move when, what the optimizer s
 resume) but not CUDA stream ordering, pinned memory, or VRAM; those are the GPU checks in
 scratchpad/tsm_lokr/gpu/run_tsm_lokr_gpu.py.
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe -B -m pytest tests/test_tsm_offload.py
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe -B -m pytest tests/test_tsm_offload.py
 """
 import argparse
 import io

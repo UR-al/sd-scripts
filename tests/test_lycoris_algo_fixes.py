@@ -6,7 +6,7 @@ forward/backward works there, every trainable tensor gets a gradient and is in t
 Forge's own weight adapters (C:/sd-webui-forge-classic/modules_forge/packages/comfy/weight_adapter, imported with a
 two-function backend stub) and reproduces the trained weight; DoRA on (both axes) and off where supported.
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe -B -m pytest tests/test_lycoris_algo_fixes.py
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe -B -m pytest tests/test_lycoris_algo_fixes.py
 """
 import argparse
 import copy

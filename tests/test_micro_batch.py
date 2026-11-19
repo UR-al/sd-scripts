@@ -2,7 +2,7 @@
 dict split (collate_fn's entry kinds), the weighted backward == the batch-mean backward, the logging sums, and
 anima_train_network's split_batch_for_backward (budget in DiT tokens, announced once per tier).
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe -m pytest tests/test_micro_batch.py -q
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe -m pytest tests/test_micro_batch.py -q
 """
 import argparse
 import logging

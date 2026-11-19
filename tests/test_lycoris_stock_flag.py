@@ -5,7 +5,7 @@ run without any flag; --lycoris_stock turns them off (the module is not even imp
 accepted for old configs and changes nothing; with both, --lycoris_stock wins. Non-LyCORIS networks are never touched.
 
 Each case runs NetworkTrainer._lycoris_fix_setup in a fresh interpreter, so "not imported / nothing patched" is real.
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe -B -m pytest tests/test_lycoris_stock_flag.py
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe -B -m pytest tests/test_lycoris_stock_flag.py
 """
 import json
 import os

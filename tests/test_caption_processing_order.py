@@ -5,7 +5,7 @@
 - Text Encoder caching encodes the processed caption for every model (strategy_base.caption_for_cache),
 - BaseSubsetParams defaults match argparse, tags-only metadata keeps its tags, "\\n" in line prompts.
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe -m pytest tests/test_caption_processing_order.py
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe -m pytest tests/test_caption_processing_order.py
 """
 import types
 from dataclasses import asdict

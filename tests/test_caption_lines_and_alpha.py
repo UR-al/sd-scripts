@@ -1,7 +1,7 @@
 """CPU tests: multi-line caption files are read whole (not cut to the first line) unless enable_wildcard picks a line, and
 transparent images are composited onto white when loaded for training.
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe -m pytest tests/test_caption_lines_and_alpha.py
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe -m pytest tests/test_caption_lines_and_alpha.py
 """
 from dataclasses import asdict
 

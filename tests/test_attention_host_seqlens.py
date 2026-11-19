@@ -7,7 +7,7 @@ must stay bit-identical to the device path, and the host path must not read a te
 
 A "device read" is counted the way it would sync on a GPU (tests/_device_reads.py).
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe -B -m pytest tests/test_attention_host_seqlens.py
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe -B -m pytest tests/test_attention_host_seqlens.py
 """
 import os
 

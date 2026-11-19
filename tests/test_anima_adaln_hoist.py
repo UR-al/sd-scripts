@@ -6,7 +6,7 @@ torch_checkpoint(use_reentrant=False), cpu-offload torch_checkpoint, UnslothOffl
 Function gives gradients to its extra tensor arguments, the Linears are not called in the recompute, no hoist with block
 swap / eval / no_grad, and the aten op count of a 2-Block forward + backward drops.
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe tests/test_anima_adaln_hoist.py   (or with pytest)
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe tests/test_anima_adaln_hoist.py   (or with pytest)
 """
 import types
 import warnings

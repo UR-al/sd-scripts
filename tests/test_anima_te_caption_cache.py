@@ -12,7 +12,7 @@ config_anima29.toml / config_anima_base.toml; review F5 and perf (a), 2026-10-21
 - AnimaTextEncoderOutputsCachingStrategy.load_outputs_npz reads one variant and returns exactly what the old
   load_npz-based loader returned (type, dtype, shape, bits); the lazy validity check decides as the old one did.
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe -m pytest -p no:cacheprovider --basetemp=<scratch dir>
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe -m pytest -p no:cacheprovider --basetemp=<scratch dir>
      tests/test_anima_te_caption_cache.py
 """
 import random

@@ -1,6 +1,6 @@
 """CPU tests for library/config_validation.py: --config_file keys must name an option, values must fit it.
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe -m pytest tests/test_config_validation.py
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe -m pytest tests/test_config_validation.py
 """
 import ast
 import os

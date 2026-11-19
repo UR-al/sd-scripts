@@ -5,7 +5,7 @@ Anima checkpoints (e.g. Anima-2.9B-preview-v1) store ``pos_embedder.seq`` / ``di
 ``load_state_dict(assign=True)``; a ``model.to(bf16)`` casts them too. diffusion-pipe (the model author's trainer) and
 ComfyUI compute these values in fp32, so the angles must not depend on the buffer dtype.
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe -m pytest tests/test_anima_rope_precision.py -q
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe -m pytest tests/test_anima_rope_precision.py -q
 """
 import os
 import sys

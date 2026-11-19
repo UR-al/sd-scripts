@@ -1,7 +1,7 @@
 """CPU tests: the git dependencies in requirements.txt are pinned to commits, backend/installer.py installs the same
 commits, and the git packages installed in this venv are those commits.
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe -m pytest tests/test_requirements_pins.py
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe -m pytest tests/test_requirements_pins.py
 """
 import json
 import os

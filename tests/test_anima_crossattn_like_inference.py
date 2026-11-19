@@ -1,6 +1,6 @@
 """CPU tests for --anima_crossattn_like_inference and --anima_sample_like_inference (no GPU, no model files).
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe tests/test_anima_crossattn_like_inference.py   (or with pytest)
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe tests/test_anima_crossattn_like_inference.py   (or with pytest)
 
 Why (2026-11-09): eastown v6 samples looked unlike ComfyUI / Forge pictures of the same LoRA. Besides the sampler, the
 trainer gave the DiT the LLM-adapter context zero-padded to --t5_max_token_length (620) where ComfyUI pads to 512, and its

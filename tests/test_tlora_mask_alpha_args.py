@@ -3,7 +3,7 @@
 Before, algo=tlora read only tlora_mask_alpha and the LoCon-flag path only tlora_alpha, so a config written with the
 other spelling (config_anima29_tlora.toml used tlora_alpha with algo=tlora) was silently ignored.
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe -m pytest tests/test_tlora_mask_alpha_args.py -q
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe -m pytest tests/test_tlora_mask_alpha_args.py -q
 """
 import types
 

@@ -1,7 +1,7 @@
 """CPU tests for the CUDA caching-allocator controls (library/cuda_memory.py) and the cap-aware free-bytes helper in
 library/lycoris_fast.py. torch.cuda calls are monkeypatched; whether the cap really trims the cache is a GPU check.
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe -B -m pytest tests/test_cuda_memory.py
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe -B -m pytest tests/test_cuda_memory.py
 """
 import argparse
 import json

@@ -1,7 +1,7 @@
 """CPU tests for the Anima speed-ups: the restructured Block / Attention eager path is bit-identical to the module-call
 math it replaced, and the fast LyCORIS LoKr forward is bit-identical for fp32 inputs (Anima's LayerNorm outputs).
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe tests/test_anima_speedups.py   (or with pytest if installed)
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe tests/test_anima_speedups.py   (or with pytest if installed)
 """
 import types
 

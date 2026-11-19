@@ -5,7 +5,7 @@ so 0.29 of 100 steps = 28.999999999999996 gave 28. It now uses train_util.fracti
 and decay ratios use. Integer steps (>= 1) and 0 are unchanged. Drives the real DreamBoothDataset.process_caption.
 CPU only.
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe -m pytest tests/test_token_warmup_fraction.py
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe -m pytest tests/test_token_warmup_fraction.py
 """
 import os
 import sys

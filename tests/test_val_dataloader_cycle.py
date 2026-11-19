@@ -6,7 +6,7 @@ whole run. train_util.DataLoaderCycle starts a new pass over the loader instead 
 
 No model, no GPU.
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe -m pytest -p no:cacheprovider --basetemp=<scratch dir>
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe -m pytest -p no:cacheprovider --basetemp=<scratch dir>
      tests/test_val_dataloader_cycle.py
 """
 import gc

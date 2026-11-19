@@ -1,6 +1,6 @@
 """CPU tests for the named sigmoid timestep presets and --scale_resume (library/timestep_presets.py).
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe -m pytest tests/test_timestep_presets.py
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe -m pytest tests/test_timestep_presets.py
 """
 import argparse
 import os

@@ -4,7 +4,7 @@ Math against explicit dense references (fp64 / fp32 / bf16 autocast), stage 1 an
 per-sample timesteps in a batch, gradient checkpointing, registration/dispatch, validation messages, save/load round
 trips and the stage-1 -> stage-2 hand-over.
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe -B -m pytest tests/test_tsm_lokr.py
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe -B -m pytest tests/test_tsm_lokr.py
 """
 import argparse
 import logging

@@ -1,6 +1,6 @@
 """CPU tests for --learning_rate_DoRA (library/dora_lr.py): DoRA magnitude parameters get their own optimizer group and lr.
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe -m pytest tests/test_dora_lr.py
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe -m pytest tests/test_dora_lr.py
 """
 import argparse
 import os

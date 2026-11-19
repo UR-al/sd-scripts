@@ -37,7 +37,7 @@ graph as inductor, without codegen) on a 2-Block toy Anima and networks built th
   the lazy per-module caches - without it LoKr+DoRA breaks on a .item() and keeps the fragments (loha / full trace whole
   cold: the fork's default-free _HadaWeight Function, the 0-d alpha/dim operand as a graph constant, {**a, **b}).
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe -B -m pytest tests/test_anima_block_compile.py
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe -B -m pytest tests/test_anima_block_compile.py
 """
 import argparse
 import logging

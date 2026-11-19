@@ -4,8 +4,9 @@
 # every joint MossBlock's `_forward` (attention + MLP math, NOT the checkpointing wrapper `forward` / `_run`) is compiled
 # with the LyCORIS-adapted Linears inside the graph, so a micro-step runs a few graph calls per block instead of the
 # Python-level module calls of the 6 adapted Linears and the elementwise chains. Shared with Anima, imported from
-# anima_block_compile: the pause() switch (sampling / validation run eager), the recompile limit, the per-signature
-# inductor cache dir, CompiledBlocks / restore, and the autocast-state-as-graph-argument entry.
+# anima_block_compile: the pause() switch (sampling / validation run eager), the recompile limit (global and per region,
+# block_compile_kwargs), the per-signature inductor cache dir, CompiledBlocks / restore, and the
+# autocast-state-as-graph-argument entry.
 #
 # What differs from Anima:
 # * the block input is already flat: x [B, L, D] with L = image tokens + text tokens of the joint sequence, rope
@@ -79,9 +80,9 @@ def compile_moss_blocks(
         if float(stream_scale) != 1.0:
             signature += f";stream_scale={float(stream_scale)!r}"
         logger.info(f"MOSS block compile: inductor cache dir {abc.isolate_inductor_cache(signature)}")
-    kwargs: Dict[str, Any] = {"backend": backend, "dynamic": False}
-    if mode:
-        kwargs["mode"] = mode
+    # the limit passed per region as well: the recomputes compile in the autograd engine's thread, which does not see
+    # raise_recompile_limit's global value on torch 2.14 (anima_block_compile.block_compile_kwargs)
+    kwargs = abc.block_compile_kwargs(backend, mode, limit)
     state = abc.CompiledBlocks()
     entries: Dict[Any, Callable] = {}
 

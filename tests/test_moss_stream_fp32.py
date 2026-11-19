@@ -1,6 +1,6 @@
 """CPU tests for --moss_stream_fp32 (no GPU, no model files).
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe tests/test_moss_stream_fp32.py   (or with pytest if installed)
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe tests/test_moss_stream_fp32.py   (or with pytest if installed)
 CPU autocast stands in for accelerate's bf16 autocast: the same ops are cast, on the same rule.
 """
 import copy

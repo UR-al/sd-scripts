@@ -3,7 +3,7 @@ recomputation in backward replays the forward's RNG states, so gradients through
 non-checkpointed ones, and the caller's RNG stream after backward is where plain autograd leaves it (as with
 torch.utils.checkpoint).
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe tests/test_unsloth_checkpoint_rng.py   (or with pytest if installed)
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe tests/test_unsloth_checkpoint_rng.py   (or with pytest if installed)
 """
 import torch
 from torch import nn

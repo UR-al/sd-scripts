@@ -68,6 +68,10 @@
 #   the first call for the rest of the run.
 # * the inductor cache is routed to a per-signature directory (the persistent caches key on the FX graph but not on the
 #   mark_dynamic ranges; two processes compiled with different bands poison each other through the shared default dir).
+# * the recompile limit travels with the compiled entry (torch.compile(recompile_limit=...), block_compile_kwargs): torch
+#   2.14 keeps dynamo / inductor config overrides per thread, and a checkpointed Block's recompute runs - and compiles
+#   graphs of its own (the thread count is a guard) - in the autograd engine's thread, which never saw
+#   raise_recompile_limit's global value (11-17, library/elementwise_compile.py).
 #
 # Cache entries = 2 (Block 0's input is bf16, Blocks 1+ see the fp32 residual; 1 under --anima_stream_fp32, where Block 0
 # sees it too) x expert choices (TSM stage 1: n_core;
@@ -91,6 +95,7 @@ from __future__ import annotations
 import bisect
 import contextlib
 import hashlib
+import inspect
 import logging
 import os
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -332,6 +337,30 @@ def raise_recompile_limit(limit: int) -> int:
     return target
 
 
+# torch >= 2.14: torch.compile(recompile_limit=...), a per-region limit that holds in every thread
+REGION_RECOMPILE_LIMIT = "recompile_limit" in inspect.signature(torch.compile).parameters
+
+
+def block_compile_kwargs(backend: str, mode: Optional[str], recompile_limit: int) -> Dict[str, Any]:
+    """torch.compile arguments of the Block entries (compile_blocks, moss.block_compile.compile_moss_blocks).
+
+    torch 2.14 keeps torch._dynamo / torch._inductor config overrides per thread (ContextVar): raise_recompile_limit's
+    value, set in the main thread, is not seen by the autograd engine's thread, where the gradient-checkpoint recomputes
+    run and compile graphs of their own (its thread count differs: a guard). There the default limit 8 applied, and a
+    recompute past it ran eager beside a compiled first pass. The per-region limit is checked in whichever thread
+    compiles; raise_recompile_limit stays for torch without the argument. The block compilers set no inductor config
+    (`mode` already travels with the entry), so there are no `options` to pass.
+    accumulated_recompile_limit stays per thread (256 in the autograd thread) and has no per-region argument. dynamo
+    counts it over all entries of the code object; the entry's cache entries hold no ID-matched object, so the per-region
+    count is that same total and the per-region limit is reached first while it is <= 256 (128 / 64 by default)."""
+    kwargs: Dict[str, Any] = {"backend": backend, "dynamic": False}
+    if mode:
+        kwargs["mode"] = mode
+    if REGION_RECOMPILE_LIMIT:
+        kwargs["recompile_limit"] = int(recompile_limit)
+    return kwargs
+
+
 def compile_signature(bands: Sequence[Tuple[int, int]], backend: str, mode: Optional[str], dynamic: str,
                       stream_fp32: bool = False) -> str:
     signature = f"torch={torch.__version__};backend={backend};mode={mode or None};dynamic={dynamic};bands={list(bands)}"
@@ -408,9 +437,7 @@ def compile_blocks(
     if isolate_cache and backend == "inductor":
         cache_dir = isolate_inductor_cache(compile_signature(bands, backend, mode, dynamic, stream_fp32))
         logger.info(f"block compile: inductor cache dir {cache_dir}")
-    kwargs: Dict[str, Any] = {"backend": backend, "dynamic": False}
-    if mode:
-        kwargs["mode"] = mode
+    kwargs = block_compile_kwargs(backend, mode, limit)
     state = CompiledBlocks()
     state.bands = list(bands)
 

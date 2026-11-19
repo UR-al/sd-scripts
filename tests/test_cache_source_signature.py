@@ -8,7 +8,7 @@
 
 Only temporary folders and small fake arrays; no model, no GPU.
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe -m pytest -p no:cacheprovider --basetemp=<scratch dir>
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe -m pytest -p no:cacheprovider --basetemp=<scratch dir>
      tests/test_cache_source_signature.py
 """
 import json

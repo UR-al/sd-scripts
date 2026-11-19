@@ -1,6 +1,6 @@
 """CPU tests for the MOSS-Image trainer plumbing (sampler, LoRA/LyCORIS naming, TE caching). No model files needed.
 
-Run: CUDA_VISIBLE_DEVICES=-1 venv/Scripts/python.exe tests/test_moss_pipeline.py   (or with pytest if installed)
+Run: CUDA_VISIBLE_DEVICES=-1 venv_t214/Scripts/python.exe tests/test_moss_pipeline.py   (or with pytest if installed)
 """
 import argparse
 import contextlib
